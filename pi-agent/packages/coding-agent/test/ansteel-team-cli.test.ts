@@ -82,6 +82,20 @@ interface RpcCliProcess {
 	stop: () => Promise<void>;
 }
 
+async function waitForCondition<T>(
+	description: string,
+	condition: () => T | undefined,
+	timeoutMs = 15_000,
+): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const value = condition();
+		if (value !== undefined) return value;
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+	}
+	throw new Error(`Timed out waiting for ${description}`);
+}
+
 function createTemporaryProject(): { agentDir: string; projectDir: string } {
 	const root = mkdtempSync(join(tmpdir(), "pi-ansteel-team-cli-"));
 	temporaryDirectories.push(root);
@@ -231,9 +245,11 @@ describe("Ansteel team CLI", () => {
 			const teamDirectory = join(projectDir, ".pi", "ansteel-team");
 			const statePath = join(teamDirectory, "team.json");
 			const eventsPath = join(teamDirectory, "events.jsonl");
-			if (!existsSync(statePath)) {
-				throw new Error(`Ansteel team state was not created. RPC: ${JSON.stringify(rpc.records())}. Stderr: ${rpc.stderr()}`);
-			}
+			await waitForCondition("the Staff Engineer task claim", () => {
+				if (!existsSync(statePath)) return undefined;
+				const state = JSON.parse(readFileSync(statePath, "utf8")) as { tasks: Array<{ id: string }> };
+				return state.tasks.some((task) => task.id === "TASK-STAFF") ? state : undefined;
+			});
 			expect(existsSync(eventsPath)).toBe(true);
 			const state = JSON.parse(readFileSync(statePath, "utf8")) as {
 				taskOwners: string[];
@@ -264,7 +280,11 @@ describe("Ansteel team CLI", () => {
 
 			const stop = await rpc.send({ id: "stop", type: "prompt", message: `/${teamCommand} stop` });
 			expect(stop).toMatchObject({ success: true, command: "prompt" });
-			expect(JSON.parse(readFileSync(statePath, "utf8"))).toMatchObject({ status: "stopped" });
+			await waitForCondition("the Ansteel team to stop", () => {
+				if (!existsSync(statePath)) return undefined;
+				const state = JSON.parse(readFileSync(statePath, "utf8")) as { status: string };
+				return state.status === "stopped" ? state : undefined;
+			});
 		} finally {
 			await rpc.stop();
 		}
