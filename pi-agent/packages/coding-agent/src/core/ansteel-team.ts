@@ -1,11 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import { ANSTEEL_ROLES, DEFAULT_ANSTEEL_TEAM_TASK_OWNERS, type AnsteelRole } from "./ansteel-discussion.ts";
 
-const ANSTEEL_TEAM_STATE_VERSION = 4;
+const ANSTEEL_TEAM_STATE_VERSION = 6;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
 const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
@@ -20,7 +20,10 @@ export type AnsteelTeamEventType =
 	| "role-failure"
 	| "task-claimed"
 	| "task-submitted"
-	| "task-review";
+	| "task-review"
+	| "milestone-planned"
+	| "milestone-submitted"
+	| "milestone-review";
 
 export interface AnsteelTeamRoleState {
 	model: string;
@@ -41,7 +44,10 @@ export interface AnsteelTeamTask {
 	files: string[];
 	description: string;
 	acceptanceCriteria: string;
-	status: "claimed" | "submitted" | "revision-required" | "approved";
+	/** Immutable task IDs that must be approved before this task can be changed. */
+	dependsOn: string[];
+	/** `blocked` is coordinator-derived from `dependsOn`; roles cannot choose it. */
+	status: "blocked" | "claimed" | "submitted" | "revision-required" | "approved";
 	revision: number;
 	testEvidence: AnsteelTeamTaskTestEvidence[];
 	submissions: AnsteelTeamTaskSubmission[];
@@ -70,12 +76,39 @@ export interface AnsteelTeamTaskReview {
 	reviewedAt: string;
 }
 
+export interface AnsteelTeamMilestone {
+	id: string;
+	taskIds: string[];
+	description: string;
+	acceptanceCriteria: string;
+	status: "blocked" | "ready" | "submitted" | "revision-required" | "approved";
+	revision: number;
+	testEvidence: AnsteelTeamTaskTestEvidence[];
+	submissions: AnsteelTeamMilestoneSubmission[];
+	reviews: AnsteelTeamMilestoneReview[];
+}
+
+export interface AnsteelTeamMilestoneSubmission {
+	revision: number;
+	submittedAt: string;
+	test: AnsteelTeamTaskTestEvidence;
+}
+
+export interface AnsteelTeamMilestoneReview {
+	revision: number;
+	reviewer: AnsteelRole;
+	verdict: "approve" | "reject";
+	issue?: string;
+	reviewedAt: string;
+}
+
 export interface ClaimAnsteelTeamTaskInput {
 	id: string;
 	owner: AnsteelRole;
 	files: string[];
 	description: string;
 	acceptanceCriteria: string;
+	dependsOn?: string[];
 }
 
 export interface RecordAnsteelTeamTaskTestResultInput {
@@ -87,6 +120,13 @@ export interface RecordAnsteelTeamTaskTestResultInput {
 export interface ReviewAnsteelTeamTaskInput {
 	verdict: "approve" | "reject";
 	issue?: string;
+}
+
+export interface CreateAnsteelTeamMilestoneInput {
+	id: string;
+	taskIds: string[];
+	description: string;
+	acceptanceCriteria: string;
 }
 
 export interface AnsteelTeamState {
@@ -102,6 +142,7 @@ export interface AnsteelTeamState {
 	taskOwners: AnsteelRole[];
 	openChallenges: AnsteelTeamChallenge[];
 	tasks: AnsteelTeamTask[];
+	milestones: AnsteelTeamMilestone[];
 	ledgerHeadHash: string | null;
 }
 
@@ -152,6 +193,10 @@ export function getAnsteelTeamEventPath(cwd: string): string {
 	return join(getAnsteelTeamDirectory(cwd), "events.jsonl");
 }
 
+export function getAnsteelTeamTransactionPath(cwd: string): string {
+	return join(getAnsteelTeamDirectory(cwd), "transaction.json");
+}
+
 function getAnsteelTeamRoleSessionPath(cwd: string, role: AnsteelRole): string {
 	return join(getAnsteelTeamDirectory(cwd), "sessions", `${role}.jsonl`);
 }
@@ -197,6 +242,12 @@ function assertChallengeId(id: string | undefined, eventType: AnsteelTeamEventTy
 function assertTaskId(id: unknown): asserts id is string {
 	if (typeof id !== "string" || !/^TASK-[A-Z0-9-]+$/.test(id)) {
 		throw new AnsteelTeamStateError("Ansteel team task IDs must use the TASK-<UPPERCASE-ID> form");
+	}
+}
+
+function assertMilestoneId(id: unknown): asserts id is string {
+	if (typeof id !== "string" || !/^MILESTONE-[A-Z0-9-]+$/.test(id)) {
+		throw new AnsteelTeamStateError("Ansteel team milestone IDs must use the MILESTONE-<UPPERCASE-ID> form");
 	}
 }
 
@@ -288,6 +339,7 @@ function assertState(state: AnsteelTeamState): void {
 			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} requires acceptance criteria`);
 		}
 		if (
+			task.status !== "blocked" &&
 			task.status !== "claimed" &&
 			task.status !== "submitted" &&
 			task.status !== "revision-required" &&
@@ -346,6 +398,130 @@ function assertState(state: AnsteelTeamState): void {
 			}
 		}
 	}
+	assertAnsteelTeamTaskDependencyGraph(state.tasks);
+	assertAnsteelTeamMilestones(state.tasks, state.milestones);
+}
+
+function assertAnsteelTeamTaskDependencyGraph(tasks: readonly AnsteelTeamTask[]): void {
+	const tasksById = new Map(tasks.map((task) => [task.id, task]));
+	for (const task of tasks) {
+		if (!Array.isArray(task.dependsOn) || task.dependsOn.some((dependency) => typeof dependency !== "string")) {
+			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} has invalid dependencies`);
+		}
+		if (new Set(task.dependsOn).size !== task.dependsOn.length) {
+			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} has duplicate dependencies`);
+		}
+		for (const dependency of task.dependsOn) {
+			assertTaskId(dependency);
+			if (dependency === task.id) {
+				throw new AnsteelTeamStateError(`Ansteel team task ${task.id} cannot depend on itself`);
+			}
+			if (!tasksById.has(dependency)) {
+				throw new AnsteelTeamStateError(`Ansteel team task ${task.id} depends on unknown task ${dependency}`);
+			}
+		}
+	}
+
+	const visited = new Set<string>();
+	const visiting = new Set<string>();
+	const visit = (task: AnsteelTeamTask): void => {
+		if (visiting.has(task.id)) throw new AnsteelTeamStateError("Ansteel team task dependency cycle");
+		if (visited.has(task.id)) return;
+		visiting.add(task.id);
+		for (const dependency of task.dependsOn) visit(tasksById.get(dependency)!);
+		visiting.delete(task.id);
+		visited.add(task.id);
+	};
+	for (const task of tasks) visit(task);
+
+	for (const task of tasks) {
+		const dependenciesApproved = task.dependsOn.every(
+			(dependency) => tasksById.get(dependency)?.status === "approved",
+		);
+		if (!dependenciesApproved && task.status !== "blocked") {
+			throw new AnsteelTeamStateError(
+				`Ansteel team task ${task.id} is unblocked before its dependencies are approved`,
+			);
+		}
+		if (dependenciesApproved && task.status === "blocked") {
+			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} is blocked despite approved dependencies`);
+		}
+	}
+}
+
+function reconcileAnsteelTeamTaskDependencies(state: AnsteelTeamState): void {
+	const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
+	for (const task of state.tasks) {
+		const dependenciesApproved = task.dependsOn.every(
+			(dependency) => tasksById.get(dependency)?.status === "approved",
+		);
+		if (!dependenciesApproved && task.status !== "blocked") {
+			task.status = "blocked";
+			task.testEvidence = [];
+		} else if (dependenciesApproved && task.status === "blocked") {
+			task.status = "claimed";
+		}
+	}
+	for (const milestone of state.milestones) {
+		const tasksApproved = milestone.taskIds.every((taskId) => tasksById.get(taskId)?.status === "approved");
+		if (!tasksApproved && milestone.status !== "blocked") {
+			milestone.status = "blocked";
+			milestone.testEvidence = [];
+		} else if (tasksApproved && milestone.status === "blocked") {
+			milestone.status = "ready";
+		}
+	}
+}
+
+function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], milestones: unknown): void {
+	if (!Array.isArray(milestones)) throw new AnsteelTeamStateError("Ansteel team state has invalid milestones");
+	const tasksById = new Map(tasks.map((task) => [task.id, task]));
+	const milestoneIds = new Set<string>();
+	for (const milestone of milestones) {
+		if (!isRecord(milestone)) throw new AnsteelTeamStateError("Ansteel team state has invalid milestone entries");
+		assertMilestoneId(milestone.id);
+		if (milestoneIds.has(milestone.id)) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} is duplicated`);
+		milestoneIds.add(milestone.id);
+		if (!Array.isArray(milestone.taskIds) || milestone.taskIds.length === 0 || milestone.taskIds.some((id) => typeof id !== "string")) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} requires task IDs`);
+		}
+		if (new Set(milestone.taskIds).size !== milestone.taskIds.length) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} cannot repeat a task`);
+		}
+		for (const taskId of milestone.taskIds) {
+			assertTaskId(taskId);
+			if (!tasksById.has(taskId)) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} references unknown task ${taskId}`);
+		}
+		if (typeof milestone.description !== "string" || milestone.description.trim().length === 0) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} requires a description`);
+		}
+		if (typeof milestone.acceptanceCriteria !== "string" || milestone.acceptanceCriteria.trim().length === 0) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} requires acceptance criteria`);
+		}
+		const revision = milestone.revision;
+		if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} has an invalid revision`);
+		}
+		if (!Array.isArray(milestone.testEvidence) || !Array.isArray(milestone.submissions) || !Array.isArray(milestone.reviews)) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} has invalid evidence`);
+		}
+		if (
+			milestone.status !== "blocked" &&
+			milestone.status !== "ready" &&
+			milestone.status !== "submitted" &&
+			milestone.status !== "revision-required" &&
+			milestone.status !== "approved"
+		) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} has an invalid status`);
+		}
+		const tasksApproved = milestone.taskIds.every((taskId) => tasksById.get(taskId)?.status === "approved");
+		if (!tasksApproved && milestone.status !== "blocked") {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} is unblocked before its tasks are approved`);
+		}
+		if (tasksApproved && milestone.status === "blocked") {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} is blocked despite approved tasks`);
+		}
+	}
 }
 
 export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): AnsteelTeamState {
@@ -374,6 +550,7 @@ export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): 
 		taskOwners,
 		openChallenges: [],
 		tasks: [],
+		milestones: [],
 		ledgerHeadHash: null,
 	};
 	assertState(state);
@@ -421,6 +598,9 @@ export function getAnsteelTeamWriteBlockReason(
 	if (task.owner !== role) {
 		return `Ansteel team writes to ${normalizedFile} must be claimed by ${role}; it belongs to ${task.owner} via ${task.id}`;
 	}
+	if (task.status === "blocked") {
+		return `Ansteel team task ${task.id} is waiting for approved dependencies: ${task.dependsOn.join(", ")}`;
+	}
 	if (task.status !== "claimed" && task.status !== "revision-required") {
 		return `Ansteel team task ${task.id} is ${task.status}; code is frozen until peer review returns it for revision`;
 	}
@@ -461,6 +641,22 @@ export function claimAnsteelTeamTask(
 	if (state.tasks.some((task) => task.id === input.id)) {
 		throw new AnsteelTeamStateError(`Ansteel team task ${input.id} already exists`);
 	}
+	const dependsOn = input.dependsOn ?? [];
+	if (!Array.isArray(dependsOn) || dependsOn.some((dependency) => typeof dependency !== "string")) {
+		throw new AnsteelTeamStateError("Ansteel team task dependencies must be task IDs");
+	}
+	if (new Set(dependsOn).size !== dependsOn.length) {
+		throw new AnsteelTeamStateError("Ansteel team task cannot declare the same dependency more than once");
+	}
+	for (const dependency of dependsOn) {
+		assertTaskId(dependency);
+		if (dependency === input.id) {
+			throw new AnsteelTeamStateError(`Ansteel team task ${input.id} cannot depend on itself`);
+		}
+		if (!state.tasks.some((task) => task.id === dependency)) {
+			throw new AnsteelTeamStateError(`Ansteel team task ${input.id} depends on unknown task ${dependency}`);
+		}
+	}
 	const files = [...new Set(input.files.map((file) => normalizeTaskFilePath(projectDirectory, file)))];
 	if (files.length !== input.files.length) {
 		throw new AnsteelTeamStateError("Ansteel team task cannot claim the same file more than once");
@@ -477,7 +673,10 @@ export function claimAnsteelTeamTask(
 		files,
 		description: input.description.trim(),
 		acceptanceCriteria: input.acceptanceCriteria.trim(),
-		status: "claimed",
+		dependsOn: [...dependsOn],
+		status: dependsOn.every((dependency) => state.tasks.find((task) => task.id === dependency)?.status === "approved")
+			? "claimed"
+			: "blocked",
 		revision: 0,
 		testEvidence: [],
 		submissions: [],
@@ -486,6 +685,181 @@ export function claimAnsteelTeamTask(
 	state.tasks.push(task);
 	saveAnsteelTeamState(projectDirectory, state);
 	return task;
+}
+
+export function createAnsteelTeamMilestone(
+	cwd: string,
+	state: AnsteelTeamState,
+	input: CreateAnsteelTeamMilestoneInput,
+): AnsteelTeamMilestone {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertMilestoneId(input.id);
+	if (state.milestones.some((milestone) => milestone.id === input.id)) {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${input.id} already exists`);
+	}
+	if (!Array.isArray(input.taskIds) || input.taskIds.length === 0 || input.taskIds.some((taskId) => typeof taskId !== "string")) {
+		throw new AnsteelTeamStateError("Ansteel team milestone requires task IDs");
+	}
+	if (new Set(input.taskIds).size !== input.taskIds.length) {
+		throw new AnsteelTeamStateError("Ansteel team milestone cannot repeat a task");
+	}
+	for (const taskId of input.taskIds) {
+		assertTaskId(taskId);
+		if (!state.tasks.some((task) => task.id === taskId)) {
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${input.id} references unknown task ${taskId}`);
+		}
+	}
+	if (typeof input.description !== "string" || input.description.trim().length === 0) {
+		throw new AnsteelTeamStateError("Ansteel team milestone requires a description");
+	}
+	if (typeof input.acceptanceCriteria !== "string" || input.acceptanceCriteria.trim().length === 0) {
+		throw new AnsteelTeamStateError("Ansteel team milestone requires acceptance criteria");
+	}
+	const tasksApproved = input.taskIds.every((taskId) => state.tasks.find((task) => task.id === taskId)?.status === "approved");
+	const milestone: AnsteelTeamMilestone = {
+		id: input.id,
+		taskIds: [...input.taskIds],
+		description: input.description.trim(),
+		acceptanceCriteria: input.acceptanceCriteria.trim(),
+		status: tasksApproved ? "ready" : "blocked",
+		revision: 0,
+		testEvidence: [],
+		submissions: [],
+		reviews: [],
+	};
+	state.milestones.push(milestone);
+	saveAnsteelTeamState(projectDirectory, state);
+	return milestone;
+}
+
+function getMilestoneForIntegration(state: AnsteelTeamState, role: AnsteelRole, milestoneId: string): AnsteelTeamMilestone {
+	assertRole(role, "milestone role");
+	if (role !== "tech-lead") throw new AnsteelTeamStateError("Only Ansteel team tech-lead can submit milestone integration evidence");
+	assertMilestoneId(milestoneId);
+	const milestone = state.milestones.find((item) => item.id === milestoneId);
+	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
+	if (milestone.status === "blocked") {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} is waiting for approved tasks`);
+	}
+	if (milestone.status !== "ready" && milestone.status !== "revision-required") {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} cannot accept new integration evidence`);
+	}
+	return milestone;
+}
+
+export function runAnsteelTeamMilestoneTest(
+	cwd: string,
+	state: AnsteelTeamState,
+	role: AnsteelRole,
+	milestoneId: string,
+	command: string,
+): AnsteelTeamTaskTestEvidence {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	const milestone = getMilestoneForIntegration(state, role, milestoneId);
+	if (typeof command !== "string") throw new AnsteelTeamStateError("Ansteel team milestone tests require a command");
+	const normalizedCommand = assertAllowedTaskTestCommand(command);
+	const result = spawnSync(normalizedCommand, {
+		cwd: projectDirectory,
+		encoding: "utf8",
+		shell: true,
+		timeout: ANSTEEL_TEAM_TEST_TIMEOUT_MS,
+		maxBuffer: 4 * 1024 * 1024,
+		windowsHide: true,
+	});
+	const evidence: AnsteelTeamTaskTestEvidence = {
+		command: normalizedCommand,
+		output: `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? `\n${result.error.message}` : ""}`.slice(
+			0,
+			MAX_PUBLIC_EVENT_CONTENT_LENGTH,
+		),
+		isError: result.status !== 0 || result.error !== undefined,
+		completedAt: new Date().toISOString(),
+	};
+	milestone.testEvidence.push(evidence);
+	saveAnsteelTeamState(projectDirectory, state);
+	return evidence;
+}
+
+export function submitAnsteelTeamMilestone(
+	cwd: string,
+	state: AnsteelTeamState,
+	role: AnsteelRole,
+	milestoneId: string,
+	testCommand: string,
+): AnsteelTeamMilestoneSubmission {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	const milestone = getMilestoneForIntegration(state, role, milestoneId);
+	const test = [...milestone.testEvidence]
+		.reverse()
+		.find((evidence) => evidence.command === testCommand.trim() && !evidence.isError);
+	if (!test) {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} requires a successful recorded result for ${testCommand.trim()}`);
+	}
+	const submission: AnsteelTeamMilestoneSubmission = {
+		revision: milestone.revision + 1,
+		submittedAt: new Date().toISOString(),
+		test: { ...test },
+	};
+	milestone.revision = submission.revision;
+	milestone.submissions.push(submission);
+	milestone.status = "submitted";
+	saveAnsteelTeamState(projectDirectory, state);
+	return submission;
+}
+
+export function reviewAnsteelTeamMilestone(
+	cwd: string,
+	state: AnsteelTeamState,
+	reviewer: AnsteelRole,
+	milestoneId: string,
+	input: ReviewAnsteelTeamTaskInput,
+): AnsteelTeamMilestoneReview {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertRole(reviewer, "milestone reviewer");
+	if (reviewer === "tech-lead") throw new AnsteelTeamStateError("Ansteel team tech-lead cannot review its own milestone evidence");
+	assertMilestoneId(milestoneId);
+	const milestone = state.milestones.find((item) => item.id === milestoneId);
+	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
+	if (milestone.status !== "submitted" && milestone.status !== "revision-required") {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} has no submitted integration evidence to review`);
+	}
+	if (input.verdict !== "approve" && input.verdict !== "reject") {
+		throw new AnsteelTeamStateError("Ansteel team milestone review requires approve or reject");
+	}
+	if (input.verdict === "reject" && (typeof input.issue !== "string" || input.issue.trim().length === 0)) {
+		throw new AnsteelTeamStateError("Ansteel team milestone rejection requires an issue");
+	}
+	const submission = milestone.submissions.at(-1);
+	if (!submission || submission.revision !== milestone.revision) {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} has no immutable integration evidence package`);
+	}
+	if (milestone.reviews.some((review) => review.revision === submission.revision && review.reviewer === reviewer)) {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} already has a ${reviewer} review for revision ${submission.revision}`);
+	}
+	const review: AnsteelTeamMilestoneReview = {
+		revision: submission.revision,
+		reviewer,
+		verdict: input.verdict,
+		...(input.verdict === "reject" ? { issue: input.issue!.trim() } : {}),
+		reviewedAt: new Date().toISOString(),
+	};
+	milestone.reviews.push(review);
+	if (review.verdict === "reject") {
+		milestone.status = "revision-required";
+		milestone.testEvidence = [];
+	} else if (
+		["staff-engineer", "qa-engineer"].every((role) =>
+			milestone.reviews.some((item) => item.revision === submission.revision && item.reviewer === role && item.verdict === "approve"),
+		)
+	) {
+		milestone.status = "approved";
+	}
+	saveAnsteelTeamState(projectDirectory, state);
+	return review;
 }
 
 function getTaskForOwner(state: AnsteelTeamState, role: AnsteelRole, taskId: string): AnsteelTeamTask {
@@ -695,6 +1069,7 @@ export function reviewAnsteelTeamTask(
 			task.status = "approved";
 		}
 	}
+	reconcileAnsteelTeamTaskDependencies(state);
 	saveAnsteelTeamState(projectDirectory, state);
 	return review;
 }
@@ -705,6 +1080,43 @@ function writeAnsteelTeamState(path: string, state: AnsteelTeamState): void {
 	const temporaryPath = `${path}.${process.pid}.tmp`;
 	writeFileSync(temporaryPath, `${JSON.stringify(state, null, "\t")}\n`, "utf8");
 	renameSync(temporaryPath, path);
+}
+
+interface AnsteelTeamPendingTransaction {
+	state: AnsteelTeamState;
+	event: AnsteelTeamEvent;
+}
+
+function writeAnsteelTeamPendingTransaction(cwd: string, transaction: AnsteelTeamPendingTransaction): void {
+	const path = getAnsteelTeamTransactionPath(cwd);
+	mkdirSync(getAnsteelTeamDirectory(cwd), { recursive: true });
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	writeFileSync(temporaryPath, `${JSON.stringify(transaction)}\n`, "utf8");
+	renameSync(temporaryPath, path);
+}
+
+function recoverAnsteelTeamPendingTransaction(cwd: string): void {
+	const path = getAnsteelTeamTransactionPath(cwd);
+	if (!existsSync(path)) return;
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		throw new AnsteelTeamStateError(`Ansteel team transaction could not be read: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!isRecord(raw)) throw new AnsteelTeamStateError("Ansteel team transaction must be a JSON object");
+	const state = parseAnsteelTeamState(raw.state);
+	const event = parseAnsteelTeamEvent(raw.event);
+	const events = listAnsteelTeamEvents(cwd);
+	const last = events.at(-1);
+	if (last?.hash !== event.hash) {
+		if (event.sequence !== events.length + 1 || event.previousHash !== (last?.hash ?? null)) {
+			throw new AnsteelTeamStateError("Ansteel team transaction does not continue the event ledger");
+		}
+		appendFileSync(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`, "utf8");
+	}
+	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state);
+	unlinkSync(path);
 }
 
 function getAnsteelTeamDirectoryFromStatePath(path: string): string {
@@ -728,8 +1140,18 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 	if (state.version === 2) state = { ...state, version: 3, ledgerHeadHash: null };
 	if (state.version === 3) {
 		// Version 3 had no owner restriction, so a resume must explicitly confirm all roles.
-		state = { ...state, version: ANSTEEL_TEAM_STATE_VERSION, taskOwners: [...ANSTEEL_ROLES] };
+		state = { ...state, version: 4, taskOwners: [...ANSTEEL_ROLES] };
 	}
+	if (state.version === 4) {
+		state = {
+			...state,
+			version: 5,
+			tasks: Array.isArray(state.tasks)
+				? state.tasks.map((task) => (isRecord(task) ? { ...task, dependsOn: [] } : task))
+				: state.tasks,
+		};
+	}
+	if (state.version === 5) state = { ...state, version: ANSTEEL_TEAM_STATE_VERSION, milestones: [] };
 	return state;
 }
 
@@ -790,6 +1212,7 @@ function migrateLegacyAnsteelTeamEventLedger(cwd: string, state: AnsteelTeamStat
 }
 
 export function loadAnsteelTeamState(cwd: string): AnsteelTeamState | undefined {
+	recoverAnsteelTeamPendingTransaction(cwd);
 	const path = getAnsteelTeamStatePath(cwd);
 	if (!existsSync(path)) return undefined;
 	try {
@@ -823,7 +1246,10 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "role-failure" &&
 		event.type !== "task-claimed" &&
 		event.type !== "task-submitted" &&
-		event.type !== "task-review"
+		event.type !== "task-review" &&
+		event.type !== "milestone-planned" &&
+		event.type !== "milestone-submitted" &&
+		event.type !== "milestone-review"
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
 	}
@@ -968,11 +1394,13 @@ export function appendAnsteelTeamEvent(
 		hash: hashAnsteelTeamEvent(unsignedEvent),
 	});
 	applyAnsteelTeamEvent(state, event);
-	mkdirSync(getAnsteelTeamDirectory(cwd), { recursive: true });
-	appendFileSync(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`, "utf8");
 	state.nextEventSequence = event.sequence + 1;
 	state.ledgerHeadHash = event.hash;
 	state.updatedAt = event.createdAt;
+	writeAnsteelTeamPendingTransaction(cwd, { state, event });
+	mkdirSync(getAnsteelTeamDirectory(cwd), { recursive: true });
+	appendFileSync(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`, "utf8");
 	saveAnsteelTeamState(cwd, state);
+	unlinkSync(getAnsteelTeamTransactionPath(cwd));
 	return event;
 }
