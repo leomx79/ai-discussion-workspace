@@ -1,113 +1,239 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
-</p>
+# Pi Agent Harness 与鞍钢治理扩展
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+本仓库以 [Pi Agent Harness](https://pi.dev) 为底座，提供可扩展的终端编码智能体，并在 `packages/coding-agent` 中加入了鞍钢宪法式多角色工程治理能力。
 
-# Pi Agent Harness
+它解决的不是“让更多模型同时回答”这一件事，而是把工程讨论中的证据、质疑、修订、验证、任务所有权和交付证据变成可检查的状态与记录。
 
-This is the home of the Pi agent harness project including our self extensible coding agent.
+上游 Pi 负责模型接入、会话、工具调用、CLI 和扩展机制；本仓库的鞍钢扩展基于这些原生能力实现，不替换 Pi 的智能体循环。
 
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+## 项目导图
 
-To learn more about Pi:
+[在 XMind 中打开完整运作原理图](https://app.xmind.com/jumpto/chatgpt-generated-content/mXCeINBApEzi?utm_source=ChatGPT)
 
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
+```mermaid
+flowchart TB
+    User[用户与项目目录] --> Pi[Pi Coding Agent]
+    Pi --> Models[多提供商模型与认证]
+    Pi --> Tools[原生工具与扩展]
+    Pi --> Review[pi --ansteel\n退出式治理审查]
+    Pi --> Team[/ansteel-team\n持续协作与受控交付]
 
-## All Packages
+    Review --> RolesA[TL / Staff / QA\n独立调查与双向质疑]
+    RolesA --> Ledger[协调器计算的挑战台账]
+    Ledger --> Signoff[修订、独立验证、共识、双会签]
+    Signoff --> Report[.pi/ansteel-reports\n完整审查报告]
 
-| Package | Description |
-|---------|-------------|
-| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
-| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
-
-For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
-
-## Permissions & Containerization
-
-Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
-
-If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
-
-- **Gondolin extension**: keep `pi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
-- **Plain Docker**: run the whole `pi` process in a local container for simple isolation.
-- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
-
-## Development
-
-```bash
-npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
-npm run build         # Refresh model data, then build all packages
-npm run build:offline # Rebuild using existing model data without network access
-npm run check         # Lint, format, and type check
-./test.sh            # Run tests (skips LLM-dependent tests without API keys)
-./pi-test.sh         # Run pi from sources (can be run from any directory)
+    Team --> RolesB[三份持久角色会话]
+    RolesB --> Task[任务声明与精确文件所有权]
+    Task --> Evidence[真实测试与冻结 Git diff]
+    Evidence --> Peer[两名非所有者独立评审]
+    Peer --> State[.pi/ansteel-team\n状态与哈希事件账本]
 ```
 
-## Building standalone binaries from release source
+## 适用场景
 
-GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the official standalone binaries:
+- 使用 Pi 在代码库中进行交互式分析、编码、测试和会话管理。
+- 对一个方案、改动或项目执行证据优先的三角色工程审查。
+- 让三名持续工作的角色协作交付代码，并强制任务声明、测试证据和同行会签。
+- 接入 OpenAI、Anthropic、Google、OpenAI 兼容服务、本地模型或其他 Pi 支持的提供商。
 
-```bash
-VERSION="<release-version>"
-tar -xzf "pi-${VERSION}-source.tar.gz"
-cd "pi-${VERSION}"
-./scripts/build-binaries.sh --platform linux-x64 --out "$PWD/out"
+不适用场景：把模型结论当作事实、把不同模型名称当作已证明的真实后端隔离，或把审查通过误解为代码已经合并、发布或完成业务验收。
+
+## 系统组成
+
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| `pi-ai` | `packages/ai` | 统一模型 API 与提供商适配。 |
+| `pi-agent-core` | `packages/agent` | 智能体会话、工具调用循环、状态与中止控制。 |
+| `pi-coding-agent` | `packages/coding-agent` | 终端 CLI、交互界面、RPC、内置工具与扩展。 |
+| 鞍钢审查核心 | `packages/coding-agent/src/core/ansteel-discussion.ts` | 三角色审查、挑战台账、不可变共识和报告。 |
+| 鞍钢团队扩展 | `packages/coding-agent/src/extensions/ansteel-team/` | 持久角色会话、受控任务交付与同行评审。 |
+| 团队状态机 | `packages/coding-agent/src/core/ansteel-team.ts` | 任务、测试、Git diff、评审和哈希事件账本。 |
+
+## 两条运行路径
+
+### 1. 非交互治理审查：`pi --ansteel`
+
+该模式针对“这个方案或变更是否经得起工程审查”。它有边界、结束后退出，并生成 Markdown 报告。
+
+```text
+独立调查
+  -> 独立交叉质疑
+  -> 逐条修订
+  -> 独立验证
+  -> TL 共识
+  -> Staff 最终会签
+  -> QA 最终会签
+  -> 批准或拒绝归档
 ```
 
-The script installs dependencies, builds the monorepo, compiles the Bun executable, and stages its runtime assets. Package maintainers who provide dependencies separately can pass `--skip-install --skip-deps`.
+三名治理角色固定为 Tech Lead、Staff Engineer、QA Engineer。协调器负责调度、门禁和归档，不是第四个审查者，也不参与会签。
 
-## Supply-chain hardening
+运行时，三名角色首先独立调查，不读取彼此当轮结论；随后独立质疑同一组工作卡。问题必须使用 `ISSUE: <ID> | TARGET: <role>`，被质疑者必须使用 `RESOLUTION: <ID> | RESOLVED` 回应。验证阶段只有精确的 `VERDICT: APPROVE` 才能通过；带新问题的 `VERDICT: REJECT` 进入下一轮修订，最多两轮。
 
-We treat npm dependency changes as reviewed code changes.
+每个角色阶段都有总墙钟超时，默认 120 秒。缺少角色、模型配置重复、模型不可用、工具超预算、格式不合格、超时或遗漏台账都会失败关闭并归档，而不是静默放行。
 
-- Direct external dependencies are pinned to exact versions. Internal workspace packages remain version-ranged.
-- `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
-- `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1` is set.
-- `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent shrinkwrap.
-- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users.
-- Release smoke tests use `npm run release:local` to build, pack, and create isolated npm and Bun installs outside the repo before tagging a release.
-- Local release installs, documented npm installs, and `pi update --self` use `--ignore-scripts` where supported.
-- CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
-- Shrinkwrap generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
+重要边界：该模式的报告即使 `Governance result: APPROVED`，`Delivery result` 仍为 `NOT_DELIVERED`。审查通过只能说明治理流程通过，不代表实现已经完成。
 
-## Share your OSS coding agent sessions
+### 2. 交互团队交付：`/ansteel-team`
 
-If you use Pi or other coding agents for open source work, please share your sessions.
+该模式用于真实项目工作。它为 TL、Staff、QA 各保留一个 Pi 会话，角色私有历史不互相暴露，宿主时间线仅显示公开更新和可审计事件。
 
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
+```text
+/ansteel-team start <议题>
+  -> 三方独立调查
+  -> 公开交叉质疑
+  -> /ansteel-team ask <协作问题>
+  -> 受控任务声明、修改、测试、评审
+  -> /ansteel-team stop
+```
 
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
+`start` 新建或恢复团队；新团队先完成独立调查与交叉质疑。`ask` 让三个角色带着各自私有会话和同一份公开台账继续协作。`stop` 释放在内存中的角色会话，但保留状态以便后续恢复。
 
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
+团队状态保存在项目目录下：
 
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
+```text
+.pi/ansteel-team/
+  team.json      # 角色、任务权限、任务、测试、提交与评审状态
+  events.jsonl   # 追加式公开事件账本，带顺序与 SHA-256 哈希链
+  sessions/      # 三个角色的持久会话记录
+```
 
-I regularly publish my own `pi-mono` work sessions here:
+恢复时会检查已持久化的角色模型和任务所有权策略；配置变更不会被悄悄套用。若上次宿主中断时角色仍为 `working`，系统先把它记录为失败，避免把未完成阶段伪装成成功。
 
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
+## 交互式代码变更门禁
 
-## License
+默认只有 Staff Engineer 可以承担代码变更任务，TL 和 QA 仍保留完整的质疑与评审职责。项目可通过 `teamTaskOwners` 显式调整这一策略。
 
-MIT
+1. **声明任务**：所有者调用 `ansteel_claim_task`，提供唯一 `TASK-...`、精确的项目相对文件、描述和验收标准。
+2. **隔离写入**：仅任务所有者可通过 `edit` 或 `write` 修改已声明的精确文件。未声明路径、他人路径、`.pi` 治理目录和已提交任务都会被阻断。
+3. **执行真实测试**：所有者调用 `ansteel_submit_change`。系统只接受受限的单条测试或检查命令，记录真实 stdout、stderr、退出结果和时间。
+4. **冻结证据包**：成功测试后，系统在 Git worktree 中捕获仅属于声明文件的非空 diff，形成不可变 revision 证据包。
+5. **独立同行评审**：两名非所有者并发接收相同的测试输出与 diff，彼此看不到当轮评审。各自必须调用 `ansteel_review_task` 给出 `approve` 或附带具体问题的 `reject`。
+6. **状态转换**：两票 `approve` 才会把任务变为 `approved`；任一 `reject` 立即变为 `revision-required`，所有者必须重新修改、测试、提交和评审。
 
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
-</p>
+直接 `bash` 在团队会话中仅允许单条只读检查，不能绕过写入或测试门禁。没有成功测试、没有 Git diff、没有完整双评审，就不会获得交付批准。
+
+## 挑战台账与可信度
+
+### 机械台账，而不是模型自报数字
+
+协调器从合格的 `ISSUE`、`RESOLUTION` 和验证结果计算挑战台账。共识和最终会签阶段会注入同一份不可变摘要，最终报告也由协调器计算数字。
+
+如果模型在共识中声称错误的已解决、开放或总问题数量，审查结果为 `invalid-ledger-summary`。这条规则用于防止“所有 12 个问题都已解决”之类没有事实依据的模型自述通过门禁。
+
+### 证据分级
+
+| 级别 | 含义 | 处理方式 |
+|---|---|---|
+| `L1` | 已验证 | 给出文件、命令输出、测试结果或权威来源。 |
+| `L2` | 高可信 | 说明技术依据，但不伪装为已验证。 |
+| `L3` | 待验证 | 说明未知点与下一步验证方法。 |
+| `L4` | 存疑或未知 | 明确承认不确定，不能转写为结论。 |
+
+系统保证的是流程和证据边界，不保证模型或测试永远正确。不同的 `provider/model` 配置标识也只证明配置不同，不能证明真实后端、端点或模型一定不同；报告会明确标记这种限制。
+
+## 快速开始
+
+### 安装或从源码运行
+
+Pi 的发布包可通过 npm 安装：
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+cd /path/to/your-project
+pi
+```
+
+从本仓库源码运行时，要求 Node.js `>= 22.19.0`：
+
+```powershell
+npm install --ignore-scripts
+.\pi-test.ps1
+```
+
+Windows 需要可用的 Bash。通常安装 Git for Windows 即可；详见 [Windows 配置](packages/coding-agent/docs/windows.md)。
+
+### 配置模型
+
+启动 Pi 后使用 `/login` 进行订阅或 API Key 登录，或按 [提供商文档](packages/coding-agent/docs/providers.md) 配置环境变量。自定义 OpenAI 兼容端点、本地模型与代理请见 [自定义模型](packages/coding-agent/docs/models.md)。
+
+在被审项目中创建 `.pi/ansteel.json`，为三名角色配置模型：
+
+```json
+{
+  "roles": {
+    "tech-lead": { "model": "provider-a/model-a" },
+    "staff-engineer": { "model": "provider-b/model-b", "thinkingLevel": "high" },
+    "qa-engineer": { "model": "provider-c/model-c" }
+  },
+  "stageTimeoutMs": 120000,
+  "maxToolCallsPerStage": 8,
+  "teamTaskOwners": ["staff-engineer"],
+  "allowSingleModel": false
+}
+```
+
+凭据不要写入 `.pi/ansteel.json`，应使用 Pi 的认证存储、环境变量或提供商配置。完整字段、工具权限和恢复语义见 [鞍钢治理文档](packages/coding-agent/docs/ansteel.md)。
+
+### 启动审查或团队
+
+```bash
+# 一次性治理审查：输出阶段进度、完整报告和结果
+pi --ansteel "审查这个电机安全改动"
+```
+
+```text
+# 进入 pi 交互界面后
+/ansteel-team start 审查并实现电机安全改动
+/ansteel-team ask 列出下一项可安全交付的任务与验收条件
+/ansteel-team status
+/ansteel-team stop
+```
+
+## 可观测性与验证
+
+非交互审查会在标准错误输出阶段状态：`role / stage started|completed|failed|timed out`，并把完整转录写入：
+
+```text
+.pi/ansteel-reports/ansteel-<UTC 时间>-<主题>.md
+```
+
+仓库为治理和交付关键点提供确定性回归：
+
+- `ansteel-cli.test.ts`：通过真实 CLI 边界验证错误台账数字会拒绝为 `invalid-ledger-summary`。
+- `ansteel-team-cli.test.ts`：通过真实 RPC 子进程、确定性提供商和角色工具验证默认任务所有权；测试等待持久化完成态，而不把 RPC 预检响应误当作命令完成。
+- `ansteel-team.test.ts`：验证任务、测试证据、Git diff、双评审、状态迁移和哈希账本。
+- `ansteel-team-extension.test.ts`：验证会话启动、超时、恢复、提交后双评审和宿主绕过阻断。
+
+确定性测试证明机制边界；真实提供商运行还应使用小议题观察模型可用性、工具调用、超时和报告，二者不能互相替代。
+
+## 常用文档
+
+| 主题 | 文档 |
+|---|---|
+| Pi 快速开始与基础交互 | [Quickstart](packages/coding-agent/docs/quickstart.md) |
+| 鞍钢审查与团队交付 | [Ansteel](packages/coding-agent/docs/ansteel.md) |
+| 模型与认证提供商 | [Providers](packages/coding-agent/docs/providers.md) |
+| 自定义模型与 OpenAI 兼容服务 | [Custom models](packages/coding-agent/docs/models.md) |
+| 扩展、技能和包 | [Extensions](packages/coding-agent/docs/extensions.md) / [Skills](packages/coding-agent/docs/skills.md) / [Packages](packages/coding-agent/docs/packages.md) |
+| JSON 与 RPC 集成 | [JSON mode](packages/coding-agent/docs/json.md) / [RPC](packages/coding-agent/docs/rpc.md) |
+| 安全与容器化 | [Security](packages/coding-agent/docs/security.md) / [Containerization](packages/coding-agent/docs/containerization.md) |
+| 会话与上下文 | [Sessions](packages/coding-agent/docs/sessions.md) / [Compaction](packages/coding-agent/docs/compaction.md) |
+
+## 开发与安全
+
+```bash
+npm install --ignore-scripts
+npm run build
+npm run check
+./test.sh
+```
+
+Pi 默认以启动它的用户权限访问文件、进程和网络。对于不可信项目或高风险工具，请使用 [Gondolin 扩展、Docker 或 OpenShell](packages/coding-agent/docs/containerization.md) 建立隔离边界。把 Git 提交或其他可恢复检查点作为日常工作流的一部分。
+
+依赖与发布安全策略见根目录 `.npmrc`、`package-lock.json`、`AGENTS.md` 和 `scripts/`。贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 上游与许可
+
+Pi 是开源项目；上游文档与演示见 [pi.dev](https://pi.dev)，本仓库保留其原有包结构与许可。许可证见 [LICENSE](LICENSE)。
