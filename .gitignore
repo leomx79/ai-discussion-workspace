@@ -1,0 +1,35 @@
+# Nested repository metadata is stored outside this workspace after consolidation.
+**/.git
+
+# Dependencies, generated output, and local caches.
+**/node_modules/
+**/dist/
+**/build/
+**/.cache/
+**/__pycache__/
+**/*.py[cod]
+
+# Runtime state, reports, logs, and local tool configuration.
+.ansteel/
+.kilo/
+.superpowers/
+**/.pi/
+*.log
+
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+llm-config.json
+llm-config.ps1
+model-config.ps1
+API配置指南（小白版）.md
+
+# Local backup copies and Windows special-file artifacts.
+*.bak
+*.bak*
+**/nul
+
+# Operating-system metadata.
+**/.DS_Store
+**/Thumbs.db

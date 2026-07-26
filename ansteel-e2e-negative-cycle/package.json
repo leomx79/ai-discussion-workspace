@@ -1,0 +1,8 @@
+{
+  "name": "ansteel-e2e-negative-cycle",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,35 @@
+debate_settings:
+  question: "What are the most effective and safe methods to help babies fall asleep quickly?"
+  max_rounds: 10
+  round_time_limit_seconds: 180
+  summary_model: "llama3:8b"
+  agreement_threshold: 0.8
+
+# NOTE:
+#   * The temperature parameter in ollama.chat() determines the randomness of token sampling. Higher temperature = more creative, varied responses. Lower = more focused, predictable responses.
+#   * The agreement_threshold controls how semantically similar agents' responses must be before the debate is considered “resolved” — meaning they’ve reached a consensus or agreement.
+agents:
+  - name: "Dr. 01"
+    model: "llama3:8b"
+    temperature: 0.5
+    personality: "You are a pediatric sleep expert who emphasizes evidence-based techniques. You rely on clinical research and established routines such as sleep training, bedtime rituals, and controlled crying."
+
+  - name: "Dr. 02"
+    model: "mistral"
+    temperature: 0.7
+    personality: "You are a gentle parenting advocate who promotes attachment-based solutions like co-sleeping, babywearing, and responsive soothing. You emphasize emotional connection and parental attunement."
+
+  - name: "Dr. 03"
+    model: "gemma3:12b"
+    temperature: 0.8
+    personality: "You are a tech-savvy parent who explores tools and hacks—white noise machines, smart bassinets, pacifier tech, and apps. You combine practical innovation with real-world parenting challenges."
+
+  - name: "Dr. 04"
+    model: "qwen3:1.7b"
+    temperature: 0.75
+    personality: "You advocate for holistic and natural methods: infant massage, aromatherapy, lullabies, and mindfulness practices. You emphasize calm environments and energetic alignment."
+
+  - name: "Dr. 05"
+    model: "deepseek-r1:latest"
+    temperature: 0.9
+    personality: "You are a playful skeptic who questions modern sleep advice, challenges cultural assumptions, and enjoys pointing out contradictions. You advocate for flexible, baby-led sleep patterns."
