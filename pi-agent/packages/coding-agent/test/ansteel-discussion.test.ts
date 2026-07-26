@@ -9,14 +9,19 @@ import {
 	AnsteelGovernanceSetupError,
 	type AnsteelRole,
 	createAnsteelEvidencePackage,
+	createAnsteelProjectToolBudget,
 	createAnsteelRawTurnSession,
 	createAnsteelReviewToolPolicy,
+	createAnsteelRunCheckpoint,
 	createAnsteelSetupFailureMarkdown,
+	createAnsteelStageBudgetPolicy,
 	createAnsteelToolBudget,
 	getAnsteelReviewExitCode,
 	loadAnsteelConfig,
+	loadAnsteelRunCheckpoint,
 	runAnsteelDiscussion,
 	runAnsteelProjectReview,
+	updateAnsteelRunCheckpoint,
 	writeAnsteelReport,
 } from "../src/core/ansteel-discussion.ts";
 import { getAnsteelModelBoundary } from "../src/main.ts";
@@ -114,8 +119,14 @@ const COMPLETE_WORK_CARD = [
 	"## Questions for Peers\n[L2] Review the stated evidence and trade-offs.",
 ].join("\n\n");
 
+const COMPLETE_REVISION_WORK_CARD = [
+	COMPLETE_WORK_CARD,
+	"## Challenge Responses\n[L2] Each resolved challenge is explained with its evidence and remaining risk.",
+	"## Recommended Actions\n[L2] Assign the next verification task with a scope and acceptance criterion.",
+].join("\n\n");
+
 function completeWorkCard(response: string): string {
-	return `${response}\n\n${COMPLETE_WORK_CARD}`;
+	return `${response}\n\n${COMPLETE_REVISION_WORK_CARD}`;
 }
 
 const MUTUAL_REVIEW_RESPONSES: Record<AnsteelDiscussionStage, string> = {
@@ -128,9 +139,9 @@ const MUTUAL_REVIEW_RESPONSES: Record<AnsteelDiscussionStage, string> = {
 		"ISSUE: STAFF-CROSS | TARGET: qa-engineer\nNO ISSUES | TARGET: tech-lead\n[L2] Challenge the test strategy.",
 	"qa-cross-examination":
 		"ISSUE: QA-CROSS | TARGET: tech-lead\nNO ISSUES | TARGET: staff-engineer\n[L2] Challenge the evidence boundary.",
-	"architecture-revision": `RESOLUTION: QA-CROSS | RESOLVED\n[L2] Tech Lead revised work card\n\n${COMPLETE_WORK_CARD}`,
-	"staff-revision": `RESOLUTION: TL-CROSS | RESOLVED\n[L2] Staff revised work card\n\n${COMPLETE_WORK_CARD}`,
-	"qa-revision": `RESOLUTION: STAFF-CROSS | RESOLVED\n[L2] QA revised work card\n\n${COMPLETE_WORK_CARD}`,
+	"architecture-revision": `RESOLUTION: QA-CROSS | RESOLVED\n[L2] Tech Lead revised work card\n\n${COMPLETE_REVISION_WORK_CARD}`,
+	"staff-revision": `RESOLUTION: TL-CROSS | RESOLVED\n[L2] Staff revised work card\n\n${COMPLETE_REVISION_WORK_CARD}`,
+	"qa-revision": `RESOLUTION: STAFF-CROSS | RESOLVED\n[L2] QA revised work card\n\n${COMPLETE_REVISION_WORK_CARD}`,
 	"tech-lead-verification": "VERDICT: APPROVE",
 	"staff-verification": "VERDICT: APPROVE",
 	"qa-verification": "VERDICT: APPROVE",
@@ -276,7 +287,13 @@ describe("runAnsteelDiscussion", () => {
 			);
 			expect(prompt).toContain("Emit no `RESOLUTION` marker when no open challenge ID is assigned to you.");
 			expect(prompt).toContain(
-				"After those resolution markers, publish the revised work card with each exact heading once and nonempty content: `## Conclusion`, `## Evidence`, `## Assumptions and Unknowns`, `## Alternatives and Trade-offs`, `## Self-Refutation Conditions`, and `## Questions for Peers`.",
+				"After those resolution markers, publish the revised work card with each exact heading once and nonempty content: `## Conclusion`, `## Evidence`, `## Assumptions and Unknowns`, `## Alternatives and Trade-offs`, `## Self-Refutation Conditions`, `## Questions for Peers`, `## Challenge Responses`, and `## Recommended Actions`.",
+			);
+			expect(prompt).toContain(
+				"In Challenge Responses, explain the evidence, decision, and remaining risk for each resolution instead of merely repeating its marker.",
+			);
+			expect(prompt).toContain(
+				"In Recommended Actions, state the owner or decision maker, scope, and acceptance condition for each next step; when no action is needed, explain why current evidence is sufficient.",
 			);
 			expect(prompt).toContain(
 				"Do not emit `VERDICT`, `ISSUE`, or `NO ISSUES` markers in this revision stage; reserve them for a subsequent verification stage if required.",
@@ -410,6 +427,20 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.verdict).toBe("rejected");
 		expect(result.terminationReason).toBe("incomplete-work-card");
 		expect(result.transcript.at(-1)?.stage).toBe("architecture-revision");
+	});
+
+	it("requires each revision to explain challenge responses and recommend actions", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Review explanation and action requirements",
+			runRole: async ({ stage }) =>
+				stage === "architecture-revision"
+					? `RESOLUTION: QA-CROSS | RESOLVED\n\n${COMPLETE_WORK_CARD}`
+					: responseForMutualReviewStage(stage),
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(result.terminationReason).toBe("incomplete-work-card");
+		expect(result.markdown).toContain("missing required visible sections: Challenge Responses, Recommended Actions");
 	});
 
 	it("rejects a qualified revision heading with an empty body", async () => {
@@ -651,6 +682,204 @@ describe("runAnsteelDiscussion", () => {
 		budget.reset();
 		expect(budget.getStageFailureReason()).toBeUndefined();
 		expect(budget.beforeToolCall("bash", { command: "npm test", timeout: 20 })).toBeUndefined();
+	});
+
+	it("creates a bounded stage policy with immutable hard and project limits", () => {
+		expect(
+			createAnsteelStageBudgetPolicy({
+				stageTimeoutMs: 40,
+				maxStageTimeoutMs: 60,
+				timeoutExtensionMs: 10,
+				maxStageExtensions: 1,
+				projectTimeoutMs: 200,
+				maxToolCallsPerStage: 2,
+				maxProjectToolCalls: 5,
+			}),
+		).toEqual({
+			stageTimeoutMs: 40,
+			maxStageTimeoutMs: 60,
+			timeoutExtensionMs: 10,
+			maxStageExtensions: 1,
+			projectTimeoutMs: 200,
+			maxToolCallsPerStage: 2,
+			maxProjectToolCalls: 5,
+		});
+		expect(() =>
+			createAnsteelStageBudgetPolicy({
+				stageTimeoutMs: 60,
+				maxStageTimeoutMs: 40,
+			}),
+		).toThrow("Ansteel maxStageTimeoutMs must be at least stageTimeoutMs");
+	});
+
+	it("rejects tool calls after the project-wide tool budget is exhausted", () => {
+		const budget = createAnsteelProjectToolBudget(2);
+
+		expect(budget.tryConsumeToolCall()).toBeUndefined();
+		expect(budget.tryConsumeToolCall()).toBeUndefined();
+		expect(budget.tryConsumeToolCall()).toBe(
+			"Ansteel project tool budget of 2 executions is exhausted. Provide the evidence-labelled conclusion without requesting more tools.",
+		);
+		expect(budget.getUsedToolCalls()).toBe(2);
+	});
+
+	it("creates a recovery checkpoint outside historical reports", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-"));
+		temporaryDirectories.push(cwd);
+		mkdirSync(join(cwd, ".pi", "ansteel-reports"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "ansteel-reports", "old-review.md"), "historical model output", "utf8");
+
+		const checkpoint = createAnsteelRunCheckpoint({
+			cwd,
+			topic: "Recover provider failure",
+			roleModels: {
+				"tech-lead": "tech/lead",
+				"staff-engineer": "staff/engineer",
+				"qa-engineer": "qa/engineer",
+			},
+			now: new Date("2026-07-26T00:00:00.000Z"),
+		});
+
+		expect(checkpoint.path).toMatch(
+			/\.pi[\\/]ansteel-runs[\\/]ansteel-run-2026-07-26T00-00-00-000Z[\\/]checkpoint\.json$/,
+		);
+		expect(loadAnsteelRunCheckpoint(checkpoint.path)).toMatchObject({
+			status: "active",
+			topic: "Recover provider failure",
+			roleModels: checkpoint.state.roleModels,
+			events: [],
+		});
+		updateAnsteelRunCheckpoint(checkpoint, {
+			status: "failed",
+			event: { type: "failed", detail: "stage-timeout" },
+			now: new Date("2026-07-26T00:01:00.000Z"),
+		});
+		expect(loadAnsteelRunCheckpoint(checkpoint.path)).toMatchObject({
+			status: "failed",
+			updatedAt: "2026-07-26T00:01:00.000Z",
+			events: [expect.objectContaining({ type: "failed", detail: "stage-timeout" })],
+		});
+	});
+
+	it("fails over only an explicitly configured role after a recoverable provider failure", async () => {
+		type TestModel = { provider: string; id: string };
+		const createdModels: string[] = [];
+		const disposedModels: string[] = [];
+
+		const result = await runAnsteelProjectReview<TestModel>({
+			topic: "Recover a transient provider failure",
+			cwd: process.cwd(),
+			config: {
+				allowProviderFallback: true,
+				roles: {
+					"tech-lead": { model: "tech/primary", fallbackModels: ["tech/fallback"], tools: ["read"] },
+					"staff-engineer": { model: "staff/primary", tools: ["read"] },
+					"qa-engineer": { model: "qa/primary", tools: ["read"] },
+				},
+				reportDirectory: "unused",
+			},
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async ({ model }) => {
+				const reference = `${model.provider}/${model.id}`;
+				createdModels.push(reference);
+				return {
+					prompt: async (prompt) => {
+						if (reference === "tech/primary") throw new Error("HTTP 503 service unavailable");
+						return responseForMutualReviewStage(getStageFromPrompt(prompt));
+					},
+					dispose: () => {
+						disposedModels.push(reference);
+					},
+				};
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(createdModels).toEqual(["tech/primary", "staff/primary", "qa/primary", "tech/fallback"]);
+		expect(disposedModels).toContain("tech/primary");
+		expect(result.providerFallbacks).toEqual([
+			expect.objectContaining({
+				role: "tech-lead",
+				fromModel: "tech/primary",
+				toModel: "tech/fallback",
+				failureClass: "transient",
+			}),
+		]);
+		expect(result.markdown).toContain("## Provider Recovery");
+	});
+
+	it("persists a completed project review to a dedicated run checkpoint when enabled", async () => {
+		type TestModel = { provider: string; id: string };
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-review-"));
+		temporaryDirectories.push(cwd);
+
+		const result = await runAnsteelProjectReview<TestModel>({
+			topic: "Persist recoverable review state",
+			cwd,
+			enableRunCheckpoints: true,
+			config: {
+				roles: {
+					"tech-lead": { model: "tech/lead", tools: ["read"] },
+					"staff-engineer": { model: "staff/engineer", tools: ["read"] },
+					"qa-engineer": { model: "qa/engineer", tools: ["read"] },
+				},
+				reportDirectory: "unused",
+			},
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async () => ({
+				prompt: async (prompt) => responseForMutualReviewStage(getStageFromPrompt(prompt)),
+				dispose: () => {},
+			}),
+		});
+
+		expect(result.runCheckpointPath).toBeDefined();
+		if (!result.runCheckpointPath) throw new Error("Expected a run checkpoint path");
+		expect(loadAnsteelRunCheckpoint(result.runCheckpointPath)).toMatchObject({
+			status: "completed",
+			topic: "Persist recoverable review state",
+			events: expect.arrayContaining([expect.objectContaining({ type: "completed" })]),
+		});
+	});
+
+	it("extends a stage once for new redacted evidence and records the budget ledger", async () => {
+		const progress: string[] = [];
+		const result = await runAnsteelDiscussion({
+			topic: "Review adaptive stage budget",
+			stageBudgetPolicy: {
+				stageTimeoutMs: 10,
+				maxStageTimeoutMs: 30,
+				timeoutExtensionMs: 20,
+				maxStageExtensions: 1,
+				projectTimeoutMs: 500,
+				maxToolCallsPerStage: 4,
+				maxProjectToolCalls: 20,
+			},
+			getStageAudit: () => ({
+				events: [
+					{ type: "tool-execution-end", elapsedMs: 1, toolName: "read", isError: false, evidenceProgress: true },
+				],
+			}),
+			onStageEvent: ({ type, role, stage, budget }) => {
+				if (type === "budget-extended") progress.push(`${role}/${stage}:${budget.stageTimeoutMs}`);
+			},
+			runRole: async ({ stage }) => {
+				if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 15));
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(progress).toEqual(["tech-lead/architecture:30"]);
+		expect(result.budgetLedger[0]).toMatchObject({
+			role: "tech-lead",
+			stage: "architecture",
+			outcome: "completed",
+			extensions: 1,
+			toolCalls: 1,
+			maxStageTimeoutMs: 30,
+		});
+		expect(result.markdown).toContain("## Budget Ledger");
+		expect(result.markdown).not.toContain("src/main.ts");
 	});
 
 	it("blocks all tool execution during the one permitted format repair", () => {
@@ -1991,14 +2220,12 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		expect(result.verdict).toBe("approved");
-		expect(calls.filter((call) => call.stage.includes("cross-examination")).map((call) => call.toolsEnabled)).toEqual([
-			false,
-			false,
-			false,
-		]);
-		expect(calls.filter((call) => !call.stage.includes("cross-examination")).every((call) => call.toolsEnabled === true)).toBe(
-			true,
+		expect(calls.filter((call) => call.stage.includes("cross-examination")).map((call) => call.toolsEnabled)).toEqual(
+			[false, false, false],
 		);
+		expect(
+			calls.filter((call) => !call.stage.includes("cross-examination")).every((call) => call.toolsEnabled === true),
+		).toBe(true);
 	});
 
 	it("archives a project-session prompt failure and disposes every created session", async () => {

@@ -6,17 +6,22 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	appendAnsteelTeamEvent,
 	claimAnsteelTeamTask,
+	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
 	getAnsteelTeamEventPath,
 	getAnsteelTeamStatePath,
+	getAnsteelTeamTransactionPath,
 	getAnsteelTeamWriteBlockReason,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
 	recordAnsteelTeamTaskTestResult,
+	reviewAnsteelTeamMilestone,
 	reviewAnsteelTeamTask,
+	runAnsteelTeamMilestoneTest,
 	runAnsteelTeamTaskTest,
 	saveAnsteelTeamState,
 	submitAnsteelTeamTask,
+	submitAnsteelTeamMilestone,
 } from "../src/core/ansteel-team.ts";
 
 const temporaryDirectories: string[] = [];
@@ -83,7 +88,7 @@ describe("Ansteel team state", () => {
 
 		const migrated = loadAnsteelTeamState(cwd);
 
-		expect(migrated).toMatchObject({ version: 4, tasks: [], ledgerHeadHash: null });
+		expect(migrated).toMatchObject({ version: 6, tasks: [], milestones: [], ledgerHeadHash: null });
 		expect(migrated?.roles).toEqual(team.roles);
 	});
 
@@ -118,8 +123,8 @@ describe("Ansteel team state", () => {
 			previousHash: null,
 			hash: expect.stringMatching(/^[a-f0-9]{64}$/),
 		});
-		expect(migrated).toMatchObject({ version: 4, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
-		expect(persistedState).toMatchObject({ version: 4, ledgerHeadHash: events[0]?.hash });
+		expect(migrated).toMatchObject({ version: 6, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
+		expect(persistedState).toMatchObject({ version: 6, ledgerHeadHash: events[0]?.hash });
 		expect(persistedEvent).toMatchObject({ previousHash: null, hash: events[0]?.hash });
 	});
 
@@ -134,9 +139,9 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		const persistedState = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
 
-		expect(migrated).toMatchObject({ version: 4, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
+		expect(migrated).toMatchObject({ version: 6, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
 		expect(persistedState).toMatchObject({
-			version: 4,
+			version: 6,
 			taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"],
 		});
 	});
@@ -196,6 +201,31 @@ describe("Ansteel team state", () => {
 		expect(loadAnsteelTeamState(cwd)?.nextEventSequence).toBe(3);
 		expect(listAnsteelTeamEvents(cwd)).toEqual([report, challenge]);
 		expect(readFileSync(getAnsteelTeamEventPath(cwd), "utf8").trim().split("\n")).toHaveLength(2);
+	});
+
+	it("recovers an interrupted event transaction whether the ledger append happened or not", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		saveAnsteelTeamState(cwd, team);
+		const before = readFileSync(getAnsteelTeamStatePath(cwd), "utf8");
+		const event = appendAnsteelTeamEvent(cwd, team, {
+			type: "role-report",
+			role: "tech-lead",
+			content: "L1: captured recoverable state.",
+		});
+		const candidate = readFileSync(getAnsteelTeamStatePath(cwd), "utf8");
+		writeFileSync(getAnsteelTeamStatePath(cwd), before, "utf8");
+		writeFileSync(getAnsteelTeamTransactionPath(cwd), `${JSON.stringify({ state: JSON.parse(candidate), event })}\n`, "utf8");
+
+		expect(loadAnsteelTeamState(cwd)).toMatchObject({ nextEventSequence: 2, ledgerHeadHash: event.hash });
+		expect(() => readFileSync(getAnsteelTeamTransactionPath(cwd), "utf8")).toThrow();
+
+		writeFileSync(getAnsteelTeamEventPath(cwd), "", "utf8");
+		writeFileSync(getAnsteelTeamStatePath(cwd), before, "utf8");
+		writeFileSync(getAnsteelTeamTransactionPath(cwd), `${JSON.stringify({ state: JSON.parse(candidate), event })}\n`, "utf8");
+
+		expect(loadAnsteelTeamState(cwd)).toMatchObject({ nextEventSequence: 2, ledgerHeadHash: event.hash });
+		expect(listAnsteelTeamEvents(cwd)).toEqual([event]);
 	});
 
 	it("links event hashes and rejects a tampered event ledger", () => {
@@ -330,6 +360,157 @@ describe("Ansteel team state", () => {
 				["staff-engineer", "tech-lead"],
 			),
 		).toMatchObject({ owner: "tech-lead", status: "claimed" });
+	});
+
+	it("derives a dependent task's lock and release from approved predecessors", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const predecessor = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-PARSER",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Implement the parser boundary.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const dependent = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-INTEGRATION",
+			owner: "staff-engineer",
+			files: ["src/integration.ts"],
+			description: "Integrate the approved parser boundary.",
+			acceptanceCriteria: "The integration test passes.",
+			dependsOn: ["TASK-PARSER"],
+		});
+
+		expect(dependent).toMatchObject({ dependsOn: ["TASK-PARSER"], status: "blocked" });
+		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "src/integration.ts")).toContain(
+			"waiting for approved dependencies",
+		);
+
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", predecessor.id, {
+			command: "npm test -- parser",
+			output: "PASS parser boundary",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", predecessor.id, "npm test -- parser");
+		reviewAnsteelTeamTask(cwd, team, "tech-lead", predecessor.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(cwd, team, "qa-engineer", predecessor.id, { verdict: "approve" });
+
+		expect(dependent.status).toBe("claimed");
+		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "src/integration.ts")).toBeUndefined();
+
+		predecessor.status = "revision-required";
+		expect(() => saveAnsteelTeamState(cwd, team)).toThrow("is unblocked before its dependencies are approved");
+	});
+
+	it("rejects unknown, self-referential, and cyclic task dependencies", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+
+		expect(() =>
+			claimAnsteelTeamTask(cwd, team, {
+				id: "TASK-UNKNOWN",
+				owner: "staff-engineer",
+				files: ["src/unknown.ts"],
+				description: "Depend on a missing task.",
+				acceptanceCriteria: "Never runs.",
+				dependsOn: ["TASK-MISSING"],
+			}),
+		).toThrow("depends on unknown task TASK-MISSING");
+		expect(() =>
+			claimAnsteelTeamTask(cwd, team, {
+				id: "TASK-SELF",
+				owner: "staff-engineer",
+				files: ["src/self.ts"],
+				description: "Depend on itself.",
+				acceptanceCriteria: "Never runs.",
+				dependsOn: ["TASK-SELF"],
+			}),
+		).toThrow("cannot depend on itself");
+
+		const first = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-FIRST",
+			owner: "staff-engineer",
+			files: ["src/first.ts"],
+			description: "First task.",
+			acceptanceCriteria: "Never runs.",
+		});
+		const second = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-SECOND",
+			owner: "staff-engineer",
+			files: ["src/second.ts"],
+			description: "Second task.",
+			acceptanceCriteria: "Never runs.",
+		});
+		(first as typeof first & { dependsOn: string[] }).dependsOn = [second.id];
+		(second as typeof second & { dependsOn: string[] }).dependsOn = [first.id];
+
+		expect(() => saveAnsteelTeamState(cwd, team)).toThrow("task dependency cycle");
+	});
+
+	it("requires task approval, a real integration test, and two independent milestone reviews", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		mkdirSync(join(cwd, "test"), { recursive: true });
+		writeFileSync(join(cwd, "test", "integration.test.mjs"), "import test from 'node:test';\ntest('integration', () => {});\n", "utf8");
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-PARSER",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Implement the parser boundary.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const milestone = createAnsteelTeamMilestone(cwd, team, {
+			id: "MILESTONE-PARSER-INTEGRATION",
+			taskIds: [task.id],
+			description: "Integrate the parser boundary with the application.",
+			acceptanceCriteria: "The integration test passes and both independent reviewers approve.",
+		});
+
+		expect(milestone.status).toBe("blocked");
+		expect(() =>
+			runAnsteelTeamMilestoneTest(
+				cwd,
+				team,
+				"tech-lead",
+				milestone.id,
+				"node --test test/integration.test.mjs",
+			),
+		).toThrow("is waiting for approved tasks");
+
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS parser boundary",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+
+		expect(milestone.status).toBe("ready");
+		const evidence = runAnsteelTeamMilestoneTest(
+			cwd,
+			team,
+			"tech-lead",
+			milestone.id,
+			"node --test test/integration.test.mjs",
+		);
+		expect(evidence).toMatchObject({ isError: false, command: "node --test test/integration.test.mjs" });
+		const submission = submitAnsteelTeamMilestone(
+			cwd,
+			team,
+			"tech-lead",
+			milestone.id,
+			"node --test test/integration.test.mjs",
+		);
+		expect(submission.test.output).toMatch(/pass 1/i);
+		reviewAnsteelTeamMilestone(cwd, team, "staff-engineer", milestone.id, { verdict: "approve" });
+		reviewAnsteelTeamMilestone(cwd, team, "qa-engineer", milestone.id, { verdict: "approve" });
+
+		expect(milestone.status).toBe("approved");
 	});
 
 	it("submits an immutable scoped diff only after a successful recorded test", () => {

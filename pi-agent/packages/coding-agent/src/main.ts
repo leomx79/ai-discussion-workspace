@@ -830,26 +830,32 @@ export async function main(args: string[], options?: MainOptions) {
 		const reviewCwd = sessionManager.getCwd();
 		let config: AnsteelConfig | undefined;
 		try {
-			const loadedConfig = loadAnsteelConfig(reviewCwd);
+			const smokeConfigPath = process.env.PI_ANSTEEL_CONFIG_PATH;
+			const loadedConfig = loadAnsteelConfig(reviewCwd, smokeConfigPath === undefined ? undefined : smokeConfigPath);
 			config = loadedConfig;
 			const review = await runAnsteelProjectReview({
 				topic: parsed.ansteel,
 				cwd: reviewCwd,
+				enableRunCheckpoints: true,
 				config: loadedConfig,
 				resolveModel: (provider, id) => {
 					const model = modelRuntime.getModel(provider, id);
 					return model && modelRuntime.hasConfiguredAuth(model.provider) ? model : undefined;
 				},
-				onStageEvent: ({ type, role, stage, reason }) => {
+				onStageEvent: ({ type, role, stage, reason, budget }) => {
 					const status =
 						type === "started"
 							? "started"
 							: type === "completed"
 								? "completed"
-								: type === "timed-out"
-									? "timed out"
-									: "failed";
-					process.stderr.write(`[Ansteel] ${role} / ${stage} ${status}${reason ? `: ${reason}` : ""}\n`);
+								: type === "budget-extended"
+									? "budget extended"
+									: type === "timed-out"
+										? "timed out"
+										: "failed";
+					process.stderr.write(
+						`[Ansteel] ${role} / ${stage} ${status}; stage-budget=${budget.stageTimeoutMs}/${budget.maxStageTimeoutMs}ms; project-tools=${budget.projectToolCallsUsed}/${budget.maxProjectToolCalls}${reason ? `: ${reason}` : ""}\n`,
+					);
 				},
 				createRoleSession: async ({
 					model,
@@ -859,6 +865,7 @@ export async function main(args: string[], options?: MainOptions) {
 					skillPaths,
 					cwd: roleCwd,
 					maxToolCallsPerStage,
+					projectToolBudget,
 				}) => {
 					if (memoryFile !== undefined && !existsSync(memoryFile)) {
 						throw new Error(`Ansteel role memory file does not exist: ${memoryFile}`);
@@ -892,7 +899,7 @@ export async function main(args: string[], options?: MainOptions) {
 						tools: [...tools],
 						customTools: [],
 					});
-					const toolBudget = createAnsteelToolBudget(maxToolCallsPerStage);
+					const toolBudget = createAnsteelToolBudget(maxToolCallsPerStage, projectToolBudget);
 					const configuredToolNames = [...tools];
 					const reviewToolPolicy = createAnsteelReviewToolPolicy(roleCwd);
 					const previousBeforeToolCall = created.session.agent.beforeToolCall;
