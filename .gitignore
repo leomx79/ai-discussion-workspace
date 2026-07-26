@@ -15,6 +15,7 @@
 .superpowers/
 **/.pi/
 *.log
+artifacts/runtime/
 
 # Local credentials and machine-specific configuration.
 .env

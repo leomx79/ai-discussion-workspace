@@ -12,6 +12,7 @@
 import openai
 import json
 from datetime import datetime
+from pathlib import Path
 
 # ============================================================
 # 配置区：同一个模型，不同的"帽子"
@@ -280,7 +281,9 @@ if __name__ == "__main__":
     result = ansteel_discussion(topic)
 
     # 保存讨论记录
-    log_file = f"discussion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    output_dir = Path(__file__).parent / "artifacts" / "runtime" / "legacy-discussions"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / f"discussion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(log_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 

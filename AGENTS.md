@@ -240,7 +240,7 @@ TL 架构 v0
 | `llm-config.json` | 角色/模型/API 配置 |
 | `agent-llm.py` | 旧版单智能体脚本（保留备用） |
 | `ask-llm.ps1` | 旧版一次性问答脚本（保留备用） |
-| `ansteel-solution-*.md` | 讨论记录归档 |
+| `docs/legacy/solutions/` | 历史讨论记录归档；旧脚本的新运行产物写入 `artifacts/runtime/legacy-solutions/` |
 
 ---
 

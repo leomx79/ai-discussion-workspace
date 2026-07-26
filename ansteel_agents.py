@@ -1079,7 +1079,9 @@ SE 已回应质疑，TL 已做裁决。请你作为 QA Engineer 审核：
 
     # 保存文件
     filename = f"ansteel-solution-{now.strftime('%Y-%m-%d')}-{topic_short}.md"
-    filepath = SCRIPT_DIR / filename
+    output_dir = SCRIPT_DIR / "artifacts" / "runtime" / "legacy-solutions"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filepath = output_dir / filename
     filepath.write_text(output, encoding="utf-8")
     if verbose:
         print(f"\n[SAVED] {filepath}", file=sys.stderr)

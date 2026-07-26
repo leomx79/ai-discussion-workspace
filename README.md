@@ -50,7 +50,8 @@ flowchart TB
 | [`ansteel-e2e-real-glm-gpt/`](ansteel-e2e-real-glm-gpt/) | 真实提供商审查的运行夹具与报告位置。 | 验证 |
 | [`kilo-ansteel-template/`](kilo-ansteel-template/) | Kilo Code 中的鞍钢讨论集成模板。 | 并行集成 |
 | [`_ref_crewai_debate/`](_ref_crewai_debate/)、[`_ref_llm_discussion/`](_ref_llm_discussion/)、[`_ref_local_debate/`](_ref_local_debate/) | 第三方或本地讨论实现，用于能力和设计对照。 | 参考 |
-| 根目录 Python、PowerShell、Markdown | 早期外部模型脚本、设计方案、讨论记录和回测资料。 | 历史资料 |
+| [`docs/legacy/`](docs/legacy/) | 早期设计方案、配置指南、讨论记录和解决方案归档。 | 历史资料 |
+| 根目录兼容脚本 | `ansteel_agents.py`、`agent-llm.py`、`ansteel_discussion.py` 和 PowerShell 桥接脚本；保留以兼容旧工作流。 | 历史入口 |
 
 ## 当前主产品：`pi-agent`
 
@@ -166,8 +167,8 @@ node_modules/、dist/、build/、缓存、Python 字节码
 | 从源码启动 Pi | [pi-agent/pi-test.ps1](pi-agent/pi-test.ps1) |
 | 配置模型、代理或本地 OpenAI 兼容服务 | [docs/models.md](pi-agent/packages/coding-agent/docs/models.md) |
 | 配置认证与提供商 | [docs/providers.md](pi-agent/packages/coding-agent/docs/providers.md) |
-| 查看早期架构判断 | [pi-agent-analysis.md](pi-agent-analysis.md) |
-| 查看历史方案演进 | [鞍钢宪法式AI防幻觉讨论方案_V6.md](鞍钢宪法式AI防幻觉讨论方案_V6.md) |
+| 查看早期架构判断 | [pi-agent-analysis.md](docs/legacy/design/pi-agent-analysis.md) |
+| 查看历史方案演进 | [鞍钢宪法式AI防幻觉讨论方案_V6.md](docs/legacy/design/鞍钢宪法式AI防幻觉讨论方案_V6.md) |
 
 ## 许可证与来源
 
