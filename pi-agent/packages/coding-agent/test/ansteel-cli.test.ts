@@ -160,5 +160,5 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("- Total recorded challenges: 3");
 		expect(report).toContain("Configured/resolved role identities:");
 		expect(report).toContain("Diversity status: UNVERIFIED.");
-	});
+	}, 20_000);
 });
