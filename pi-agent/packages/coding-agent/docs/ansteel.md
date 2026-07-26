@@ -57,12 +57,12 @@ The coordinator runs these stages in order:
 
 1. Tech Lead, Staff Engineer, and QA Engineer each independently investigate the same topic and publish a work card. Their work-card prompts do not include another role's conclusion.
 2. Each role receives the same three work cards and independently cross-examines the other roles' claims, evidence, omissions, alternatives, and trade-offs.
-3. For at most two revision rounds, every role publishes a response and revised work card that resolves every open challenge assigned to that role.
+3. For at most two revision rounds, every role publishes a response and revised work card that resolves every open challenge assigned to that role. The revision must explain the evidence, decision, and remaining risk behind each response, then propose actionable next steps with an owner or decision maker, scope, and acceptance condition.
 4. Tech Lead, Staff Engineer, and QA Engineer independently verify the same set of three revised work cards. Their current-round verification answers are not shared until all three are complete.
 5. All three verifiers must approve. A valid rejection creates the next revision round; exhausting the cap rejects the review.
 6. Tech Lead writes consensus from the visible evidence, followed by immutable Staff Engineer and QA Engineer sign-off.
 
-Work cards must contain visible Markdown headings with nonempty body content for `Conclusion`, `Evidence`, `Assumptions and Unknowns`, `Alternatives and Trade-offs`, `Self-Refutation Conditions`, and `Questions for Peers`. Missing any required heading or leaving its body empty rejects the review. The transcript shares these auditable materials, not hidden model reasoning. Each role still has its own in-memory session, role-local memory, and configured Skill set; role sessions load no extensions or custom tools.
+Initial work cards must contain visible Markdown headings with nonempty body content for `Conclusion`, `Evidence`, `Assumptions and Unknowns`, `Alternatives and Trade-offs`, `Self-Refutation Conditions`, and `Questions for Peers`. Revised work cards additionally require `Challenge Responses` and `Recommended Actions`. `Challenge Responses` explains why each issue can be closed and what risk remains; `Recommended Actions` turns the discussion into a proposed owner or decision maker, scope, and acceptance condition. Missing any required heading or leaving its body empty rejects the review. The transcript shares these auditable materials, not hidden model reasoning. Each role still has its own in-memory session, role-local memory, and configured Skill set; role sessions load no extensions or custom tools.
 
 Every role stage has a total wall-clock deadline independent of the provider HTTP idle timeout. The default is 120 seconds. When that deadline expires, Pi aborts the active role session, rejects the review with `stage-timeout`, and continues through normal cleanup and report writing rather than waiting indefinitely.
 
@@ -87,6 +87,8 @@ Each role revision must include this exact marker for every open challenge assig
 ```text
 RESOLUTION: STAFF-1 | RESOLVED
 ```
+
+The marker is only the ledger transition. The revised work card must also explain the response in `Challenge Responses` and convert the resulting decision into testable `Recommended Actions`; a marker alone does not constitute team discussion or a delivery plan.
 
 Missing, duplicated, unknown, self-targeted, or malformed issue and resolution markers reject the review. A verification rejection must add at least one new targeted `ISSUE` marker; a rejection without a new issue is rejected as unsupported rather than silently retried.
 

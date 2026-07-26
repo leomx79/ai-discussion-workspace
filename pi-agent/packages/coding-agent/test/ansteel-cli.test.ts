@@ -23,10 +23,19 @@ const COMPLETE_WORK_CARD = [
 	"[L2] No further questions.",
 ].join("\n");
 
+const COMPLETE_REVISION_WORK_CARD = [
+	COMPLETE_WORK_CARD,
+	"## Challenge Responses",
+	"[L2] The resolution is supported by the cited evidence and retains the stated residual risk.",
+	"## Recommended Actions",
+	"[L2] Staff Engineer verifies the change within the claimed scope using the stated acceptance criterion.",
+].join("\n");
+
 const DETERMINISTIC_PROVIDER_EXTENSION = `
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 
 const completeWorkCard = ${JSON.stringify(COMPLETE_WORK_CARD)};
+const completeRevisionWorkCard = ${JSON.stringify(COMPLETE_REVISION_WORK_CARD)};
 
 function register(pi, provider, model, responses) {
 	const faux = fauxProvider({ provider, models: [{ id: model }] });
@@ -38,20 +47,20 @@ export default function (pi) {
 	register(pi, "deterministic-tech", "tech", [
 		completeWorkCard,
 		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
-		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeWorkCard,
+		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
 		"VERDICT: APPROVE",
 		"[L1] Consensus\\nAll 2 ledger entries are resolved.",
 	]);
 	register(pi, "deterministic-staff", "staff", [
 		completeWorkCard,
 		"ISSUE: STAFF-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: qa-engineer",
-		"RESOLUTION: TL-1 | RESOLVED\\n\\n" + completeWorkCard,
+		"RESOLUTION: TL-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
 		"VERDICT: APPROVE",
 	]);
 	register(pi, "deterministic-qa", "qa", [
 		completeWorkCard,
 		"ISSUE: QA-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: staff-engineer",
-		completeWorkCard,
+		completeRevisionWorkCard,
 		"VERDICT: APPROVE",
 	]);
 }

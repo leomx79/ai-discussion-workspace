@@ -114,8 +114,14 @@ const COMPLETE_WORK_CARD = [
 	"## Questions for Peers\n[L2] Review the stated evidence and trade-offs.",
 ].join("\n\n");
 
+const COMPLETE_REVISION_WORK_CARD = [
+	COMPLETE_WORK_CARD,
+	"## Challenge Responses\n[L2] Each resolved challenge is explained with its evidence and remaining risk.",
+	"## Recommended Actions\n[L2] Assign the next verification task with a scope and acceptance criterion.",
+].join("\n\n");
+
 function completeWorkCard(response: string): string {
-	return `${response}\n\n${COMPLETE_WORK_CARD}`;
+	return `${response}\n\n${COMPLETE_REVISION_WORK_CARD}`;
 }
 
 const MUTUAL_REVIEW_RESPONSES: Record<AnsteelDiscussionStage, string> = {
@@ -128,9 +134,9 @@ const MUTUAL_REVIEW_RESPONSES: Record<AnsteelDiscussionStage, string> = {
 		"ISSUE: STAFF-CROSS | TARGET: qa-engineer\nNO ISSUES | TARGET: tech-lead\n[L2] Challenge the test strategy.",
 	"qa-cross-examination":
 		"ISSUE: QA-CROSS | TARGET: tech-lead\nNO ISSUES | TARGET: staff-engineer\n[L2] Challenge the evidence boundary.",
-	"architecture-revision": `RESOLUTION: QA-CROSS | RESOLVED\n[L2] Tech Lead revised work card\n\n${COMPLETE_WORK_CARD}`,
-	"staff-revision": `RESOLUTION: TL-CROSS | RESOLVED\n[L2] Staff revised work card\n\n${COMPLETE_WORK_CARD}`,
-	"qa-revision": `RESOLUTION: STAFF-CROSS | RESOLVED\n[L2] QA revised work card\n\n${COMPLETE_WORK_CARD}`,
+	"architecture-revision": `RESOLUTION: QA-CROSS | RESOLVED\n[L2] Tech Lead revised work card\n\n${COMPLETE_REVISION_WORK_CARD}`,
+	"staff-revision": `RESOLUTION: TL-CROSS | RESOLVED\n[L2] Staff revised work card\n\n${COMPLETE_REVISION_WORK_CARD}`,
+	"qa-revision": `RESOLUTION: STAFF-CROSS | RESOLVED\n[L2] QA revised work card\n\n${COMPLETE_REVISION_WORK_CARD}`,
 	"tech-lead-verification": "VERDICT: APPROVE",
 	"staff-verification": "VERDICT: APPROVE",
 	"qa-verification": "VERDICT: APPROVE",
@@ -276,7 +282,13 @@ describe("runAnsteelDiscussion", () => {
 			);
 			expect(prompt).toContain("Emit no `RESOLUTION` marker when no open challenge ID is assigned to you.");
 			expect(prompt).toContain(
-				"After those resolution markers, publish the revised work card with each exact heading once and nonempty content: `## Conclusion`, `## Evidence`, `## Assumptions and Unknowns`, `## Alternatives and Trade-offs`, `## Self-Refutation Conditions`, and `## Questions for Peers`.",
+				"After those resolution markers, publish the revised work card with each exact heading once and nonempty content: `## Conclusion`, `## Evidence`, `## Assumptions and Unknowns`, `## Alternatives and Trade-offs`, `## Self-Refutation Conditions`, `## Questions for Peers`, `## Challenge Responses`, and `## Recommended Actions`.",
+			);
+			expect(prompt).toContain(
+				"In Challenge Responses, explain the evidence, decision, and remaining risk for each resolution instead of merely repeating its marker.",
+			);
+			expect(prompt).toContain(
+				"In Recommended Actions, state the owner or decision maker, scope, and acceptance condition for each next step; when no action is needed, explain why current evidence is sufficient.",
 			);
 			expect(prompt).toContain(
 				"Do not emit `VERDICT`, `ISSUE`, or `NO ISSUES` markers in this revision stage; reserve them for a subsequent verification stage if required.",
@@ -410,6 +422,20 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.verdict).toBe("rejected");
 		expect(result.terminationReason).toBe("incomplete-work-card");
 		expect(result.transcript.at(-1)?.stage).toBe("architecture-revision");
+	});
+
+	it("requires each revision to explain challenge responses and recommend actions", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Review explanation and action requirements",
+			runRole: async ({ stage }) =>
+				stage === "architecture-revision"
+					? `RESOLUTION: QA-CROSS | RESOLVED\n\n${COMPLETE_WORK_CARD}`
+					: responseForMutualReviewStage(stage),
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(result.terminationReason).toBe("incomplete-work-card");
+		expect(result.markdown).toContain("missing required visible sections: Challenge Responses, Recommended Actions");
 	});
 
 	it("rejects a qualified revision heading with an empty body", async () => {

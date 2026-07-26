@@ -1176,6 +1176,12 @@ const REQUIRED_WORK_CARD_SECTIONS = [
 	"Questions for Peers",
 ] as const;
 
+const REQUIRED_REVISION_WORK_CARD_SECTIONS = [
+	...REQUIRED_WORK_CARD_SECTIONS,
+	"Challenge Responses",
+	"Recommended Actions",
+] as const;
+
 const WORK_CARD_INSTRUCTIONS = [
 	`Use these visible sections in every work card: ${REQUIRED_WORK_CARD_SECTIONS.map((section) => `## ${section}`).join(", ")}.`,
 	"Evidence must name the current file, command, test, or source used. Do not present private reasoning as evidence.",
@@ -1190,7 +1196,8 @@ const INITIAL_WORK_CARD_INSTRUCTIONS = [
 const REVISION_WORK_CARD_INSTRUCTIONS = [
 	"Before the revised work card, for every open challenge ID assigned to you, emit exactly one whole-line `RESOLUTION: <assigned-ID> | RESOLVED` marker.",
 	"Emit no `RESOLUTION` marker when no open challenge ID is assigned to you.",
-	"After those resolution markers, publish the revised work card with each exact heading once and nonempty content: `## Conclusion`, `## Evidence`, `## Assumptions and Unknowns`, `## Alternatives and Trade-offs`, `## Self-Refutation Conditions`, and `## Questions for Peers`.",
+	"After those resolution markers, publish the revised work card with each exact heading once and nonempty content: `## Conclusion`, `## Evidence`, `## Assumptions and Unknowns`, `## Alternatives and Trade-offs`, `## Self-Refutation Conditions`, `## Questions for Peers`, `## Challenge Responses`, and `## Recommended Actions`.",
+	"In Challenge Responses, explain the evidence, decision, and remaining risk for each resolution instead of merely repeating its marker. In Recommended Actions, state the owner or decision maker, scope, and acceptance condition for each next step; when no action is needed, explain why current evidence is sufficient.",
 	"Do not emit `VERDICT`, `ISSUE`, or `NO ISSUES` markers in this revision stage; reserve them for a subsequent verification stage if required.",
 ].join(" ");
 
@@ -1245,7 +1252,7 @@ const STAGE_INSTRUCTIONS: Record<AnsteelDiscussionStage, string> = {
 	"staff-verification": `Independently verify the three revised work cards against the ledger using project evidence and tools. ${VERIFICATION_VERDICT_INSTRUCTIONS}`,
 	"qa-verification": `Independently verify the three revised work cards against the ledger using project evidence and tools. ${VERIFICATION_VERDICT_INSTRUCTIONS}`,
 	consensus:
-		"Produce the final consensus. Separate verified conclusions, unresolved risks, and required follow-up work.",
+		"Produce the final consensus. Resolve the competing recommendations into a decision, explain the selected trade-off, and carry forward the prioritized recommended actions with their owners, scope, and acceptance conditions. Separate verified conclusions, unresolved risks, and required follow-up work.",
 	"staff-sign-off":
 		"Review the Tech Lead consensus in the transcript. It is immutable: do not rewrite or replace it. End with the required explicit verdict marker.",
 	"qa-sign-off":
@@ -1641,11 +1648,12 @@ function isBlankRoleResponse(response: string): boolean {
 
 function getRequiredWorkCardSection(
 	headingText: string,
+	requiredSections: readonly string[],
 	allowParenthesizedQualifier: boolean,
-): (typeof REQUIRED_WORK_CARD_SECTIONS)[number] | undefined {
+): string | undefined {
 	const sectionText = /^(?:##\s+)?(.+)$/.exec(headingText)?.[1];
 	if (!sectionText) return undefined;
-	for (const section of REQUIRED_WORK_CARD_SECTIONS) {
+	for (const section of requiredSections) {
 		if (sectionText === section) return section;
 		if (
 			allowParenthesizedQualifier &&
@@ -1658,12 +1666,16 @@ function getRequiredWorkCardSection(
 	return undefined;
 }
 
-function getMissingWorkCardSections(response: string, allowParenthesizedQualifier = false): string[] {
+function getMissingWorkCardSections(
+	response: string,
+	requiredSections: readonly string[] = REQUIRED_WORK_CARD_SECTIONS,
+	allowParenthesizedQualifier = false,
+): string[] {
 	const headings = Array.from(response.matchAll(/^#{1,6}\s+(.+?)\s*$/gm)).map((heading) => ({
 		heading,
-		section: getRequiredWorkCardSection(heading[1], allowParenthesizedQualifier),
+		section: getRequiredWorkCardSection(heading[1], requiredSections, allowParenthesizedQualifier),
 	}));
-	return REQUIRED_WORK_CARD_SECTIONS.filter((section) => {
+	return requiredSections.filter((section) => {
 		const headingIndex = headings.findIndex((candidate) => candidate.section === section);
 		if (headingIndex === -1) return true;
 		const heading = headings[headingIndex].heading;
@@ -2101,7 +2113,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			const stageOptions = { round, context: revisionContext, challengeLedger };
 			let result = await runRequiredStage(role, stage, stageOptions);
 			if ("rejection" in result) return result.rejection;
-			let missingSections = getMissingWorkCardSections(result.response, true);
+			let missingSections = getMissingWorkCardSections(result.response, REQUIRED_REVISION_WORK_CARD_SECTIONS, true);
 			if (missingSections.length > 0) {
 				return reject(
 					`${role} / ${stage} work card is missing required visible sections: ${missingSections.join(", ")}`,
@@ -2114,7 +2126,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			if (resolutionError && isRepairableResolutionMarkerError(resolutionError)) {
 				result = await runSingleFormatRepair(role, stage, stageOptions, result.entry, resolutionError);
 				if ("rejection" in result) return result.rejection;
-				missingSections = getMissingWorkCardSections(result.response, true);
+				missingSections = getMissingWorkCardSections(result.response, REQUIRED_REVISION_WORK_CARD_SECTIONS, true);
 				if (missingSections.length > 0) {
 					return reject(
 						`${role} / ${stage} work card is missing required visible sections: ${missingSections.join(", ")}`,
