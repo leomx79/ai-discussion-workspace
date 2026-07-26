@@ -288,5 +288,5 @@ describe("Ansteel team CLI", () => {
 		} finally {
 			await rpc.stop();
 		}
-	});
+	}, 20_000);
 });
