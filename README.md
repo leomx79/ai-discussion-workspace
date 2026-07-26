@@ -25,7 +25,7 @@ flowchart TB
     Live --> Runtime[一次真实运行的可观测证据]
 ```
 
-> XMind 工作区导图待补：2026-07-26 两次生成请求均因 XMind 服务端 `504` 超时而未产生文件。当前 Mermaid 图与下文目录结构是同一份工作区导图结构。
+> [在 XMind 中打开工作区全景导图](https://app.xmind.com/jumpto/chatgpt-generated-content/apUfIO1nUDG7?utm_source=ChatGPT)。该图与本页 Mermaid 总览和下文目录结构保持一致。
 
 ## 这个工作区解决什么问题
 
