@@ -30,8 +30,10 @@ import {
 	createAnsteelReviewToolPolicy,
 	createAnsteelSetupFailureMarkdown,
 	createAnsteelToolBudget,
+	getAnsteelRunCheckpointPath,
 	getAnsteelDefaultReportDirectory,
 	getAnsteelReviewExitCode,
+	loadAnsteelRunCheckpoint,
 	loadAnsteelConfig,
 	runAnsteelProjectReview,
 	writeAnsteelReport,
@@ -119,7 +121,7 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 }
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
-	if (parsed.ansteel !== undefined) {
+	if (parsed.ansteel !== undefined || parsed.ansteelResume !== undefined) {
 		return "print";
 	}
 	if (parsed.mode === "rpc") {
@@ -821,22 +823,28 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
-	if (appMode !== "interactive" && !session.model && parsed.ansteel === undefined) {
+	if (appMode !== "interactive" && !session.model && parsed.ansteel === undefined && parsed.ansteelResume === undefined) {
 		console.error(chalk.red(formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
 
-	if (parsed.ansteel !== undefined) {
+	if (parsed.ansteel !== undefined || parsed.ansteelResume !== undefined) {
 		const reviewCwd = sessionManager.getCwd();
 		let config: AnsteelConfig | undefined;
+		let reviewTopic = parsed.ansteel;
 		try {
+			if (parsed.ansteelResume !== undefined) {
+				reviewTopic = loadAnsteelRunCheckpoint(getAnsteelRunCheckpointPath(reviewCwd, parsed.ansteelResume)).topic;
+			}
+			if (reviewTopic === undefined) throw new Error("Ansteel review requires a topic or resumable checkpoint");
 			const smokeConfigPath = process.env.PI_ANSTEEL_CONFIG_PATH;
 			const loadedConfig = loadAnsteelConfig(reviewCwd, smokeConfigPath === undefined ? undefined : smokeConfigPath);
 			config = loadedConfig;
 			const review = await runAnsteelProjectReview({
-				topic: parsed.ansteel,
+				topic: reviewTopic,
 				cwd: reviewCwd,
 				enableRunCheckpoints: true,
+				...(parsed.ansteelResume === undefined ? {} : { resumeRunId: parsed.ansteelResume }),
 				config: loadedConfig,
 				resolveModel: (provider, id) => {
 					const model = modelRuntime.getModel(provider, id);
@@ -924,7 +932,7 @@ export async function main(args: string[], options?: MainOptions) {
 						if (await previousShouldStopAfterTurn?.(context)) return true;
 						return toolBudget.getStageFailureReason() !== undefined;
 					};
-					return createAnsteelRawTurnSession({
+					const rawTurnSession = createAnsteelRawTurnSession({
 						prompt: async (text, promptOptions) => {
 							const toolsEnabled = promptOptions?.toolsEnabled ?? true;
 							created.session.setActiveToolsByName(toolsEnabled ? configuredToolNames : []);
@@ -944,6 +952,10 @@ export async function main(args: string[], options?: MainOptions) {
 						abort: () => created.session.abort(),
 						dispose: () => created.session.dispose(),
 					});
+					return {
+						...rawTurnSession,
+						setToolBudgetExtensionHandler: (handler) => toolBudget.setExtensionHandler(handler),
+					};
 				},
 			});
 			const roleModels = ANSTEEL_ROLES.map((role) => {
@@ -951,6 +963,14 @@ export async function main(args: string[], options?: MainOptions) {
 				return `- ${role}: ${model.provider}/${model.id}`;
 			}).join("\n");
 			const modelBoundary = getAnsteelModelBoundary(loadedConfig.allowSingleModel === true);
+			if (review.verdict === "paused") {
+				stopThemeWatcher();
+				restoreStdout();
+				console.log(review.markdown);
+				console.log(`Ansteel review paused: ${review.runCheckpointPath ?? "checkpoint unavailable"}`);
+				process.exitCode = 0;
+				return;
+			}
 			const reportPath = writeAnsteelReport({
 				reportDirectory: loadedConfig.reportDirectory,
 				topic: review.topic,
@@ -969,8 +989,8 @@ export async function main(args: string[], options?: MainOptions) {
 			try {
 				const reportPath = writeAnsteelReport({
 					reportDirectory: config?.reportDirectory ?? getAnsteelDefaultReportDirectory(reviewCwd),
-					topic: parsed.ansteel,
-					markdown: createAnsteelSetupFailureMarkdown({ topic: parsed.ansteel, config, error }),
+					topic: reviewTopic ?? "Ansteel resume",
+					markdown: createAnsteelSetupFailureMarkdown({ topic: reviewTopic ?? "Ansteel resume", config, error }),
 				});
 				console.log(`Ansteel review rejected: ${reportPath}`);
 			} catch {

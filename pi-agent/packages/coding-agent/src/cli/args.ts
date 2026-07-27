@@ -36,6 +36,7 @@ export interface Args {
 	noExtensions?: boolean;
 	print?: boolean;
 	ansteel?: string;
+	ansteelResume?: string;
 	export?: string;
 	noSkills?: boolean;
 	skills?: string[];
@@ -151,6 +152,17 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				result.diagnostics.push({ type: "error", message: "--ansteel requires a review topic" });
 			}
+		} else if (arg === "--ansteel-resume") {
+			if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
+				result.diagnostics.push({ type: "error", message: "--ansteel-resume requires a run ID" });
+			} else {
+				const runId = args[++i];
+				if (!/^ansteel-run-[A-Za-z0-9-]+$/.test(runId)) {
+					result.diagnostics.push({ type: "error", message: "--ansteel-resume requires a safe Ansteel run ID" });
+				} else {
+					result.ansteelResume = runId;
+				}
+			}
 		} else if (arg === "--export" && i + 1 < args.length) {
 			result.export = args[++i];
 		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
@@ -213,6 +225,13 @@ export function parseArgs(args: string[]): Args {
 		}
 	}
 
+	if (result.ansteel !== undefined && result.ansteelResume !== undefined) {
+		result.diagnostics.push({ type: "error", message: "--ansteel and --ansteel-resume cannot be used together" });
+	}
+	if (result.resume === true && result.ansteelResume !== undefined) {
+		result.diagnostics.push({ type: "error", message: "--resume cannot be used with --ansteel-resume" });
+	}
+
 	return result;
 }
 
@@ -250,6 +269,7 @@ ${chalk.bold("Options:")}
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
   --ansteel <topic>              Run an evidence-first multi-role engineering review and exit
+	--ansteel-resume <run-id>       Resume a checkpointed Ansteel review epoch
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

@@ -22,7 +22,21 @@ pi --ansteel "Review the motor safety change"
 Ansteel review approved: /project/.pi/ansteel-reports/ansteel-2026-07-22-10-30-00-review-the-motor-safety-change.md
 ```
 
+## Resume a bounded review
+
+Every `--ansteel` run writes coordinator-owned state under `.pi/ansteel-runs/<run-id>/checkpoint.json`. A process may be restarted after a committed role stage with:
+
+```bash
+pi --ansteel-resume ansteel-run-2026-07-28T00-00-00-000Z
+```
+
+`--ansteel-resume` accepts only a generated run ID. It cannot be combined with `--ansteel` or Pi's ordinary `--resume/-r` session selector. Before creating any role session, Pi reloads the v3 checkpoint and rejects a resume when the review root, immutable evidence-package hash, coordinator configuration fingerprint, or any configured role provider/model identity changed. It preserves the original project start and hard deadline, so a resumed process never receives a fresh project SLA; an expired checkpoint is archived before prompting the next role. New checkpoints retain the bounded evidence-file path selection and its candidate count, then rebuild exactly that selection on resume: a changed, deleted, unreadable, or out-of-bound selected file rejects the resume; a later unselected ordinary file cannot alter ordering or enter the historical evidence boundary. Checkpoints are local protected governance records: they retain the frozen evidence and committed role responses needed for deterministic replay, but never credentials, raw tool arguments, or tool output. They restore the project-wide tool count and deterministically replay only coordinator validation for committed transcript entries; those completed role prompts are never sent to a provider again.
+
+When an enabled `adaptiveBudgetPolicy.epochTimeoutMs` boundary is reached between committed role stages, Pi reports `PAUSED`, leaves the checkpoint in `ready-to-resume`, increments its epoch counter, and exits with success rather than publishing a rejected review report. The next `--ansteel-resume` invocation opens fresh short-lived role sessions and continues from the next uncommitted stage.
+
 There is no fallback to the current Pi model. Before naming each role model, make sure it is available and authenticated in Pi. Use `/login`, `pi --list-models`, and the normal [Providers](providers.md) and [Custom models](models.md) setup as needed. A role can use only its explicitly configured fallback chain, and only when provider fallback is enabled for the review.
+
+For a monorepo review, do not rely on a topic's relative paths to reach a parent directory. Set `reviewRoot` to `git-root` and declare every workflow, document, or configuration file that must be in the shared evidence package. Before any role session is created, Pi resolves the Git root, rejects missing, excluded, out-of-root, binary, or over-limit required paths, and retains declared files ahead of the normal evidence-file limit. The default `cwd` scope remains unchanged for ordinary single-project reviews.
 
 ## Run an interactive team
 
@@ -143,6 +157,12 @@ Create `.pi/ansteel.json` in the project being reviewed. The `model` field is re
     }
   },
   "reportDirectory": ".pi/ansteel-reports",
+	"reviewRoot": "git-root",
+	"requiredEvidencePaths": [
+		".github/workflows/ansteel-delivery.yml",
+		"pi-agent/packages/coding-agent/docs/ansteel-acceptance.md",
+		"pi-agent/.pi/ansteel.json"
+	],
   "stageTimeoutMs": 120000,
 	"maxToolCallsPerStage": 8,
 	"stageBudgetPolicy": {
@@ -178,16 +198,20 @@ Keep API credentials out of `.pi/ansteel.json`. Configure authentication through
 
 `reportDirectory` is resolved from the project directory and must remain inside it. Omit it to use the default `.pi/ansteel-reports` location.
 
+`reviewRoot` is optional and defaults to `cwd`. Set it to `git-root` only when the review must include repository-level evidence outside the command's current subdirectory. Pi walks upward only to the first Git root; it never lets model-provided paths expand the boundary. `requiredEvidencePaths` is optional and contains root-relative supported text files. Every declared file must exist, stay within the resolved review root, remain outside generated Ansteel state, and fit within the 24-file evidence package cap. Declared files are hashed and included before ordinary discovered files. Review tools also run from the resolved root, so role prompts use manifest paths directly, without a launch-subdirectory prefix or `../` traversal.
+
 `stageTimeoutMs` is optional and defaults to `120000`. It is the soft `--ansteel` stage limit and must be an integer from `1` through `2147483647` milliseconds. It applies to both `--ansteel` review stages and interactive team investigations or task reviews; an interactive timeout still aborts the role when possible and records a public `role-failure` event.
 
 `maxToolCallsPerStage` is optional and defaults to `4`. It must be an integer from `1` through `32`. A tool request beyond the configured budget rejects the current review stage rather than allowing an unbounded tool loop.
 
 `stageBudgetPolicy` is optional and applies to `--ansteel`. It may set `maxStageTimeoutMs`, `timeoutExtensionMs`, `maxStageExtensions`, `projectTimeoutMs`, and `maxProjectToolCalls`; it can also override the soft `stageTimeoutMs` and `maxToolCallsPerStage` together. Defaults are one 30-second extension, a stage hard ceiling of the soft limit plus 30 seconds, a one-hour project ceiling, and 96 tool executions across all role sessions. `maxStageTimeoutMs` must be at least the soft stage limit, `projectTimeoutMs` must be at least the stage hard ceiling, and `maxProjectToolCalls` must be at least the per-stage tool ceiling. Set `maxStageExtensions` to `0` to disable extension. A project-wide tool budget is consumed before executing each permitted tool request and is shared by all three roles.
 
+`adaptiveBudgetPolicy` is optional and disabled unless `enabled: true`. When enabled, the coordinator uses observed successful new evidence, necessary unfinished governance output, duplicate/blocked request counts, project hard limits, and protected verification/sign-off reserves to decide each small time or tool allocation. Model text cannot request or justify allocation. Its bounded integer fields are `projectTimeoutMs`, `maxProjectToolCalls`, `timeExtensionMs`, `toolExtensionCalls`, `maxBlockedRequestsPerStage`, `maxDuplicateRequestsPerStage`, `protectedVerificationTimeMs`, `protectedVerificationToolCalls`, and `epochTimeoutMs`. Protected reserves must be strictly smaller than their project ceilings. `enabled: false` is equivalent to omitting the policy and retains fixed-budget behavior.
+
 ## Reports and governance evidence
 
-Every completed approval or rejection writes a complete, unedited Markdown transcript to `.pi/ansteel-reports/` by default. A configuration, model-resolution, or role-session construction failure also writes a sanitized rejected setup report, even when the configuration could not be parsed. The filename includes a UTC timestamp and a topic-derived slug. The CLI also creates a separate live checkpoint at `.pi/ansteel-runs/<run-id>/checkpoint.json`; it records only coordinator state, stage lifecycle, fallback events, and terminal status. Reports are historical model output and are never loaded as recovery state or review evidence.
+Every completed approval or rejection writes a complete, unedited Markdown transcript and the immutable project evidence package to `.pi/ansteel-reports/` by default. A configuration, model-resolution, or role-session construction failure also writes a sanitized rejected setup report, even when the configuration could not be parsed; it may not include an evidence package when preflight failed. The filename includes a UTC timestamp and a topic-derived slug. The CLI also creates a separate live checkpoint at `.pi/ansteel-runs/<run-id>/checkpoint.json`; it records immutable recovery identities, the next coordinator action, committed transcript, redacted stage audits, fixed and adaptive budget ledgers, challenge/revision state, provider fallback identities, and terminal or resumable status. Reports are historical model output and are never loaded as recovery state or review evidence.
 
-`Governance result` records whether the required role review, verification, and sign-off gates passed. It does not mean the reviewed task was implemented, proven, or otherwise delivered. `Delivery result` is therefore always `NOT_DELIVERED` for `--ansteel`; read the consensus and evidence sections for the review's feasibility conclusion and any next engineering task.
+`Governance result` records whether the required role review, verification, and sign-off gates passed. It does not mean the reviewed task was implemented, proven, or otherwise delivered. `Delivery result` is therefore always `NOT_DELIVERED` for `--ansteel`. A rejected report does not publish a standalone Tech Lead consensus section: the raw response remains in the complete transcript, but no governance conclusion was formed without both final sign-offs.
 
-The report records the result, challenge ledger, revision-round outcomes, complete role responses, configured/resolved role identities, Tech Lead consensus when it exists, and a coordinator-derived budget ledger. The budget ledger contains only elapsed time, tool counts, extension counts, hard ceilings, and outcomes; it intentionally stores neither credentials, raw provider endpoints, tool arguments, nor tool output. A distinct configured-identity check does not prove backend model or provider diversity, and it does not prove that any factual claim is true. Retain cited file, tool, test, or source evidence; model identity configuration supplements rather than replaces it.
+The report records the result, challenge ledger, revision-round outcomes, complete role responses, configured/resolved role identities, Tech Lead consensus when it exists, and coordinator-derived fixed and adaptive budget ledgers. The adaptive ledger records every grant or denial and the observed reason before the transcript; role prose cannot override it. The ledgers intentionally store neither credentials, raw provider endpoints, tool arguments, nor tool output. A distinct configured-identity check does not prove backend model or provider diversity, and it does not prove that any factual claim is true. Retain cited file, tool, test, or source evidence; model identity configuration supplements rather than replaces it.
