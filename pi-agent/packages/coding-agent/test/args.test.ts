@@ -72,6 +72,25 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--ansteel-resume flag", () => {
+		test("parses a safe Ansteel run ID", () => {
+			const result = parseArgs(["--ansteel-resume", "ansteel-run-2026-07-27T00-00-00-000Z"]);
+			expect(result.ansteelResume).toBe("ansteel-run-2026-07-27T00-00-00-000Z");
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("rejects a missing, path-like, or conflicting Ansteel resume request", () => {
+			for (const args of [
+				["--ansteel-resume"],
+				["--ansteel-resume", "../checkpoint"],
+				["--ansteel", "topic", "--ansteel-resume", "ansteel-run-2026-07-27T00-00-00-000Z"],
+				["--resume", "--ansteel-resume", "ansteel-run-2026-07-27T00-00-00-000Z"],
+			]) {
+				expect(parseArgs(args).diagnostics.some((diagnostic) => diagnostic.type === "error")).toBe(true);
+			}
+		});
+	});
+
 	describe("--continue flag", () => {
 		test("parses --continue flag", () => {
 			const result = parseArgs(["--continue"]);

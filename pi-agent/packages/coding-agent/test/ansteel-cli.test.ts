@@ -102,6 +102,39 @@ function createTemporaryProject(): { agentDir: string; projectDir: string } {
 	return { agentDir, projectDir };
 }
 
+function configureGitRootEvidence(projectDir: string): void {
+	const reviewRoot = resolve(projectDir, "..");
+	mkdirSync(join(reviewRoot, ".git"));
+	mkdirSync(join(reviewRoot, ".github", "workflows"), { recursive: true });
+	mkdirSync(join(projectDir, "docs"), { recursive: true });
+	writeFileSync(join(reviewRoot, ".github", "workflows", "ansteel-delivery.yml"), "name: delivery\n", "utf8");
+	writeFileSync(join(projectDir, "docs", "ansteel-acceptance.md"), "# Acceptance\n", "utf8");
+	writeFileSync(
+		join(projectDir, ".pi", "ansteel.json"),
+		JSON.stringify(
+			{
+				reportDirectory: ".pi/ansteel-reports",
+				reviewRoot: "git-root",
+				requiredEvidencePaths: [
+					".github/workflows/ansteel-delivery.yml",
+					"project/docs/ansteel-acceptance.md",
+					"project/.pi/ansteel.json",
+				],
+				stageTimeoutMs: 5_000,
+				maxToolCallsPerStage: 1,
+				roles: {
+					"tech-lead": { model: "deterministic-tech/tech", tools: [] },
+					"staff-engineer": { model: "deterministic-staff/staff", tools: [] },
+					"qa-engineer": { model: "deterministic-qa/qa", tools: [] },
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+}
+
 async function runCli(
 	projectDir: string,
 	agentDir: string,
@@ -160,5 +193,22 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("- Total recorded challenges: 3");
 		expect(report).toContain("Configured/resolved role identities:");
 		expect(report).toContain("Diversity status: UNVERIFIED.");
+	}, 20_000);
+
+	it("runs from a child directory while retaining declared Git-root evidence in the archived CLI report", async () => {
+		const { agentDir, projectDir } = createTemporaryProject();
+		configureGitRootEvidence(projectDir);
+
+		const result = await runCli(projectDir, agentDir);
+
+		expect(result.code).toBe(1);
+		const reportMatch = /Ansteel review rejected: (.+)\r?\n?$/.exec(result.stdout);
+		const reportPath = reportMatch?.[1];
+		if (!reportPath) throw new Error(`Could not find Ansteel report path in CLI output: ${result.stdout}`);
+		const report = readFileSync(reportPath, "utf8");
+		expect(report).toContain("Tool path rule: every manifest path is relative to the review root");
+		expect(report).toContain(".github/workflows/ansteel-delivery.yml | bytes=");
+		expect(report).toContain("project/docs/ansteel-acceptance.md | bytes=");
+		expect(report).toContain("project/.pi/ansteel.json | bytes=");
 	}, 20_000);
 });
