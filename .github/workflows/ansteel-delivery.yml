@@ -1,0 +1,77 @@
+name: Ansteel delivery candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build and package
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ansteel-delivery-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    name: build and package delivery candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: pi-agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: pi-agent/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node packages/coding-agent/node_modules/vitest/vitest.mjs --run --no-file-parallelism packages/coding-agent/test/ansteel-discussion.test.ts packages/coding-agent/test/ansteel-cli.test.ts packages/coding-agent/test/ansteel-team.test.ts packages/coding-agent/test/ansteel-team-cli.test.ts packages/coding-agent/test/ansteel-team-extension.test.ts
+      - run: node_modules/.bin/tsgo --noEmit -p packages/coding-agent/tsconfig.build.json
+      - name: Package coding agent
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/delivery"
+          package_name="$(node -p "require('./packages/coding-agent/package.json').name")"
+          test "$package_name" = "@earendil-works/pi-coding-agent"
+          cd packages/coding-agent
+          npm pack --ignore-scripts --pack-destination "$GITHUB_WORKSPACE/delivery"
+          cd "$GITHUB_WORKSPACE/delivery"
+          package_file="$(find . -maxdepth 1 -name '*.tgz' -type f -print -quit)"
+          test -n "$package_file"
+          test "$(find . -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
+          tar -tzf "$package_file" > PACKAGE-CONTENTS.txt
+          grep -qx "package/dist/cli.js" PACKAGE-CONTENTS.txt
+          if grep -Eq '^package/(\.pi|\.ansteel|\.env)' PACKAGE-CONTENTS.txt; then
+            echo "::error::Delivery package contains local runtime state or credentials."
+            exit 1
+          fi
+      - name: Write delivery evidence
+        run: |
+          commit_sha="$(git rev-parse HEAD)"
+          package_version="$(node -p "require('./packages/coding-agent/package.json').version")"
+          cat > "$GITHUB_WORKSPACE/delivery/DELIVERY-EVIDENCE.md" <<EOF
+          # Ansteel Delivery Candidate
+
+          - Source commit: ${commit_sha}
+          - Coding agent version: ${package_version}
+          - Governance regression: passed before packaging
+          - Delivery boundary: this artifact was not published to npm and no GitHub Release was created.
+          EOF
+          cd "$GITHUB_WORKSPACE/delivery"
+          sha256sum *.tgz > SHA256SUMS
+      - name: Upload delivery candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ansteel-delivery-${{ github.run_id }}
+          path: delivery/
+          if-no-files-found: error
+          retention-days: 14
