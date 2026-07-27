@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -263,14 +263,22 @@ describe("Ansteel team CLI", () => {
 			expect(state.taskOwners).toEqual(["staff-engineer"]);
 			if (state.tasks.length === 0) {
 				const staffSessionPath = state.roles["staff-engineer"].sessionFile;
-				const staffSession = existsSync(staffSessionPath) ? readFileSync(staffSessionPath, "utf8") : "(not created)";
+				const staffSession = existsSync(staffSessionPath)
+					? readFileSync(staffSessionPath, "utf8")
+					: "(not created)";
 				throw new Error(
 					`Staff task was not claimed. Events: ${JSON.stringify(events)}. Staff session: ${staffSession}. RPC: ${JSON.stringify(rpc.records())}`,
 				);
 			}
-			expect(state.tasks).toEqual([expect.objectContaining({ id: "TASK-STAFF", owner: "staff-engineer", status: "claimed" })]);
+			expect(state.tasks).toEqual([
+				expect.objectContaining({ id: "TASK-STAFF", owner: "staff-engineer", status: "claimed" }),
+			]);
 			expect(events).toContainEqual(
-				expect.objectContaining({ type: "task-claimed", role: "staff-engineer", content: expect.stringContaining("TASK-STAFF") }),
+				expect.objectContaining({
+					type: "task-claimed",
+					role: "staff-engineer",
+					content: expect.stringContaining("TASK-STAFF"),
+				}),
 			);
 			expect(events).not.toContainEqual(expect.objectContaining({ type: "task-claimed", role: "tech-lead" }));
 			expect(readFileSync(state.roles["tech-lead"].sessionFile, "utf8")).toContain(

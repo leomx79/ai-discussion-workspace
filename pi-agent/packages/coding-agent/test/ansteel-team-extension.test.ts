@@ -55,10 +55,7 @@ function initializeGitProject(cwd: string): void {
 	execFileSync("git", ["commit", "-m", "baseline"], { cwd, stdio: "ignore" });
 }
 
-function setup(
-	config = createConfig(),
-	rolePrompt?: (role: string, prompt: string) => Promise<string>,
-) {
+function setup(config = createConfig(), rolePrompt?: (role: string, prompt: string) => Promise<string>) {
 	const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
 	const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
 	const prompts: string[] = [];
@@ -172,13 +169,10 @@ describe("Ansteel team extension", () => {
 	it("records and aborts a role stage that exceeds the configured interactive timeout", async () => {
 		const config = createConfig();
 		config.stageTimeoutMs = 1;
-		const { commands, ctx, roleSessions, sendMessage } = setup(
-			config,
-			async (role) => {
-				if (role === "staff-engineer") return await new Promise<string>(() => {});
-				return `## Public Update\n\n${role} completed its investigation.`;
-			},
-		);
+		const { commands, ctx, roleSessions, sendMessage } = setup(config, async (role) => {
+			if (role === "staff-engineer") return await new Promise<string>(() => {});
+			return `## Public Update\n\n${role} completed its investigation.`;
+		});
 		const command = commands.get("ansteel-team");
 		if (!command) throw new Error("Missing ansteel-team command");
 

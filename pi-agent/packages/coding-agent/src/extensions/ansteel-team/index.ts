@@ -5,19 +5,19 @@ import { getAgentDir } from "../../config.ts";
 import {
 	ANSTEEL_ROLES,
 	ANSTEEL_TEAM_TOOLS,
-	DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
 	type AnsteelConfig,
 	type AnsteelRole,
 	type AnsteelRoleConfig,
 	createAnsteelRawTurnSession,
+	DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
 	loadAnsteelConfig,
 } from "../../core/ansteel-discussion.ts";
 import {
-	type AnsteelTeamState,
-	type AnsteelTeamTask,
 	type AnsteelTeamMilestone,
 	type AnsteelTeamMilestoneReview,
 	type AnsteelTeamMilestoneSubmission,
+	type AnsteelTeamState,
+	type AnsteelTeamTask,
 	type AnsteelTeamTaskReview,
 	type AnsteelTeamTaskSubmission,
 	appendAnsteelTeamEvent,
@@ -28,13 +28,13 @@ import {
 	isAnsteelTeamGovernancePath,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
-	reviewAnsteelTeamTask,
 	reviewAnsteelTeamMilestone,
+	reviewAnsteelTeamTask,
 	runAnsteelTeamMilestoneTest,
 	runAnsteelTeamTaskTest,
 	saveAnsteelTeamState,
-	submitAnsteelTeamTask,
 	submitAnsteelTeamMilestone,
+	submitAnsteelTeamTask,
 } from "../../core/ansteel-team.ts";
 import {
 	defineTool,
@@ -42,8 +42,8 @@ import {
 	type ExtensionCommandContext,
 	type ToolDefinition,
 } from "../../core/extensions/types.ts";
-import { DefaultResourceLoader } from "../../core/resource-loader.ts";
 import type { ModelRuntime } from "../../core/model-runtime.ts";
+import { DefaultResourceLoader } from "../../core/resource-loader.ts";
 import { createAgentSession } from "../../core/sdk.ts";
 import { SessionManager } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
@@ -300,7 +300,9 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			async execute(_toolCallId, input) {
 				const submission = await taskOperations.submitMilestone(input.milestoneId, input.testCommand);
 				return {
-					content: [{ type: "text", text: `Submitted ${input.milestoneId} integration revision ${submission.revision}.` }],
+					content: [
+						{ type: "text", text: `Submitted ${input.milestoneId} integration revision ${submission.revision}.` },
+					],
 					details: { milestoneId: input.milestoneId, revision: submission.revision },
 				};
 			},
@@ -322,7 +324,12 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 					...(input.issue === undefined ? {} : { issue: input.issue }),
 				});
 				return {
-					content: [{ type: "text", text: `${review.reviewer} recorded ${review.verdict.toUpperCase()} for ${input.milestoneId}.` }],
+					content: [
+						{
+							type: "text",
+							text: `${review.reviewer} recorded ${review.verdict.toUpperCase()} for ${input.milestoneId}.`,
+						},
+					],
 					details: { milestoneId: input.milestoneId, revision: review.revision, verdict: review.verdict },
 				};
 			},
@@ -684,7 +691,10 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							role: reviewer,
 							content,
 						});
-						emitTimelineMessage(pi, `## ${reviewer} integration review failure [${event.sequence}]\n\n${content}`);
+						emitTimelineMessage(
+							pi,
+							`## ${reviewer} integration review failure [${event.sequence}]\n\n${content}`,
+						);
 					}
 				}),
 			);
@@ -755,7 +765,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			},
 			submitMilestone: async (milestoneId, testCommand) => {
 				const test = runAnsteelTeamMilestoneTest(ctx.cwd, activeTeam.state, role, milestoneId, testCommand);
-				if (test.isError) throw new Error(`Ansteel team milestone ${milestoneId} integration command failed: ${testCommand}`);
+				if (test.isError)
+					throw new Error(`Ansteel team milestone ${milestoneId} integration command failed: ${testCommand}`);
 				const submission = submitAnsteelTeamMilestone(ctx.cwd, activeTeam.state, role, milestoneId, test.command);
 				const milestone = activeTeam.state.milestones.find((item) => item.id === milestoneId);
 				if (!milestone) throw new Error(`Ansteel team milestone ${milestoneId} disappeared after submission`);
@@ -875,7 +886,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				const event = appendAnsteelTeamEvent(ctx.cwd, state, {
 					type: "role-failure",
 					role,
-					content: "Ansteel team role was recovered from an interrupted host while its prior stage was still working.",
+					content:
+						"Ansteel team role was recovered from an interrupted host while its prior stage was still working.",
 				});
 				emitTimelineMessage(pi, `## ${role} recovery failure [${event.sequence}]\n\n${event.content}`);
 			}
@@ -885,18 +897,16 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				for (const role of ANSTEEL_ROLES) {
 					sessions.set(
 						role,
-						await (createRoleSession ?? ((options) => createDefaultRoleSession(options, ctx.modelRegistry.getRuntime())))({
+						await (
+							createRoleSession ??
+							((options) => createDefaultRoleSession(options, ctx.modelRegistry.getRuntime()))
+						)({
 							role,
 							cwd: ctx.cwd,
 							sessionFile: state.roles[role].sessionFile,
 							resolvedRole: resolvedRoles[role],
 							allowedTaskOwners: state.taskOwners,
-							taskOperations: createTaskOperations(
-								activeTeam,
-								ctx,
-								role,
-								state.taskOwners,
-							),
+							taskOperations: createTaskOperations(activeTeam, ctx, role, state.taskOwners),
 						}),
 					);
 				}

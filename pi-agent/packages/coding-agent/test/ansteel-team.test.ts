@@ -20,8 +20,8 @@ import {
 	runAnsteelTeamMilestoneTest,
 	runAnsteelTeamTaskTest,
 	saveAnsteelTeamState,
-	submitAnsteelTeamTask,
 	submitAnsteelTeamMilestone,
+	submitAnsteelTeamTask,
 } from "../src/core/ansteel-team.ts";
 
 const temporaryDirectories: string[] = [];
@@ -215,14 +215,22 @@ describe("Ansteel team state", () => {
 		});
 		const candidate = readFileSync(getAnsteelTeamStatePath(cwd), "utf8");
 		writeFileSync(getAnsteelTeamStatePath(cwd), before, "utf8");
-		writeFileSync(getAnsteelTeamTransactionPath(cwd), `${JSON.stringify({ state: JSON.parse(candidate), event })}\n`, "utf8");
+		writeFileSync(
+			getAnsteelTeamTransactionPath(cwd),
+			`${JSON.stringify({ state: JSON.parse(candidate), event })}\n`,
+			"utf8",
+		);
 
 		expect(loadAnsteelTeamState(cwd)).toMatchObject({ nextEventSequence: 2, ledgerHeadHash: event.hash });
 		expect(() => readFileSync(getAnsteelTeamTransactionPath(cwd), "utf8")).toThrow();
 
 		writeFileSync(getAnsteelTeamEventPath(cwd), "", "utf8");
 		writeFileSync(getAnsteelTeamStatePath(cwd), before, "utf8");
-		writeFileSync(getAnsteelTeamTransactionPath(cwd), `${JSON.stringify({ state: JSON.parse(candidate), event })}\n`, "utf8");
+		writeFileSync(
+			getAnsteelTeamTransactionPath(cwd),
+			`${JSON.stringify({ state: JSON.parse(candidate), event })}\n`,
+			"utf8",
+		);
 
 		expect(loadAnsteelTeamState(cwd)).toMatchObject({ nextEventSequence: 2, ledgerHeadHash: event.hash });
 		expect(listAnsteelTeamEvents(cwd)).toEqual([event]);
@@ -453,7 +461,11 @@ describe("Ansteel team state", () => {
 		const cwd = createTemporaryProject();
 		initializeGitProject(cwd);
 		mkdirSync(join(cwd, "test"), { recursive: true });
-		writeFileSync(join(cwd, "test", "integration.test.mjs"), "import test from 'node:test';\ntest('integration', () => {});\n", "utf8");
+		writeFileSync(
+			join(cwd, "test", "integration.test.mjs"),
+			"import test from 'node:test';\ntest('integration', () => {});\n",
+			"utf8",
+		);
 		const team = createTeam(cwd);
 		const task = claimAnsteelTeamTask(cwd, team, {
 			id: "TASK-PARSER",
@@ -471,13 +483,7 @@ describe("Ansteel team state", () => {
 
 		expect(milestone.status).toBe("blocked");
 		expect(() =>
-			runAnsteelTeamMilestoneTest(
-				cwd,
-				team,
-				"tech-lead",
-				milestone.id,
-				"node --test test/integration.test.mjs",
-			),
+			runAnsteelTeamMilestoneTest(cwd, team, "tech-lead", milestone.id, "node --test test/integration.test.mjs"),
 		).toThrow("is waiting for approved tasks");
 
 		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
