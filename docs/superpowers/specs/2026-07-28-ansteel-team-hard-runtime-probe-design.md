@@ -51,6 +51,8 @@ export class DurableLeaseQueue {
 }
 ```
 
+`clock` 是返回非负整数毫秒时间戳的零参数函数。任务状态固定为 `waiting`、`leased`、`completed` 或 `failed`。`claim` 在没有可运行任务时返回 `null`，成功时返回 `{ id, payload, workerId, token, leaseUntil }`；`renew` 返回更新后的同形租约；`enqueue`、`complete` 和 `fail` 返回该任务的 JSON 可序列化状态快照；`getState` 返回状态快照或 `null`。依赖任务只有在全部 `completed` 后才能运行，任一依赖 `failed` 时其下游保持 `waiting` 且不可认领。
+
 具体错误类型和内部数据结构由实现者决定，但所有拒绝都必须是可观察的异常，不能静默成功。
 
 ## 测试夹具
