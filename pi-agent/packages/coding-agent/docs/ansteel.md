@@ -34,6 +34,21 @@ pi --ansteel-resume ansteel-run-2026-07-28T00-00-00-000Z
 
 When an enabled `adaptiveBudgetPolicy.epochTimeoutMs` boundary is reached between committed role stages, Pi reports `PAUSED`, leaves the checkpoint in `ready-to-resume`, increments its epoch counter, and exits with success rather than publishing a rejected review report. The next `--ansteel-resume` invocation opens fresh short-lived role sessions and continues from the next uncommitted stage.
 
+## Supervise a long-running review
+
+Use the local supervisor when a review can span many bounded epochs:
+
+```bash
+pi --ansteel-supervise "Review the motor safety change"
+pi --ansteel-supervise-resume ansteel-run-2026-07-28T00-00-00-000Z
+```
+
+The supervisor starts a fresh short-lived `pi --ansteel` or `pi --ansteel-resume` child for each epoch. It never creates a role session or calls a provider itself; after every child exits successfully, it reloads only the durable checkpoint and continues only while its status is `ready-to-resume`. A completed, failed, or expired checkpoint is terminal. A missing, malformed, ambiguous, or other nonterminal checkpoint fails closed.
+
+`--ansteel-supervise` defaults to 64 epochs. Set `--ansteel-supervise-max-epochs <1..128>` to choose a lower or higher bounded limit. Reaching that limit preserves the `ready-to-resume` checkpoint and exits nonzero with `SUPERVISOR_STOPPED`; it does not invent a terminal governance result. The same marker is printed when a child exits nonzero or the durable checkpoint is invalid.
+
+Only one supervisor may own a project. Its lock is `.pi/ansteel-supervisor.lock`; a second supervisor refuses to start while the recorded owner PID is alive or cannot be verified. Pi removes an orphaned lock only after confirming that owner PID has exited. Before manually running `--ansteel-resume`, stop the supervisor that owns the project. Every epoch has newly created role sessions, but resume still verifies the original checkpoint, evidence boundary, project deadline, and role identities.
+
 There is no fallback to the current Pi model. Before naming each role model, make sure it is available and authenticated in Pi. Use `/login`, `pi --list-models`, and the normal [Providers](providers.md) and [Custom models](models.md) setup as needed. A role can use only its explicitly configured fallback chain, and only when provider fallback is enabled for the review.
 
 For a monorepo review, do not rely on a topic's relative paths to reach a parent directory. Set `reviewRoot` to `git-root` and declare every workflow, document, or configuration file that must be in the shared evidence package. Before any role session is created, Pi resolves the Git root, rejects missing, excluded, out-of-root, binary, or over-limit required paths, and retains declared files ahead of the normal evidence-file limit. The default `cwd` scope remains unchanged for ordinary single-project reviews.
@@ -210,7 +225,7 @@ Keep API credentials out of `.pi/ansteel.json`. Configure authentication through
 
 ### Long-running reviews
 
-For reviews that can legitimately take hours, configure three limits together: the project ceiling, each role stage's hard ceiling, and the epoch boundary. Raising only `projectTimeoutMs` does not extend a role that is still bounded by `maxStageTimeoutMs`. Keep every stage bounded to a defensible value, then use `epochTimeoutMs` to checkpoint between committed stages and resume with `--ansteel-resume <run-id>` before the immutable project deadline expires.
+For reviews that can legitimately take hours, configure three limits together: the project ceiling, each role stage's hard ceiling, and the epoch boundary. Raising only `projectTimeoutMs` does not extend a role that is still bounded by `maxStageTimeoutMs`. Keep every stage bounded to a defensible value, then use `epochTimeoutMs` with `--ansteel-supervise` to checkpoint and continue between committed stages before the immutable project deadline expires. `--ansteel-resume <run-id>` remains the explicit manual recovery command after the supervisor has stopped.
 
 ```json
 {

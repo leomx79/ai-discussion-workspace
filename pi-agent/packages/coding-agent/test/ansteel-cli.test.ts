@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -66,6 +66,56 @@ export default function (pi) {
 }
 `;
 
+const SUPERVISED_PROVIDER_EXTENSION = `
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+
+const completeWorkCard = ${JSON.stringify(COMPLETE_WORK_CARD)};
+const completeRevisionWorkCard = ${JSON.stringify(COMPLETE_REVISION_WORK_CARD)};
+
+function delayed(message) {
+	return async () => {
+		await new Promise((resolve) => setTimeout(resolve, 1_200));
+		return fauxAssistantMessage(message);
+	};
+}
+
+function register(pi, provider, model, responses) {
+	const faux = fauxProvider({ provider, models: [{ id: model }] });
+	faux.setResponses(responses.map((response) => typeof response === "function" ? response : fauxAssistantMessage(response)));
+	pi.registerProvider(faux.provider);
+}
+
+export default function (pi) {
+	const isResume = process.argv.includes("--ansteel-resume");
+	if (!isResume) {
+		register(pi, "supervised-tech", "tech", [delayed(completeWorkCard)]);
+		register(pi, "supervised-staff", "staff", []);
+		register(pi, "supervised-qa", "qa", []);
+		return;
+	}
+	register(pi, "supervised-tech", "tech", [
+		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
+		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"[L1] Consensus\\nThe coordinator-derived immutable ledger summary is the authoritative resolution record.",
+	]);
+	register(pi, "supervised-staff", "staff", [
+		completeWorkCard,
+		"ISSUE: STAFF-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: qa-engineer",
+		"RESOLUTION: TL-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+	]);
+	register(pi, "supervised-qa", "qa", [
+		completeWorkCard,
+		"ISSUE: QA-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: staff-engineer",
+		completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+	]);
+}
+`;
+
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
@@ -92,6 +142,39 @@ function createTemporaryProject(): { agentDir: string; projectDir: string } {
 					"tech-lead": { model: "deterministic-tech/tech", tools: [] },
 					"staff-engineer": { model: "deterministic-staff/staff", tools: [] },
 					"qa-engineer": { model: "deterministic-qa/qa", tools: [] },
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+	return { agentDir, projectDir };
+}
+
+function createSupervisedTemporaryProject(): { agentDir: string; projectDir: string } {
+	const { agentDir, projectDir } = createTemporaryProject();
+	const extensionsDir = join(projectDir, ".pi", "extensions");
+	writeFileSync(join(extensionsDir, "supervised-ansteel.ts"), SUPERVISED_PROVIDER_EXTENSION, "utf8");
+	writeFileSync(
+		join(projectDir, ".pi", "ansteel.json"),
+		JSON.stringify(
+			{
+				reportDirectory: ".pi/ansteel-reports",
+				stageTimeoutMs: 5_000,
+				maxToolCallsPerStage: 1,
+				adaptiveBudgetPolicy: {
+					enabled: true,
+					epochTimeoutMs: 1_000,
+					projectTimeoutMs: 30_000,
+					maxProjectToolCalls: 20,
+					protectedVerificationTimeMs: 100,
+					protectedVerificationToolCalls: 10,
+				},
+				roles: {
+					"tech-lead": { model: "supervised-tech/tech", tools: [] },
+					"staff-engineer": { model: "supervised-staff/staff", tools: [] },
+					"qa-engineer": { model: "supervised-qa/qa", tools: [] },
 				},
 			},
 			null,
@@ -138,6 +221,8 @@ function configureGitRootEvidence(projectDir: string): void {
 async function runCli(
 	projectDir: string,
 	agentDir: string,
+	args = ["--ansteel", "Reject a hallucinated ledger total"],
+	extensionName = "deterministic-ansteel.ts",
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
 	return await new Promise((resolvePromise, reject) => {
 		const child = spawn(
@@ -145,9 +230,8 @@ async function runCli(
 			[
 				cliPath,
 				"-e",
-				join(projectDir, ".pi", "extensions", "deterministic-ansteel.ts"),
-				"--ansteel",
-				"Reject a hallucinated ledger total",
+				join(projectDir, ".pi", "extensions", extensionName),
+				...args,
 			],
 			{
 				cwd: projectDir,
@@ -211,4 +295,21 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("project/docs/ansteel-acceptance.md | bytes=");
 		expect(report).toContain("project/.pi/ansteel.json | bytes=");
 	}, 20_000);
+
+	it("automatically resumes an epoch through a second real Ansteel CLI child", async () => {
+		const { agentDir, projectDir } = createSupervisedTemporaryProject();
+
+		const result = await runCli(
+			projectDir,
+			agentDir,
+			["--ansteel-supervise", "Complete two epochs", "--ansteel-supervise-max-epochs", "4"],
+			"supervised-ansteel.ts",
+		);
+
+		expect(result.code, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+		expect(result.stdout).toContain("Ansteel review paused:");
+		expect(result.stdout).toContain("Ansteel review approved:");
+		expect(readdirSync(join(projectDir, ".pi", "ansteel-runs"))).toHaveLength(1);
+		expect(existsSync(join(projectDir, ".pi", "ansteel-supervisor.lock"))).toBe(false);
+	}, 30_000);
 });
