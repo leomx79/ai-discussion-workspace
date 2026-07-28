@@ -1683,6 +1683,43 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.markdown).not.toContain("src/main.ts");
 	});
 
+	it("does not let adaptive time allocations bypass the configured stage extension count", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Respect the adaptive stage extension count",
+			stageBudgetPolicy: {
+				stageTimeoutMs: 10,
+				maxStageTimeoutMs: 30,
+				timeoutExtensionMs: 10,
+				maxStageExtensions: 1,
+				projectTimeoutMs: 500,
+				maxToolCallsPerStage: 4,
+				maxProjectToolCalls: 20,
+			},
+			adaptiveBudgetPolicy: {
+				enabled: true,
+				projectTimeoutMs: 500,
+				maxProjectToolCalls: 20,
+				timeExtensionMs: 10,
+				protectedVerificationTimeMs: 100,
+				protectedVerificationToolCalls: 10,
+			},
+			getStageAudit: () => ({
+				events: [
+					{ type: "tool-execution-end", elapsedMs: 1, toolName: "read", isError: false, evidenceProgress: true },
+				],
+			}),
+			runRole: async ({ stage }) => {
+				if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 25));
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(result.failure).toMatchObject({ role: "tech-lead", stage: "architecture" });
+		expect(result.budgetLedger[0]).toMatchObject({ outcome: "timed-out", extensions: 1, stageTimeoutMs: 20 });
+		expect(result.adaptiveBudgetEvents).toHaveLength(1);
+	});
+
 	it("grants a coordinator-derived tool batch to the active role stage", async () => {
 		const requestedExtensions: Array<number | undefined> = [];
 		const result = await runAnsteelDiscussion({

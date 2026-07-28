@@ -3120,6 +3120,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			if (timedResult.kind !== "timeout") break;
 			const auditEvents = getAuditEvents();
 			if (adaptiveBudgetState) {
+				if (extensions >= stageBudgetPolicy.maxStageExtensions) break;
 				recordObservedAdaptiveToolEvents();
 				const decision = decideAnsteelAdaptiveAllocation({
 					state: adaptiveBudgetState,
