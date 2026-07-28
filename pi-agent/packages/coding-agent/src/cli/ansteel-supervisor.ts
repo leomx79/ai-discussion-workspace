@@ -48,7 +48,12 @@ export async function runAnsteelEpochSupervisor(
 		if (exitCode !== 0) return { outcome: "child-failed", runId, epochsStarted: epoch + 1, exitCode };
 		if (runId === undefined) runId = getOnlyNewRunId(before!, listRunIds());
 
-		const checkpoint = loadCheckpoint(runId);
+		let checkpoint: { id: string; status: AnsteelRunCheckpointStatus | string };
+		try {
+			checkpoint = loadCheckpoint(runId);
+		} catch {
+			return { outcome: "invalid-checkpoint", runId, epochsStarted: epoch + 1, exitCode: 1 };
+		}
 		if (checkpoint.status === "ready-to-resume") continue;
 		if (
 			checkpoint.status === "completed" ||

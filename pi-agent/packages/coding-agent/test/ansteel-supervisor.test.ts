@@ -89,6 +89,30 @@ describe("runAnsteelEpochSupervisor", () => {
 		expect(calls).toHaveLength(1);
 	});
 
+	it("fails closed when loading the new checkpoint throws", async () => {
+		const calls: Array<{ kind: "new" | "resume"; runId?: string; topic?: string }> = [];
+		const result = await runAnsteelEpochSupervisor({
+			topic: "Long review",
+			maxEpochs: 4,
+			listRunIds: () => (calls.length === 0 ? [] : ["ansteel-run-new"]),
+			loadCheckpoint: () => {
+				throw new Error("malformed checkpoint");
+			},
+			runEpoch: async (call) => {
+				calls.push(call);
+				return 0;
+			},
+		});
+
+		expect(result).toMatchObject({
+			outcome: "invalid-checkpoint",
+			runId: "ansteel-run-new",
+			epochsStarted: 1,
+			exitCode: 1,
+		});
+		expect(calls).toHaveLength(1);
+	});
+
 	it("does not choose another run when resuming and stops at the epoch limit", async () => {
 		const calls: Array<{ kind: "new" | "resume"; runId?: string; topic?: string }> = [];
 		const result = await runAnsteelEpochSupervisor({
