@@ -255,7 +255,7 @@ export interface RunAnsteelDiscussionOptions {
 	stageTimeoutMs?: number;
 	maxToolCallsPerStage?: number;
 	stageBudgetPolicy?: AnsteelStageBudgetPolicyInput;
-	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicy;
+	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicyInput;
 	/** Persisted coordinator boundary for a resumed epoch; omitted for a new direct discussion. */
 	projectStartedAt?: number;
 	hardProjectDeadline?: number;
@@ -346,7 +346,7 @@ export interface AnsteelConfig {
 	maxToolCallsPerStage?: number;
 	stageBudgetPolicy?: AnsteelStageBudgetPolicyInput;
 	/** Optional coordinator-controlled extension policy; omitted preserves fixed-budget behavior. */
-	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicy;
+	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicyInput;
 	/** Disabled by default; requires a role-local fallbackModels chain. */
 	allowProviderFallback?: boolean;
 	/** Explicitly permits one model across all roles; this is not cross-model verification. */
@@ -2746,6 +2746,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		stageTimeoutMs: options.stageBudgetPolicy?.stageTimeoutMs ?? options.stageTimeoutMs,
 		maxToolCallsPerStage: options.stageBudgetPolicy?.maxToolCallsPerStage ?? options.maxToolCallsPerStage,
 	});
+	const adaptiveBudgetPolicy =
+		options.adaptiveBudgetPolicy === undefined
+			? undefined
+			: createAnsteelAdaptiveBudgetPolicy(options.adaptiveBudgetPolicy);
 	const projectToolBudget =
 		options.projectToolBudget ?? createAnsteelProjectToolBudget(stageBudgetPolicy.maxProjectToolCalls);
 	const projectStartedAt = options.projectStartedAt ?? Date.now();
@@ -2794,9 +2798,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		const unresolvedChallengeCount = stageOptions.challengeLedger?.filter(
 			(entry) => entry.status === "open" && entry.targetRole === role,
 		).length ?? 0;
-		const adaptiveBudgetState = options.adaptiveBudgetPolicy
+		const adaptiveBudgetState = adaptiveBudgetPolicy
 			? createAnsteelAdaptiveBudgetState({
-					policy: options.adaptiveBudgetPolicy,
+					policy: adaptiveBudgetPolicy,
 					role,
 					stage,
 					stageBaseTimeoutMs: currentStageTimeoutMs,
@@ -2804,7 +2808,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 					stageBaseToolCalls: stageBudgetPolicy.maxToolCallsPerStage,
 					stageHardToolCalls: Math.min(
 						ANSTEEL_MAX_TOOL_CALLS_PER_STAGE,
-						stageBudgetPolicy.maxToolCallsPerStage + options.adaptiveBudgetPolicy.toolExtensionCalls,
+						stageBudgetPolicy.maxToolCallsPerStage + adaptiveBudgetPolicy.toolExtensionCalls,
 					),
 					unresolvedChallengeCount,
 					projectStartedAt,
@@ -2815,7 +2819,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		if (adaptiveBudgetState) {
 			adaptiveBudgetState.remainingProjectToolCalls = Math.max(
 				0,
-				options.adaptiveBudgetPolicy!.maxProjectToolCalls - projectToolBudget.getUsedToolCalls(),
+				adaptiveBudgetPolicy!.maxProjectToolCalls - projectToolBudget.getUsedToolCalls(),
 			);
 		}
 		const prompt = buildRolePrompt(role, stage, topic, stageOptions.context ?? transcript, {
@@ -2845,9 +2849,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			return { response: replayedEntry.response, entry: replayedEntry };
 		}
 		if (
-			options.adaptiveBudgetPolicy &&
+			adaptiveBudgetPolicy &&
 			epochCommittedStages > 0 &&
-			elapsedSince(projectStartedAt) >= options.adaptiveBudgetPolicy.epochTimeoutMs
+			elapsedSince(projectStartedAt) >= adaptiveBudgetPolicy.epochTimeoutMs
 		) {
 			throw new AnsteelEpochPausedError();
 		}
@@ -2913,15 +2917,15 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			observedAdaptiveToolEvents = toolEvents.length;
 		};
 		const requestToolExtension = (): number | undefined => {
-			if (!adaptiveBudgetState || !options.adaptiveBudgetPolicy) return undefined;
+			if (!adaptiveBudgetState || !adaptiveBudgetPolicy) return undefined;
 			recordObservedAdaptiveToolEvents();
 			adaptiveBudgetState.remainingProjectToolCalls = Math.max(
 				0,
-				options.adaptiveBudgetPolicy.maxProjectToolCalls - projectToolBudget.getUsedToolCalls(),
+				adaptiveBudgetPolicy.maxProjectToolCalls - projectToolBudget.getUsedToolCalls(),
 			);
 			const decision = decideAnsteelAdaptiveAllocation({
 				state: adaptiveBudgetState,
-				policy: options.adaptiveBudgetPolicy,
+				policy: adaptiveBudgetPolicy,
 				kind: "tools",
 				now: Date.now(),
 			});
@@ -2971,7 +2975,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				recordObservedAdaptiveToolEvents();
 				const decision = decideAnsteelAdaptiveAllocation({
 					state: adaptiveBudgetState,
-					policy: options.adaptiveBudgetPolicy!,
+					policy: adaptiveBudgetPolicy!,
 					kind: "time",
 					now: projectStartedAt + elapsedSince(projectStartedAt),
 				});

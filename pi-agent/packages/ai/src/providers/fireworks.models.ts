@@ -13,10 +13,6 @@ export const FIREWORKS_MODELS = values as {
 		id: "accounts/fireworks/models/deepseek-v4-pro";
 		provider: "fireworks";
 	};
-	"accounts/fireworks/models/glm-5p1": Model<"anthropic-messages"> & {
-		id: "accounts/fireworks/models/glm-5p1";
-		provider: "fireworks";
-	};
 	"accounts/fireworks/models/glm-5p2": Model<"openai-completions"> & {
 		id: "accounts/fireworks/models/glm-5p2";
 		provider: "fireworks";
@@ -37,6 +33,10 @@ export const FIREWORKS_MODELS = values as {
 		id: "accounts/fireworks/models/kimi-k2p7-code";
 		provider: "fireworks";
 	};
+	"accounts/fireworks/models/kimi-k3": Model<"anthropic-messages"> & {
+		id: "accounts/fireworks/models/kimi-k3";
+		provider: "fireworks";
+	};
 	"accounts/fireworks/models/minimax-m2p7": Model<"anthropic-messages"> & {
 		id: "accounts/fireworks/models/minimax-m2p7";
 		provider: "fireworks";
@@ -47,10 +47,6 @@ export const FIREWORKS_MODELS = values as {
 	};
 	"accounts/fireworks/models/qwen3p7-plus": Model<"anthropic-messages"> & {
 		id: "accounts/fireworks/models/qwen3p7-plus";
-		provider: "fireworks";
-	};
-	"accounts/fireworks/routers/glm-5p1-fast": Model<"anthropic-messages"> & {
-		id: "accounts/fireworks/routers/glm-5p1-fast";
 		provider: "fireworks";
 	};
 	"accounts/fireworks/routers/glm-5p2-fast": Model<"openai-completions"> & {
@@ -67,6 +63,10 @@ export const FIREWORKS_MODELS = values as {
 	};
 	"accounts/fireworks/routers/kimi-k2p7-code-fast": Model<"anthropic-messages"> & {
 		id: "accounts/fireworks/routers/kimi-k2p7-code-fast";
+		provider: "fireworks";
+	};
+	"accounts/fireworks/routers/kimi-k3-fast": Model<"anthropic-messages"> & {
+		id: "accounts/fireworks/routers/kimi-k3-fast";
 		provider: "fireworks";
 	};
 };
