@@ -69,6 +69,8 @@ export interface AnsteelAdaptiveBudgetState {
 }
 
 const MAX_POLICY_VALUE = 2_147_483_647;
+const MANDATORY_VERIFICATION_GATE_COUNT = 5;
+const MAXIMUM_MANDATORY_VERIFICATION_GATE_COUNT = MANDATORY_VERIFICATION_GATE_COUNT * 2;
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
 	const resolved = value ?? fallback;
@@ -102,6 +104,11 @@ export function createAnsteelAdaptiveBudgetPolicy(
 	);
 	if (protectedVerificationToolCalls >= maxProjectToolCalls) {
 		throw new Error("Ansteel adaptive budget protectedVerificationToolCalls must be below maxProjectToolCalls");
+	}
+	if (protectedVerificationToolCalls < MAXIMUM_MANDATORY_VERIFICATION_GATE_COUNT) {
+		throw new Error(
+			`Ansteel adaptive budget protectedVerificationToolCalls must reserve at least ${MAXIMUM_MANDATORY_VERIFICATION_GATE_COUNT} tool calls for mandatory verification and final sign-off`,
+		);
 	}
 	return {
 		enabled: input.enabled === true,

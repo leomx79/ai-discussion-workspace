@@ -12,7 +12,7 @@ import type {
 	AnsteelTranscriptEntry,
 } from "./ansteel-discussion.ts";
 
-const ANSTEEL_RUN_CHECKPOINT_VERSION = 3;
+const ANSTEEL_RUN_CHECKPOINT_VERSION = 5;
 
 export type AnsteelRunCheckpointStatus =
 	| "ready-to-resume"
@@ -48,6 +48,7 @@ export interface AnsteelRunCheckpointState {
 	configFingerprint: string;
 	projectStartedAt: number;
 	hardProjectDeadline: number;
+	epochStartedAt: number;
 	epoch: number;
 	nextAction?: AnsteelNextAction;
 	workflowState: AnsteelRunWorkflowState;
@@ -65,6 +66,8 @@ export interface AnsteelEvidenceManifest {
 
 /** Serializable coordinator-owned state; it contains no provider payload, tool arguments, output, or credentials. */
 export interface AnsteelRunWorkflowState {
+	/** Durable project-wide tool consumption, updated before each tool execution. */
+	projectToolCallsUsed: number;
 	transcript: AnsteelTranscriptEntry[];
 	stageAudits: AnsteelStageAudit[];
 	budgetLedger: AnsteelBudgetLedgerEntry[];
@@ -100,6 +103,7 @@ export interface UpdateAnsteelRunCheckpointOptions {
 	status?: AnsteelRunCheckpointStatus;
 	event?: Omit<AnsteelRunCheckpointEvent, "createdAt">;
 	epoch?: number;
+	epochStartedAt?: number;
 	nextAction?: AnsteelNextAction;
 	workflowState?: AnsteelRunWorkflowState;
 	now?: Date;
@@ -161,6 +165,14 @@ function assertCheckpointState(value: unknown): asserts value is AnsteelRunCheck
 	) {
 		throw new Error("Ansteel run checkpoint has an invalid project deadline");
 	}
+	if (
+		typeof state.epochStartedAt !== "number" ||
+		!Number.isFinite(state.epochStartedAt) ||
+		state.epochStartedAt < state.projectStartedAt ||
+		state.epochStartedAt > state.hardProjectDeadline
+	) {
+		throw new Error("Ansteel run checkpoint has an invalid epoch start time");
+	}
 	if (state.evidenceManifest !== undefined && !isEvidenceManifest(state.evidenceManifest)) {
 		throw new Error("Ansteel run checkpoint has an invalid evidence manifest");
 	}
@@ -193,13 +205,66 @@ function isHash(value: unknown): value is string {
 function isNextAction(value: unknown): value is AnsteelNextAction {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const action = value as Partial<AnsteelNextAction>;
-	return typeof action.role === "string" && typeof action.stage === "string";
+	return (
+		isAnsteelRoleStagePair(action.role, action.stage) &&
+		(action.stage === "architecture" ||
+			action.stage === "staff-critique" ||
+			action.stage === "qa-critique" ||
+			action.stage === "tech-lead-cross-examination" ||
+			action.stage === "staff-cross-examination" ||
+			action.stage === "qa-cross-examination" ||
+			action.stage === "architecture-revision" ||
+			action.stage === "staff-revision" ||
+			action.stage === "qa-revision" ||
+			action.stage === "tech-lead-verification" ||
+			action.stage === "staff-verification" ||
+			action.stage === "qa-verification" ||
+			action.stage === "consensus" ||
+			action.stage === "staff-sign-off" ||
+			action.stage === "qa-sign-off") &&
+		(action.round === undefined || (Number.isInteger(action.round) && action.round > 0)) &&
+		(action.formatRepair === undefined || action.formatRepair === true)
+	);
+}
+
+function isAnsteelRoleStagePair(role: unknown, stage: unknown): boolean {
+	if (role === "tech-lead") {
+		return (
+			stage === "architecture" ||
+			stage === "tech-lead-cross-examination" ||
+			stage === "architecture-revision" ||
+			stage === "tech-lead-verification" ||
+			stage === "consensus"
+		);
+	}
+	if (role === "staff-engineer") {
+		return (
+			stage === "staff-critique" ||
+			stage === "staff-cross-examination" ||
+			stage === "staff-revision" ||
+			stage === "staff-verification" ||
+			stage === "staff-sign-off"
+		);
+	}
+	if (role === "qa-engineer") {
+		return (
+			stage === "qa-critique" ||
+			stage === "qa-cross-examination" ||
+			stage === "qa-revision" ||
+			stage === "qa-verification" ||
+			stage === "qa-sign-off"
+		);
+	}
+	return false;
 }
 
 function isWorkflowState(value: unknown): value is AnsteelRunWorkflowState {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const state = value as Partial<AnsteelRunWorkflowState>;
 	return (
+		typeof state.projectToolCallsUsed === "number" &&
+		Number.isInteger(state.projectToolCallsUsed) &&
+		state.projectToolCallsUsed >= 0 &&
 		Array.isArray(state.transcript) &&
 		Array.isArray(state.stageAudits) &&
 		Array.isArray(state.budgetLedger) &&
@@ -212,6 +277,7 @@ function isWorkflowState(value: unknown): value is AnsteelRunWorkflowState {
 
 function cloneWorkflowState(state: AnsteelRunWorkflowState | undefined): AnsteelRunWorkflowState {
 	return {
+		projectToolCallsUsed: state?.projectToolCallsUsed ?? 0,
 		transcript: state?.transcript.map((entry) => ({ ...entry })) ?? [],
 		stageAudits: state?.stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })) ?? [],
 		budgetLedger: state?.budgetLedger.map((entry) => ({ ...entry })) ?? [],
@@ -290,6 +356,7 @@ export function createAnsteelRunCheckpoint(options: CreateAnsteelRunCheckpointOp
 		configFingerprint: options.configFingerprint,
 		projectStartedAt: options.projectStartedAt,
 		hardProjectDeadline: options.hardProjectDeadline,
+		epochStartedAt: options.projectStartedAt,
 		epoch: 0,
 		nextAction: { ...options.nextAction },
 		workflowState: cloneWorkflowState(options.workflowState),
@@ -313,11 +380,41 @@ export function updateAnsteelRunCheckpoint(
 	checkpoint: AnsteelRunCheckpoint,
 	options: UpdateAnsteelRunCheckpointOptions,
 ): AnsteelRunCheckpointState {
+	if (options.nextAction !== undefined && !isNextAction(options.nextAction)) {
+		throw new Error("Ansteel run checkpoint has an invalid next action");
+	}
+	if (
+		options.status !== undefined &&
+		!isAnsteelTerminalCheckpointStatus(checkpoint.state.status) &&
+		!isAllowedAnsteelCheckpointTransition(checkpoint.state.status, options.status)
+	) {
+		throw new Error(
+			`Ansteel run checkpoint cannot transition from ${checkpoint.state.status} to ${options.status}`,
+		);
+	}
+	if (
+		options.status !== undefined &&
+		isAnsteelTerminalCheckpointStatus(checkpoint.state.status) &&
+		options.status !== checkpoint.state.status
+	) {
+		throw new Error(`Ansteel run checkpoint cannot transition from terminal status ${checkpoint.state.status}`);
+	}
+	if (
+		isAnsteelTerminalCheckpointStatus(checkpoint.state.status) &&
+		(options.event !== undefined ||
+			options.epoch !== undefined ||
+			options.epochStartedAt !== undefined ||
+			options.nextAction !== undefined ||
+			options.workflowState !== undefined)
+	) {
+		throw new Error("Ansteel terminal checkpoint cannot be modified");
+	}
 	const now = options.now ?? new Date();
 	const state: AnsteelRunCheckpointState = {
 		...checkpoint.state,
 		...(options.status === undefined ? {} : { status: options.status }),
 		...(options.epoch === undefined ? {} : { epoch: options.epoch }),
+		...(options.epochStartedAt === undefined ? {} : { epochStartedAt: options.epochStartedAt }),
 		...(options.nextAction === undefined ? {} : { nextAction: { ...options.nextAction } }),
 		...(options.workflowState === undefined ? {} : { workflowState: cloneWorkflowState(options.workflowState) }),
 		updatedAt: now.toISOString(),
@@ -329,4 +426,19 @@ export function updateAnsteelRunCheckpoint(
 	writeCheckpoint(checkpoint.path, state);
 	checkpoint.state = state;
 	return state;
+}
+
+function isAnsteelTerminalCheckpointStatus(status: AnsteelRunCheckpointStatus): boolean {
+	return status === "expired" || status === "completed" || status === "failed";
+}
+
+function isAllowedAnsteelCheckpointTransition(
+	from: AnsteelRunCheckpointStatus,
+	to: AnsteelRunCheckpointStatus,
+): boolean {
+	if (from === to) return true;
+	if (from === "ready-to-resume") return to === "waiting-provider" || to === "blocked" || to === "expired" || to === "completed" || to === "failed";
+	if (from === "waiting-provider") return to === "ready-to-resume" || to === "blocked" || to === "expired" || to === "failed";
+	if (from === "blocked") return to === "ready-to-resume" || to === "expired" || to === "failed";
+	return false;
 }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -806,12 +806,104 @@ describe("runAnsteelDiscussion", () => {
 		expect(budget.getUsedToolCalls()).toBe(2);
 	});
 
+	it("blocks a tool call when its project budget consumption cannot be durably persisted", () => {
+		const budget = createAnsteelProjectToolBudget(2, 0, 0, () => {
+			throw new Error("checkpoint write failed");
+		});
+
+		expect(budget.tryConsumeToolCall()).toContain("could not be durably recorded");
+		expect(budget.getUsedToolCalls()).toBe(0);
+	});
+
 	it("restores consumed project tool capacity before a resumed role session starts", () => {
 		const budget = createAnsteelProjectToolBudget(3, 2);
 
 		expect(budget.getUsedToolCalls()).toBe(2);
 		expect(budget.tryConsumeToolCall()).toBeUndefined();
 		expect(budget.tryConsumeToolCall()).toContain("project tool budget of 3 executions is exhausted");
+	});
+
+	it("protects verification reserve from ordinary project tool calls", () => {
+		const createBudget = createAnsteelProjectToolBudget as unknown as (
+			maximum: number,
+			initialUsed: number,
+			protectedVerificationToolCalls: number,
+		) => ReturnType<typeof createAnsteelProjectToolBudget>;
+		const budget = createBudget(5, 0, 2);
+
+		expect(budget.tryConsumeToolCall()).toBeUndefined();
+		expect(budget.tryConsumeToolCall()).toBeUndefined();
+		expect(budget.tryConsumeToolCall()).toBeUndefined();
+		expect(budget.tryConsumeToolCall()).toContain("protected verification reserve");
+	});
+
+	it("leaves a minimum tool allocation for every remaining mandatory verification gate", () => {
+		const budget = createAnsteelProjectToolBudget(10, 5, 5);
+		budget.setProtectedVerificationReserve(4);
+
+		expect(budget.tryConsumeToolCall()).toBeUndefined();
+		expect(budget.tryConsumeToolCall()).toContain("protected verification reserve");
+	});
+
+	it("enforces the adaptive project cap before ordinary stages can consume the verification reserve", async () => {
+		type TestModel = { provider: string; id: string };
+		const architectureToolResults: Array<string | undefined> = [];
+
+		const result = await runAnsteelProjectReview<TestModel>({
+			topic: "Enforce adaptive project tool cap",
+			cwd: process.cwd(),
+			config: {
+				stageBudgetPolicy: { maxProjectToolCalls: 20 },
+				adaptiveBudgetPolicy: {
+					enabled: true,
+					maxProjectToolCalls: 12,
+					protectedVerificationToolCalls: 10,
+				},
+				roles: {
+					"tech-lead": { model: "tech/lead", tools: ["read"] },
+					"staff-engineer": { model: "staff/engineer", tools: ["read"] },
+					"qa-engineer": { model: "qa/engineer", tools: ["read"] },
+				},
+				reportDirectory: "unused",
+			},
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async ({ projectToolBudget }) => ({
+				prompt: async (prompt) => {
+					const stage = getStageFromPrompt(prompt);
+					if (stage === "architecture") {
+						if (!projectToolBudget) throw new Error("Expected a project tool budget");
+						architectureToolResults.push(
+							projectToolBudget.tryConsumeToolCall(),
+							projectToolBudget.tryConsumeToolCall(),
+							projectToolBudget.tryConsumeToolCall(),
+							projectToolBudget.tryConsumeToolCall(),
+						);
+					}
+					return responseForMutualReviewStage(stage);
+				},
+				dispose: () => {},
+			}),
+		});
+
+		expect(result.verdict, result.markdown).toBe("approved");
+		expect(architectureToolResults).toEqual([
+			undefined,
+			undefined,
+			expect.stringContaining("protected verification reserve"),
+			expect.stringContaining("protected verification reserve"),
+		]);
+	});
+
+	it("rejects an injected project budget that exceeds the adaptive hard cap", async () => {
+		await expect(
+			runAnsteelDiscussion({
+				topic: "Reject oversized injected budget",
+				stageBudgetPolicy: { maxProjectToolCalls: 20 },
+				adaptiveBudgetPolicy: { enabled: true, maxProjectToolCalls: 12, protectedVerificationToolCalls: 10 },
+				projectToolBudget: createAnsteelProjectToolBudget(20),
+				runRole: async ({ stage }) => responseForMutualReviewStage(stage),
+			}),
+		).rejects.toThrow("Ansteel injected project tool budget exceeds the effective project hard cap of 12");
 	});
 
 	it("creates a recovery checkpoint outside historical reports", () => {
@@ -858,6 +950,204 @@ describe("runAnsteelDiscussion", () => {
 		});
 	});
 
+	it("durably records project tool use before an uncommitted role response can be interrupted", async () => {
+		type TestModel = { provider: string; id: string };
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-durable-tool-use-"));
+		temporaryDirectories.push(cwd);
+		let releaseArchitectureResponse: (() => void) | undefined;
+		let resolveToolConsumed: (() => void) | undefined;
+		const toolConsumed = new Promise<void>((resolve) => {
+			resolveToolConsumed = resolve;
+		});
+
+		const review = runAnsteelProjectReview<TestModel>({
+			topic: "Persist project tool usage before a role response commits",
+			cwd,
+			enableRunCheckpoints: true,
+			config: {
+				roles: {
+					"tech-lead": { model: "tech/lead", tools: ["read"] },
+					"staff-engineer": { model: "staff/engineer", tools: ["read"] },
+					"qa-engineer": { model: "qa/engineer", tools: ["read"] },
+				},
+				reportDirectory: "unused",
+			},
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async ({ projectToolBudget }) => ({
+				prompt: async (prompt) => {
+					const stage = getStageFromPrompt(prompt);
+					if (stage === "architecture") {
+						expect(projectToolBudget?.tryConsumeToolCall()).toBeUndefined();
+						resolveToolConsumed?.();
+						await new Promise<void>((resolve) => {
+							releaseArchitectureResponse = resolve;
+						});
+					}
+					return responseForMutualReviewStage(stage);
+				},
+				dispose: () => {},
+			}),
+		});
+
+		await toolConsumed;
+		const [runId] = readdirSync(join(cwd, ".pi", "ansteel-runs"));
+		const checkpoint = loadAnsteelRunCheckpoint(getAnsteelRunCheckpointPath(cwd, runId));
+		expect(checkpoint.workflowState).toMatchObject({ projectToolCallsUsed: 1 });
+
+		releaseArchitectureResponse?.();
+		await expect(review).resolves.toMatchObject({ verdict: "approved" });
+	});
+
+	it("rejects a checkpoint transition from a terminal state back to resumable", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-transition-"));
+		temporaryDirectories.push(cwd);
+		const checkpoint = createAnsteelRunCheckpoint({
+			cwd,
+			topic: "Reject terminal checkpoint rewind",
+			roleModels: {
+				"tech-lead": "tech/lead",
+				"staff-engineer": "staff/engineer",
+				"qa-engineer": "qa/engineer",
+			},
+			reviewRoot: cwd,
+			evidencePackageHash: "a".repeat(64),
+			configFingerprint: "b".repeat(64),
+			projectStartedAt: 1,
+			hardProjectDeadline: 2,
+			nextAction: { role: "tech-lead", stage: "architecture" },
+		});
+
+		updateAnsteelRunCheckpoint(checkpoint, { status: "completed" });
+		expect(() => updateAnsteelRunCheckpoint(checkpoint, { status: "ready-to-resume" })).toThrow(
+			"Ansteel run checkpoint cannot transition from terminal status completed",
+		);
+	});
+
+	it("rejects a checkpoint update with an unknown governance action", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-action-"));
+		temporaryDirectories.push(cwd);
+		const checkpoint = createAnsteelRunCheckpoint({
+			cwd,
+			topic: "Reject unknown checkpoint action",
+			roleModels: {
+				"tech-lead": "tech/lead",
+				"staff-engineer": "staff/engineer",
+				"qa-engineer": "qa/engineer",
+			},
+			reviewRoot: cwd,
+			evidencePackageHash: "a".repeat(64),
+			configFingerprint: "b".repeat(64),
+			projectStartedAt: 1,
+			hardProjectDeadline: 2,
+			nextAction: { role: "tech-lead", stage: "architecture" },
+		});
+
+		expect(() =>
+			updateAnsteelRunCheckpoint(checkpoint, {
+				nextAction: { role: "unknown-role" as AnsteelRole, stage: "architecture" },
+			}),
+		).toThrow("Ansteel run checkpoint has an invalid next action");
+	});
+
+	it("rejects a checkpoint action whose role cannot perform its stage", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-role-stage-"));
+		temporaryDirectories.push(cwd);
+		const checkpoint = createAnsteelRunCheckpoint({
+			cwd,
+			topic: "Reject mismatched checkpoint role and stage",
+			roleModels: {
+				"tech-lead": "tech/lead",
+				"staff-engineer": "staff/engineer",
+				"qa-engineer": "qa/engineer",
+			},
+			reviewRoot: cwd,
+			evidencePackageHash: "a".repeat(64),
+			configFingerprint: "b".repeat(64),
+			projectStartedAt: 1,
+			hardProjectDeadline: 2,
+			nextAction: { role: "tech-lead", stage: "architecture" },
+		});
+
+		expect(() =>
+			updateAnsteelRunCheckpoint(checkpoint, {
+				nextAction: { role: "qa-engineer", stage: "architecture" },
+			}),
+		).toThrow("Ansteel run checkpoint has an invalid next action");
+	});
+
+	it("refuses all workflow changes once a checkpoint is terminal", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-terminal-"));
+		temporaryDirectories.push(cwd);
+		const checkpoint = createAnsteelRunCheckpoint({
+			cwd,
+			topic: "Reject terminal checkpoint mutation",
+			roleModels: {
+				"tech-lead": "tech/lead",
+				"staff-engineer": "staff/engineer",
+				"qa-engineer": "qa/engineer",
+			},
+			reviewRoot: cwd,
+			evidencePackageHash: "a".repeat(64),
+			configFingerprint: "b".repeat(64),
+			projectStartedAt: 1,
+			hardProjectDeadline: 2,
+			nextAction: { role: "tech-lead", stage: "architecture" },
+		});
+
+		updateAnsteelRunCheckpoint(checkpoint, { status: "completed" });
+		expect(() =>
+			updateAnsteelRunCheckpoint(checkpoint, {
+				workflowState: { ...checkpoint.state.workflowState, projectToolCallsUsed: 1 },
+			}),
+		).toThrow("Ansteel terminal checkpoint cannot be modified");
+	});
+
+	it("rejects an impossible transition from blocked directly to completed", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-transition-graph-"));
+		temporaryDirectories.push(cwd);
+		const checkpoint = createAnsteelRunCheckpoint({
+			cwd,
+			topic: "Reject impossible checkpoint transition",
+			roleModels: {
+				"tech-lead": "tech/lead",
+				"staff-engineer": "staff/engineer",
+				"qa-engineer": "qa/engineer",
+			},
+			reviewRoot: cwd,
+			evidencePackageHash: "a".repeat(64),
+			configFingerprint: "b".repeat(64),
+			projectStartedAt: 1,
+			hardProjectDeadline: 2,
+			nextAction: { role: "tech-lead", stage: "architecture" },
+		});
+
+		updateAnsteelRunCheckpoint(checkpoint, { status: "blocked" });
+		expect(() => updateAnsteelRunCheckpoint(checkpoint, { status: "completed" })).toThrow(
+			"Ansteel run checkpoint cannot transition from blocked to completed",
+		);
+	});
+
+	it("starts a resumed epoch from its epoch boundary instead of the original project start", async () => {
+		const calls: AnsteelDiscussionStage[] = [];
+		const resumedEpochStartedAt = Date.now();
+		const result = await runAnsteelDiscussion(
+			{
+				topic: "Resume with a fresh epoch clock",
+				projectStartedAt: resumedEpochStartedAt - 5_000,
+				hardProjectDeadline: resumedEpochStartedAt + 5_000,
+				adaptiveBudgetPolicy: { enabled: true, epochTimeoutMs: 1_000 },
+				runRole: async ({ stage }) => {
+					calls.push(stage);
+					return responseForMutualReviewStage(stage);
+				},
+				...({ epochStartedAt: resumedEpochStartedAt } as Record<string, unknown>),
+			} as Parameters<typeof runAnsteelDiscussion>[0],
+		);
+
+		expect(result.verdict, result.markdown).toBe("approved");
+		expect(calls).toContain("staff-critique");
+	});
+
 	it("persists a resumable checkpoint with an immutable evidence identity and next action", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-resume-"));
 		temporaryDirectories.push(cwd);
@@ -879,7 +1169,7 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		expect(loadAnsteelRunCheckpoint(checkpoint.path)).toMatchObject({
-			version: 3,
+			version: 5,
 			status: "ready-to-resume",
 			evidencePackageHash: "a".repeat(64),
 			configFingerprint: "b".repeat(64),
@@ -1000,6 +1290,65 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.markdown).toContain("## Provider Recovery");
 	});
 
+	it("resumes a paused review with the provider fallback identity already in effect", async () => {
+		type TestModel = { provider: string; id: string };
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-resume-fallback-"));
+		temporaryDirectories.push(cwd);
+		const config: AnsteelConfig = {
+			allowProviderFallback: true,
+			adaptiveBudgetPolicy: {
+				enabled: true,
+				projectTimeoutMs: 10_000,
+				maxProjectToolCalls: 20,
+				protectedVerificationTimeMs: 100,
+				protectedVerificationToolCalls: 10,
+				epochTimeoutMs: 500,
+			},
+			roles: {
+				"tech-lead": { model: "tech/primary", fallbackModels: ["tech/fallback"], tools: ["read"] },
+				"staff-engineer": { model: "staff/primary", tools: ["read"] },
+				"qa-engineer": { model: "qa/primary", tools: ["read"] },
+			},
+			reportDirectory: "unused",
+		};
+		const first = await runAnsteelProjectReview<TestModel>({
+			topic: "Resume persisted fallback identity",
+			cwd,
+			enableRunCheckpoints: true,
+			config,
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async ({ model }) => ({
+				prompt: async (prompt) => {
+					const stage = getStageFromPrompt(prompt);
+					if (model.id === "primary" && model.provider === "tech") throw new Error("HTTP 503 service unavailable");
+					if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 550));
+					return responseForMutualReviewStage(stage);
+				},
+				dispose: () => {},
+			}),
+		});
+		if (!first.runCheckpointPath) throw new Error("Expected checkpoint path");
+		const resumedModels: string[] = [];
+
+		const resumed = await runAnsteelProjectReview<TestModel>({
+			topic: "Resume persisted fallback identity",
+			cwd,
+			resumeRunId: loadAnsteelRunCheckpoint(first.runCheckpointPath).id,
+			config,
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async ({ model }) => {
+				resumedModels.push(`${model.provider}/${model.id}`);
+				return {
+					prompt: async (prompt) => responseForMutualReviewStage(getStageFromPrompt(prompt)),
+					dispose: () => {},
+				};
+			},
+		});
+
+		expect(resumed.verdict).toBe("approved");
+		expect(resumedModels).toContain("tech/fallback");
+	});
+
 	it("persists a completed project review to a dedicated run checkpoint when enabled", async () => {
 		type TestModel = { provider: string; id: string };
 		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-run-review-"));
@@ -1049,6 +1398,14 @@ describe("runAnsteelDiscussion", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-resume-review-"));
 		temporaryDirectories.push(cwd);
 		const config: AnsteelConfig = {
+			adaptiveBudgetPolicy: {
+				enabled: true,
+				projectTimeoutMs: 10_000,
+				maxProjectToolCalls: 20,
+				protectedVerificationTimeMs: 100,
+				protectedVerificationToolCalls: 10,
+				epochTimeoutMs: 500,
+			},
 			roles: {
 				"tech-lead": { model: "tech/lead", tools: ["read"] },
 				"staff-engineer": { model: "staff/engineer", tools: ["read"] },
@@ -1063,15 +1420,19 @@ describe("runAnsteelDiscussion", () => {
 			config,
 			resolveModel: (provider, id) => ({ provider, id }),
 			createRoleSession: async () => ({
-				prompt: async (prompt) => responseForMutualReviewStage(getStageFromPrompt(prompt)),
+				prompt: async (prompt) => {
+					const stage = getStageFromPrompt(prompt);
+					if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 550));
+					return responseForMutualReviewStage(stage);
+				},
 				dispose: () => {},
 			}),
 		});
 		if (!first.runCheckpointPath) throw new Error("Expected checkpoint path");
 		const checkpoint = { path: first.runCheckpointPath, state: loadAnsteelRunCheckpoint(first.runCheckpointPath) };
-		updateAnsteelRunCheckpoint(checkpoint, { status: "ready-to-resume" });
+		expect(checkpoint.state.status).toBe("ready-to-resume");
 		writeFileSync(join(cwd, "created-after-checkpoint.ts"), "export const later = true;\n", "utf8");
-		const resumedPrompts: string[] = [];
+		const resumedStages: AnsteelDiscussionStage[] = [];
 
 		const resumed = await runAnsteelProjectReview<TestModel>({
 			topic: "Resume committed review state",
@@ -1081,15 +1442,17 @@ describe("runAnsteelDiscussion", () => {
 			resolveModel: (provider, id) => ({ provider, id }),
 			createRoleSession: async () => ({
 				prompt: async (prompt) => {
-					resumedPrompts.push(prompt);
-					return responseForMutualReviewStage(getStageFromPrompt(prompt));
+					const stage = getStageFromPrompt(prompt);
+					resumedStages.push(stage);
+					return responseForMutualReviewStage(stage);
 				},
 				dispose: () => {},
 			}),
 		});
 
 		expect(resumed.verdict).toBe("approved");
-		expect(resumedPrompts).toEqual([]);
+		expect(resumedStages).not.toContain("architecture");
+		expect(resumedStages).toContain("staff-critique");
 	});
 
 	it("pauses at an epoch boundary after committing the current role stage", async () => {
@@ -1107,7 +1470,7 @@ describe("runAnsteelDiscussion", () => {
 					projectTimeoutMs: 1_000,
 					maxProjectToolCalls: 20,
 					protectedVerificationTimeMs: 100,
-					protectedVerificationToolCalls: 4,
+					protectedVerificationToolCalls: 10,
 					epochTimeoutMs: 1,
 				},
 				roles: {
@@ -1135,8 +1498,68 @@ describe("runAnsteelDiscussion", () => {
 		expect(loadAnsteelRunCheckpoint(result.runCheckpointPath)).toMatchObject({
 			status: "ready-to-resume",
 			epoch: 1,
+			nextAction: { role: "staff-engineer", stage: "staff-critique" },
 			workflowState: { transcript: [expect.objectContaining({ stage: "architecture" })] },
 		});
+	});
+
+	it("rejects resume when a role thinking level changes after the checkpoint", async () => {
+		type TestModel = { provider: string; id: string };
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-resume-thinking-"));
+		temporaryDirectories.push(cwd);
+		const config: AnsteelConfig = {
+			adaptiveBudgetPolicy: {
+				enabled: true,
+				projectTimeoutMs: 10_000,
+				maxProjectToolCalls: 20,
+				protectedVerificationTimeMs: 100,
+				protectedVerificationToolCalls: 10,
+				epochTimeoutMs: 500,
+			},
+			roles: {
+				"tech-lead": { model: "tech/lead", tools: ["read"] },
+				"staff-engineer": { model: "staff/engineer", tools: ["read"] },
+				"qa-engineer": { model: "qa/engineer", tools: ["read"] },
+			},
+			reportDirectory: "unused",
+		};
+		const first = await runAnsteelProjectReview<TestModel>({
+			topic: "Reject changed role thinking on resume",
+			cwd,
+			enableRunCheckpoints: true,
+			config,
+			resolveModel: (provider, id) => ({ provider, id }),
+			createRoleSession: async () => ({
+				prompt: async (prompt) => {
+					if (getStageFromPrompt(prompt) === "architecture") await new Promise((resolve) => setTimeout(resolve, 550));
+					return responseForMutualReviewStage(getStageFromPrompt(prompt));
+				},
+				dispose: () => {},
+			}),
+		});
+		if (!first.runCheckpointPath) throw new Error("Expected checkpoint path");
+		const runId = loadAnsteelRunCheckpoint(first.runCheckpointPath).id;
+		const changedConfig: AnsteelConfig = {
+			...config,
+			roles: {
+				...config.roles,
+				"staff-engineer": { ...config.roles["staff-engineer"], thinkingLevel: "high" },
+			},
+		};
+
+		await expect(
+			runAnsteelProjectReview<TestModel>({
+				topic: "Reject changed role thinking on resume",
+				cwd,
+				resumeRunId: runId,
+				config: changedConfig,
+				resolveModel: (provider, id) => ({ provider, id }),
+				createRoleSession: async () => ({
+					prompt: async (prompt) => responseForMutualReviewStage(getStageFromPrompt(prompt)),
+					dispose: () => {},
+				}),
+			}),
+		).rejects.toThrow("Ansteel resume configuration changed");
 	});
 
 	it("expires a resumed epoch from its persisted project deadline before prompting the next role", async () => {
@@ -1150,7 +1573,7 @@ describe("runAnsteelDiscussion", () => {
 				projectTimeoutMs: 1_000,
 				maxProjectToolCalls: 20,
 				protectedVerificationTimeMs: 100,
-				protectedVerificationToolCalls: 4,
+				protectedVerificationToolCalls: 10,
 				epochTimeoutMs: 1,
 			},
 			roles: {
@@ -1226,7 +1649,7 @@ describe("runAnsteelDiscussion", () => {
 			maxProjectToolCalls: 20,
 			timeExtensionMs: 20,
 			protectedVerificationTimeMs: 100,
-			protectedVerificationToolCalls: 4,
+			protectedVerificationToolCalls: 10,
 		},
 			getStageAudit: () => ({
 				events: [
@@ -1277,7 +1700,7 @@ describe("runAnsteelDiscussion", () => {
 				maxProjectToolCalls: 20,
 				toolExtensionCalls: 2,
 				protectedVerificationTimeMs: 100,
-				protectedVerificationToolCalls: 4,
+				protectedVerificationToolCalls: 10,
 			},
 			getStageAudit: () => ({
 				events: [

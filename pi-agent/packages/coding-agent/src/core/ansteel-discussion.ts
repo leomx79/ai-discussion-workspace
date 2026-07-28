@@ -154,6 +154,9 @@ export interface AnsteelBudgetLedgerEntry {
 export interface AnsteelProjectToolBudget {
 	tryConsumeToolCall: () => string | undefined;
 	getUsedToolCalls: () => number;
+	getMaximumToolCalls: () => number;
+	/** Minimum project allowance which must survive the current stage. */
+	setProtectedVerificationReserve: (remainingToolCalls: number) => void;
 }
 
 export type AnsteelStageAuditEventType =
@@ -259,6 +262,8 @@ export interface RunAnsteelDiscussionOptions {
 	/** Persisted coordinator boundary for a resumed epoch; omitted for a new direct discussion. */
 	projectStartedAt?: number;
 	hardProjectDeadline?: number;
+	/** Start of this resumable execution epoch; project wall-clock accounting remains anchored to projectStartedAt. */
+	epochStartedAt?: number;
 	/** Coordinator-derived adaptive decisions, never role-authored text. */
 	adaptiveBudgetEvents?: readonly AnsteelAdaptiveBudgetEvent[];
 	projectToolBudget?: AnsteelProjectToolBudget;
@@ -266,6 +271,8 @@ export interface RunAnsteelDiscussionOptions {
 	abortRole?: (call: AnsteelRoleCall) => void | Promise<void>;
 	getStageAudit?: (call: AnsteelRoleCall) => { events: AnsteelStageAuditEvent[] } | undefined;
 	onStageEvent?: (event: AnsteelStageProgressEvent) => void;
+	/** Persists the next uncommitted coordinator action before it can be started or paused. */
+	onNextAction?: (call: AnsteelRoleCall) => void;
 	/** Durable coordinator state from a prior epoch. Entries are replayed deterministically, never re-called. */
 	initialState?: {
 		transcript: readonly AnsteelTranscriptEntry[];
@@ -275,6 +282,7 @@ export interface RunAnsteelDiscussionOptions {
 	};
 	/** Called only after a role response is committed to the coordinator transcript. */
 	onCommittedState?: (state: {
+		projectToolCallsUsed: number;
 		transcript: readonly AnsteelTranscriptEntry[];
 		stageAudits: readonly AnsteelStageAudit[];
 		budgetLedger: readonly AnsteelBudgetLedgerEntry[];
@@ -1262,22 +1270,74 @@ export function createAnsteelStageBudgetPolicy(input: AnsteelStageBudgetPolicyIn
 }
 
 /** Shares one irreversible tool allowance across every role session in a project review. */
-export function createAnsteelProjectToolBudget(maxProjectToolCalls: number, initialUsedToolCalls = 0): AnsteelProjectToolBudget {
+export function createAnsteelProjectToolBudget(
+	maxProjectToolCalls: number,
+	initialUsedToolCalls = 0,
+	protectedVerificationToolCalls = 0,
+	onToolCallConsumed?: (usedToolCalls: number) => void,
+): AnsteelProjectToolBudget {
 	const maximum = normalizeAnsteelPositiveInteger(maxProjectToolCalls, "maxProjectToolCalls", 1024);
 	if (!Number.isInteger(initialUsedToolCalls) || initialUsedToolCalls < 0 || initialUsedToolCalls > maximum) {
 		throw new Error("Ansteel initial project tool usage must be an integer within the configured project budget");
 	}
+	if (
+		!Number.isInteger(protectedVerificationToolCalls) ||
+		protectedVerificationToolCalls < 0 ||
+		protectedVerificationToolCalls >= maximum
+	) {
+		throw new Error("Ansteel protected verification tool calls must be an integer below the configured project budget");
+	}
 	let usedToolCalls = initialUsedToolCalls;
+	let requiredProtectedVerificationReserve = protectedVerificationToolCalls;
 	return {
 		tryConsumeToolCall: () => {
+			if (
+				requiredProtectedVerificationReserve > 0 &&
+				usedToolCalls >= maximum - requiredProtectedVerificationReserve
+			) {
+				return `Ansteel protected verification reserve of ${requiredProtectedVerificationReserve} tool executions must remain available for verification and final sign-off.`;
+			}
 			if (usedToolCalls >= maximum) {
 				return `Ansteel project tool budget of ${maximum} executions is exhausted. Provide the evidence-labelled conclusion without requesting more tools.`;
 			}
-			usedToolCalls++;
+			const nextUsedToolCalls = usedToolCalls + 1;
+			try {
+				onToolCallConsumed?.(nextUsedToolCalls);
+			} catch {
+				return "Ansteel project tool use could not be durably recorded; tool execution is blocked.";
+			}
+			usedToolCalls = nextUsedToolCalls;
 			return undefined;
 		},
 		getUsedToolCalls: () => usedToolCalls,
+		getMaximumToolCalls: () => maximum,
+		setProtectedVerificationReserve: (remainingToolCalls) => {
+			if (
+				!Number.isInteger(remainingToolCalls) ||
+				remainingToolCalls < 0 ||
+				remainingToolCalls > protectedVerificationToolCalls
+			) {
+				throw new Error("Ansteel protected verification reserve must be an integer within the configured reserve");
+			}
+			requiredProtectedVerificationReserve = remainingToolCalls;
+		},
 	};
+}
+
+function getRequiredProtectedVerificationReserve(
+	stage: AnsteelDiscussionStage,
+	protectedVerificationToolCalls: number,
+	round: number | undefined,
+): number {
+	if (protectedVerificationToolCalls === 0) return 0;
+	const remainingRounds = round === 1 ? 1 : 0;
+	const futureRoundGateReserve = remainingRounds * 5;
+	if (stage === "tech-lead-verification") return futureRoundGateReserve + 4;
+	if (stage === "staff-verification") return futureRoundGateReserve + 3;
+	if (stage === "qa-verification") return futureRoundGateReserve + 2;
+	if (stage === "staff-sign-off") return 1;
+	if (stage === "qa-sign-off") return 0;
+	return round === 2 ? 5 : protectedVerificationToolCalls;
 }
 
 interface ParseAnsteelConfigOptions {
@@ -1577,10 +1637,17 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 		maxToolCallsPerStage: config.stageBudgetPolicy?.maxToolCallsPerStage ?? config.maxToolCallsPerStage,
 	});
 	let projectStartedAt = Date.now();
+	let epochStartedAt = projectStartedAt;
 	let hardProjectDeadline =
 		projectStartedAt +
 		Math.min(stageBudgetPolicy.projectTimeoutMs, config.adaptiveBudgetPolicy?.projectTimeoutMs ?? Infinity);
-	let projectToolBudget = createAnsteelProjectToolBudget(stageBudgetPolicy.maxProjectToolCalls);
+	const effectiveProjectToolLimit = Math.min(
+		stageBudgetPolicy.maxProjectToolCalls,
+		config.adaptiveBudgetPolicy?.maxProjectToolCalls ?? Infinity,
+	);
+	const protectedVerificationToolCalls = config.adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0;
+	let initialProjectToolCallsUsed = 0;
+	let projectToolBudget: AnsteelProjectToolBudget;
 	let reviewResult: AnsteelProjectReviewResult<TModel> | undefined;
 	let primaryError: unknown;
 	let reviewFailed = false;
@@ -1664,8 +1731,14 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 					roles: ANSTEEL_ROLES.map((role) => ({
 						role,
 						model: config.roles[role].model,
+						fallbackModels: config.roles[role].fallbackModels,
 						tools: config.roles[role].tools,
+						thinkingLevel: config.roles[role].thinkingLevel,
+						memoryFile: config.roles[role].memoryFile,
+						skillPaths: config.roles[role].skillPaths,
 					})),
+					allowSingleModel: config.allowSingleModel,
+					allowProviderFallback: config.allowProviderFallback,
 					reviewRoot: config.reviewRoot,
 					requiredEvidencePaths: config.requiredEvidencePaths,
 					stageBudgetPolicy,
@@ -1695,11 +1768,31 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			});
 			projectStartedAt = state.projectStartedAt;
 			hardProjectDeadline = state.hardProjectDeadline;
+			epochStartedAt = Date.now();
 			runCheckpoint = { path: checkpointPath, state };
-			projectToolBudget = createAnsteelProjectToolBudget(
-				stageBudgetPolicy.maxProjectToolCalls,
-				Math.max(0, ...state.workflowState.budgetLedger.map((entry) => entry.projectToolCallsUsed)),
-			);
+			providerFallbacks.push(...state.workflowState.providerFallbacks.map((event) => ({ ...event })));
+			for (const role of ANSTEEL_ROLES) {
+				const lastFallback = [...providerFallbacks].reverse().find((event) => event.role === role);
+				if (!lastFallback) continue;
+				const candidates = [roleModels[role], ...(fallbackModels.get(role) ?? [])];
+				const activeModel = candidates.find(
+					(candidate) => `${candidate.provider}/${candidate.id}` === lastFallback.toModel,
+				);
+				if (!activeModel) {
+					throw new AnsteelGovernanceSetupError(
+						`Ansteel resume fallback identity is unavailable for ${role}: ${lastFallback.toModel}`,
+						"model-resolution",
+						role,
+					);
+				}
+				activeModels[role] = activeModel;
+				const remainingFallbacks = fallbackModels.get(role) ?? [];
+				const activeIndex = remainingFallbacks.findIndex(
+					(candidate) => `${candidate.provider}/${candidate.id}` === lastFallback.toModel,
+				);
+				if (activeIndex >= 0) remainingFallbacks.splice(0, activeIndex + 1);
+			}
+			initialProjectToolCallsUsed = state.workflowState.projectToolCallsUsed;
 		} else if (options.enableRunCheckpoints) {
 			runCheckpoint = createAnsteelRunCheckpoint({
 				cwd: options.cwd,
@@ -1714,6 +1807,19 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 				nextAction: { role: "tech-lead", stage: "architecture" },
 			});
 		}
+		const toolBudgetCheckpoint = runCheckpoint;
+		projectToolBudget = createAnsteelProjectToolBudget(
+			effectiveProjectToolLimit,
+			initialProjectToolCallsUsed,
+			protectedVerificationToolCalls,
+			toolBudgetCheckpoint
+				? (usedToolCalls) => {
+						updateAnsteelRunCheckpoint(toolBudgetCheckpoint, {
+							workflowState: { ...toolBudgetCheckpoint.state.workflowState, projectToolCallsUsed: usedToolCalls },
+						});
+					}
+				: undefined,
+		);
 		if (Date.now() >= hardProjectDeadline) {
 			const failure: AnsteelDiscussionFailure = {
 				role: runCheckpoint?.state.nextAction?.role ?? "tech-lead",
@@ -1780,7 +1886,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 
 		for (const role of ANSTEEL_ROLES) {
 			try {
-				sessions.set(role, await createRoleSession(role, roleModels[role]));
+				sessions.set(role, await createRoleSession(role, activeModels[role]));
 			} catch (error) {
 				throw new AnsteelGovernanceSetupError(sanitizeAnsteelFailureReason(error), "session-construction", role);
 			}
@@ -1793,6 +1899,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			adaptiveBudgetPolicy: config.adaptiveBudgetPolicy,
 			projectStartedAt,
 			hardProjectDeadline,
+			epochStartedAt,
 			...(options.resumeRunId === undefined || !runCheckpoint
 				? {}
 				: {
@@ -1836,6 +1943,10 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 						});
 						if (runCheckpoint) {
 							updateAnsteelRunCheckpoint(runCheckpoint, {
+								workflowState: {
+									...runCheckpoint.state.workflowState,
+									providerFallbacks: providerFallbacks.map((event) => ({ ...event })),
+								},
 								event: {
 									type: "provider-fallback",
 									role,
@@ -1861,10 +1972,22 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			abortRole: ({ role }) => sessions.get(role)?.abort?.(),
 			getStageAudit: ({ role }) => sessions.get(role)?.getLastStageAudit?.(),
 			getProviderFallbacks: () => providerFallbacks,
+			onNextAction: (call) => {
+				if (!runCheckpoint) return;
+				updateAnsteelRunCheckpoint(runCheckpoint, {
+					nextAction: {
+						role: call.role,
+						stage: call.stage,
+						...(call.round === undefined ? {} : { round: call.round }),
+						...(call.formatRepair ? { formatRepair: true as const } : {}),
+					},
+				});
+			},
 			onCommittedState: (state) => {
 				if (runCheckpoint) {
 					updateAnsteelRunCheckpoint(runCheckpoint, {
 						workflowState: {
+							projectToolCallsUsed: state.projectToolCallsUsed,
 							transcript: [...state.transcript],
 							stageAudits: [...state.stageAudits],
 							budgetLedger: [...state.budgetLedger],
@@ -1897,6 +2020,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			updateAnsteelRunCheckpoint(runCheckpoint, {
 				status: discussion.verdict === "approved" ? "completed" : projectExpired ? "expired" : "failed",
 				workflowState: {
+					projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
 					transcript: discussion.transcript,
 					stageAudits: discussion.stageAudits,
 					budgetLedger: discussion.budgetLedger,
@@ -1919,6 +2043,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			updateAnsteelRunCheckpoint(runCheckpoint, {
 				status: "ready-to-resume",
 				epoch: runCheckpoint.state.epoch + 1,
+				epochStartedAt: Date.now(),
 				event: { type: "stage", detail: "epoch-paused" },
 			});
 			const workflow = runCheckpoint.state.workflowState;
@@ -2750,11 +2875,36 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		options.adaptiveBudgetPolicy === undefined
 			? undefined
 			: createAnsteelAdaptiveBudgetPolicy(options.adaptiveBudgetPolicy);
+	const effectiveProjectToolLimit = Math.min(
+		stageBudgetPolicy.maxProjectToolCalls,
+		adaptiveBudgetPolicy?.maxProjectToolCalls ?? Infinity,
+	);
+	if (
+		options.projectToolBudget !== undefined &&
+		options.projectToolBudget.getMaximumToolCalls() > effectiveProjectToolLimit
+	) {
+		throw new Error(
+			`Ansteel injected project tool budget exceeds the effective project hard cap of ${effectiveProjectToolLimit}`,
+		);
+	}
 	const projectToolBudget =
-		options.projectToolBudget ?? createAnsteelProjectToolBudget(stageBudgetPolicy.maxProjectToolCalls);
+		options.projectToolBudget ??
+		createAnsteelProjectToolBudget(
+			effectiveProjectToolLimit,
+			0,
+			adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0,
+		);
 	const projectStartedAt = options.projectStartedAt ?? Date.now();
 	const hardProjectDeadline = options.hardProjectDeadline ?? projectStartedAt + stageBudgetPolicy.projectTimeoutMs;
-	if (!Number.isFinite(projectStartedAt) || !Number.isFinite(hardProjectDeadline) || hardProjectDeadline < projectStartedAt) {
+	const epochStartedAt = options.epochStartedAt ?? projectStartedAt;
+	if (
+		!Number.isFinite(projectStartedAt) ||
+		!Number.isFinite(hardProjectDeadline) ||
+		hardProjectDeadline < projectStartedAt ||
+		!Number.isFinite(epochStartedAt) ||
+		epochStartedAt < projectStartedAt ||
+		epochStartedAt > hardProjectDeadline
+	) {
 		throw new Error("Ansteel project deadline must be a finite time after project start");
 	}
 	let epochCommittedStages = 0;
@@ -2792,6 +2942,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		stage: AnsteelDiscussionStage,
 		stageOptions: RunStageOptions = {},
 	): Promise<StageResult> => {
+		projectToolBudget.setProtectedVerificationReserve(
+			getRequiredProtectedVerificationReserve(stage, adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0, stageOptions.round),
+		);
 		const stageStartedAt = Date.now();
 		let currentStageTimeoutMs = stageBudgetPolicy.stageTimeoutMs;
 		let extensions = 0;
@@ -2817,10 +2970,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				})
 			: undefined;
 		if (adaptiveBudgetState) {
-			adaptiveBudgetState.remainingProjectToolCalls = Math.max(
-				0,
-				adaptiveBudgetPolicy!.maxProjectToolCalls - projectToolBudget.getUsedToolCalls(),
-			);
+			adaptiveBudgetState.remainingProjectToolCalls = Math.max(0, projectToolBudget.getMaximumToolCalls() - projectToolBudget.getUsedToolCalls());
 		}
 		const prompt = buildRolePrompt(role, stage, topic, stageOptions.context ?? transcript, {
 			round: stageOptions.round,
@@ -2848,10 +2998,11 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			replayIndex++;
 			return { response: replayedEntry.response, entry: replayedEntry };
 		}
+		options.onNextAction?.(call);
 		if (
 			adaptiveBudgetPolicy &&
 			epochCommittedStages > 0 &&
-			elapsedSince(projectStartedAt) >= adaptiveBudgetPolicy.epochTimeoutMs
+			elapsedSince(epochStartedAt) >= adaptiveBudgetPolicy.epochTimeoutMs
 		) {
 			throw new AnsteelEpochPausedError();
 		}
@@ -2863,7 +3014,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			maxStageTimeoutMs: stageBudgetPolicy.maxStageTimeoutMs,
 			projectTimeoutMs: stageBudgetPolicy.projectTimeoutMs,
 			maxToolCallsPerStage: stageBudgetPolicy.maxToolCallsPerStage,
-			maxProjectToolCalls: stageBudgetPolicy.maxProjectToolCalls,
+			maxProjectToolCalls: projectToolBudget.getMaximumToolCalls(),
 			projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
 		});
 		const emitStageEvent = (type: AnsteelStageProgressEvent["type"], reason?: string): void => {
@@ -2919,10 +3070,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		const requestToolExtension = (): number | undefined => {
 			if (!adaptiveBudgetState || !adaptiveBudgetPolicy) return undefined;
 			recordObservedAdaptiveToolEvents();
-			adaptiveBudgetState.remainingProjectToolCalls = Math.max(
-				0,
-				adaptiveBudgetPolicy.maxProjectToolCalls - projectToolBudget.getUsedToolCalls(),
-			);
+			adaptiveBudgetState.remainingProjectToolCalls = Math.max(0, projectToolBudget.getMaximumToolCalls() - projectToolBudget.getUsedToolCalls());
 			const decision = decideAnsteelAdaptiveAllocation({
 				state: adaptiveBudgetState,
 				policy: adaptiveBudgetPolicy,
@@ -3047,16 +3195,13 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		transcript.push(entry);
 		replayIndex++;
 		epochCommittedStages++;
-		try {
-			options.onCommittedState?.({
-				transcript: transcript.map((item) => ({ ...item })),
-				stageAudits: stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })),
-				budgetLedger: budgetLedger.map((item) => ({ ...item })),
-				adaptiveBudgetEvents: adaptiveBudgetEvents.map((event) => ({ ...event })),
-			});
-		} catch {
-			// Checkpoint observers must not alter the governed result.
-		}
+		options.onCommittedState?.({
+			projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
+			transcript: transcript.map((item) => ({ ...item })),
+			stageAudits: stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })),
+			budgetLedger: budgetLedger.map((item) => ({ ...item })),
+			adaptiveBudgetEvents: adaptiveBudgetEvents.map((event) => ({ ...event })),
+		});
 		emitStageEvent("completed");
 		return { response, entry };
 	};
