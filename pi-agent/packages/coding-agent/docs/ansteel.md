@@ -208,6 +208,33 @@ Keep API credentials out of `.pi/ansteel.json`. Configure authentication through
 
 `adaptiveBudgetPolicy` is optional and disabled unless `enabled: true`. When enabled, the coordinator uses observed successful new evidence, necessary unfinished governance output, duplicate/blocked request counts, project hard limits, and protected verification/sign-off reserves to decide each small time or tool allocation. Model text cannot request or justify allocation. Its bounded integer fields are `projectTimeoutMs`, `maxProjectToolCalls`, `timeExtensionMs`, `toolExtensionCalls`, `maxBlockedRequestsPerStage`, `maxDuplicateRequestsPerStage`, `protectedVerificationTimeMs`, `protectedVerificationToolCalls`, and `epochTimeoutMs`. Protected reserves must be strictly smaller than their project ceilings. `enabled: false` is equivalent to omitting the policy and retains fixed-budget behavior.
 
+### Long-running reviews
+
+For reviews that can legitimately take hours, configure three limits together: the project ceiling, each role stage's hard ceiling, and the epoch boundary. Raising only `projectTimeoutMs` does not extend a role that is still bounded by `maxStageTimeoutMs`. Keep every stage bounded to a defensible value, then use `epochTimeoutMs` to checkpoint between committed stages and resume with `--ansteel-resume <run-id>` before the immutable project deadline expires.
+
+```json
+{
+  "stageBudgetPolicy": {
+    "stageTimeoutMs": 600000,
+    "maxStageTimeoutMs": 900000,
+    "timeoutExtensionMs": 60000,
+    "maxStageExtensions": 5,
+    "projectTimeoutMs": 14400000,
+    "maxProjectToolCalls": 160
+  },
+  "adaptiveBudgetPolicy": {
+    "enabled": true,
+    "projectTimeoutMs": 14400000,
+    "maxProjectToolCalls": 160,
+    "protectedVerificationTimeMs": 900000,
+    "protectedVerificationToolCalls": 10,
+    "epochTimeoutMs": 1800000
+  }
+}
+```
+
+`epochTimeoutMs` is checked only at a coordinator boundary after a stage commits. It cannot interrupt a live role request; `maxStageTimeoutMs` remains the fail-closed upper bound for that request. A timed-out or failed stage is terminal for that run and must not be resumed as though its response had committed.
+
 ## Reports and governance evidence
 
 Every completed approval or rejection writes a complete, unedited Markdown transcript and the immutable project evidence package to `.pi/ansteel-reports/` by default. A configuration, model-resolution, or role-session construction failure also writes a sanitized rejected setup report, even when the configuration could not be parsed; it may not include an evidence package when preflight failed. The filename includes a UTC timestamp and a topic-derived slug. The CLI also creates a separate live checkpoint at `.pi/ansteel-runs/<run-id>/checkpoint.json`; it records immutable recovery identities, the next coordinator action, committed transcript, redacted stage audits, fixed and adaptive budget ledgers, challenge/revision state, provider fallback identities, and terminal or resumable status. Reports are historical model output and are never loaded as recovery state or review evidence.
