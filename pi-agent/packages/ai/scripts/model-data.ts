@@ -205,6 +205,13 @@ export function validateModelDataDirectory(structure: ModelDataStructure, dataDi
 	const expectedFiles = Object.keys(structure)
 		.map((providerId) => `${providerId}.json`)
 		.sort();
+	const expectedEntries = [MODEL_DATA_MANIFEST_FILE, ...expectedFiles].sort();
+	const actualEntries = readdirSync(dataDir).sort();
+	if (!sameStrings(expectedEntries, actualEntries)) {
+		errors.push(
+			`model data directory entries do not match the structural catalog (${describeSetDifference(expectedEntries, actualEntries)})`,
+		);
+	}
 	const actualFiles = readdirSync(dataDir)
 		.filter((entry) => entry.endsWith(".json") && entry !== MODEL_DATA_MANIFEST_FILE)
 		.sort();

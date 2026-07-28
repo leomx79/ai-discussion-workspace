@@ -89,6 +89,10 @@ export const HUGGINGFACE_MODELS = values as {
 		id: "XiaomiMiMo/MiMo-V2-Flash";
 		provider: "huggingface";
 	};
+	"XiaomiMiMo/MiMo-V2.5": Model<"openai-completions"> & {
+		id: "XiaomiMiMo/MiMo-V2.5";
+		provider: "huggingface";
+	};
 	"XiaomiMiMo/MiMo-V2.5-Pro": Model<"openai-completions"> & {
 		id: "XiaomiMiMo/MiMo-V2.5-Pro";
 		provider: "huggingface";
@@ -147,6 +151,10 @@ export const HUGGINGFACE_MODELS = values as {
 	};
 	"moonshotai/Kimi-K2.7-Code": Model<"openai-completions"> & {
 		id: "moonshotai/Kimi-K2.7-Code";
+		provider: "huggingface";
+	};
+	"moonshotai/Kimi-K3": Model<"openai-completions"> & {
+		id: "moonshotai/Kimi-K3";
 		provider: "huggingface";
 	};
 	"openai/gpt-oss-120b": Model<"openai-completions"> & {

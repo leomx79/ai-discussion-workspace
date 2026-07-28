@@ -8,7 +8,10 @@ dist/
 packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
-packages/ai/src/providers/data/
+# Version the generated catalog snapshot; retain ignores for any other data artifacts.
+packages/ai/src/providers/data/*
+!packages/ai/src/providers/data/.manifest.json
+!packages/ai/src/providers/data/*.json
 packages/ai/src/providers/.model-generation-*/
 *.cpuprofile
 

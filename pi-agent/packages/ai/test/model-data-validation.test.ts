@@ -83,6 +83,15 @@ describe("generated model data validation", () => {
 	});
 
 	it.each([
+		["an unexpected file", (dataDir: string) => writeFileSync(join(dataDir, "notes.txt"), "unexpected\n")],
+		["an unexpected directory", (dataDir: string) => mkdirSync(join(dataDir, "nested"))],
+	])("rejects %s in the model data directory", (_description, addUnexpectedEntry) => {
+		const { dataDir, structure } = createFixture();
+		addUnexpectedEntry(dataDir);
+		expect(() => validateModelDataDirectory(structure, dataDir)).toThrow("directory entries do not match");
+	});
+
+	it.each([
 		["id", "wrong-id", "has id"],
 		["provider", "wrong-provider", "has provider"],
 		["api", "anthropic-messages", "has api"],
