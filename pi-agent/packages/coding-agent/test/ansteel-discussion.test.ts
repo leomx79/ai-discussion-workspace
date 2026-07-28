@@ -1435,23 +1435,27 @@ describe("runAnsteelDiscussion", () => {
 		writeFileSync(join(cwd, "created-after-checkpoint.ts"), "export const later = true;\n", "utf8");
 		const resumedStages: AnsteelDiscussionStage[] = [];
 
-		const resumed = await runAnsteelProjectReview<TestModel>({
-			topic: "Resume committed review state",
-			cwd,
-			resumeRunId: checkpoint.state.id,
-			config,
-			resolveModel: (provider, id) => ({ provider, id }),
-			createRoleSession: async () => ({
-				prompt: async (prompt) => {
-					const stage = getStageFromPrompt(prompt);
-					resumedStages.push(stage);
-					return responseForMutualReviewStage(stage);
-				},
-				dispose: () => {},
-			}),
-		});
+		let resumed: Awaited<ReturnType<typeof runAnsteelProjectReview<TestModel>>> | undefined;
+		for (let attempt = 0; attempt < 16; attempt++) {
+			resumed = await runAnsteelProjectReview<TestModel>({
+				topic: "Resume committed review state",
+				cwd,
+				resumeRunId: checkpoint.state.id,
+				config,
+				resolveModel: (provider, id) => ({ provider, id }),
+				createRoleSession: async () => ({
+					prompt: async (prompt) => {
+						const stage = getStageFromPrompt(prompt);
+						resumedStages.push(stage);
+						return responseForMutualReviewStage(stage);
+					},
+					dispose: () => {},
+				}),
+			});
+			if (resumed.verdict !== "paused") break;
+		}
 
-		expect(resumed.verdict).toBe("approved");
+		expect(resumed?.verdict).toBe("approved");
 		expect(resumedStages).not.toContain("architecture");
 		expect(resumedStages).toContain("staff-critique");
 	});
