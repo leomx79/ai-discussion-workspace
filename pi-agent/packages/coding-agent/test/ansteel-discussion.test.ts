@@ -1709,7 +1709,7 @@ describe("runAnsteelDiscussion", () => {
 				],
 			}),
 			runRole: async ({ stage }) => {
-				if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 25));
+				if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 50));
 				return responseForMutualReviewStage(stage);
 			},
 		});
