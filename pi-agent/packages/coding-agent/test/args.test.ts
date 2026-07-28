@@ -91,6 +91,26 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--ansteel-supervise flags", () => {
+		test("parses supervision modes and rejects Ansteel mode conflicts", () => {
+			expect(
+				parseArgs(["--ansteel-supervise", "Review", "--ansteel-supervise-max-epochs", "2"]),
+			).toMatchObject({
+				ansteelSupervise: "Review",
+				ansteelSuperviseMaxEpochs: 2,
+			});
+
+			for (const args of [
+				["--ansteel-supervise", "Review", "--ansteel", "Other"],
+				["--ansteel-supervise-resume", "../run"],
+				["--ansteel-supervise-max-epochs", "0"],
+				["--ansteel-supervise-max-epochs", "129"],
+			]) {
+				expect(parseArgs(args).diagnostics.some((diagnostic) => diagnostic.type === "error")).toBe(true);
+			}
+		});
+	});
+
 	describe("--continue flag", () => {
 		test("parses --continue flag", () => {
 			const result = parseArgs(["--continue"]);

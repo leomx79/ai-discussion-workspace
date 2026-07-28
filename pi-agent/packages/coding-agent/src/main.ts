@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
+import { runAnsteelSupervisorCli } from "./cli/ansteel-supervisor.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
@@ -547,6 +548,31 @@ export async function main(args: string[], options?: MainOptions) {
 	if (parsed.version) {
 		console.log(VERSION);
 		process.exit(0);
+	}
+
+	const isAnsteelSupervision = parsed.ansteelSupervise !== undefined || parsed.ansteelSuperviseResume !== undefined;
+	if (isAnsteelSupervision && parsed.help) {
+		printHelp();
+		process.exit(0);
+		return;
+	}
+
+	if (isAnsteelSupervision) {
+		try {
+			const result = await runAnsteelSupervisorCli({ args, cwd });
+			if (result.outcome !== "terminal") {
+				console.error(
+					`SUPERVISOR_STOPPED: outcome=${result.outcome}; runId=${result.runId ?? "none"}; epochsStarted=${result.epochsStarted}`,
+				);
+			}
+			process.exit(result.exitCode);
+			return;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(chalk.red(`Ansteel supervisor failed: ${message}`));
+			process.exit(1);
+			return;
+		}
 	}
 
 	if (parsed.export) {

@@ -5,8 +5,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	runAnsteelEpochSupervisor,
 	runAnsteelEpochSupervisorWithLock,
+	runAnsteelSupervisorCli,
 	type AnsteelEpochCall,
 } from "../src/cli/ansteel-supervisor.ts";
+import {
+	createAnsteelRunCheckpoint,
+	getAnsteelRunCheckpointPath,
+	loadAnsteelRunCheckpoint,
+	updateAnsteelRunCheckpoint,
+} from "../src/core/ansteel-run.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -199,6 +206,63 @@ describe("runAnsteelEpochSupervisor", () => {
 			epochsStarted: 2,
 			exitCode: 1,
 		});
+	});
+
+	it("spawns isolated Ansteel epochs while preserving ordinary CLI options", async () => {
+		const { cwd } = createSupervisorDirectory();
+		const childArguments: string[][] = [];
+		const runId = "ansteel-run-2026-07-28T00-00-00-000Z";
+		const result = await runAnsteelSupervisorCli({
+			args: [
+				"-e",
+				"provider.ts",
+				"--api-key",
+				"test-key",
+				"--ansteel-supervise",
+				"Review",
+				"--ansteel-supervise-max-epochs",
+				"3",
+			],
+			cwd,
+			spawnEpoch: async (args) => {
+				childArguments.push([...args]);
+				if (childArguments.length === 1) {
+					const checkpoint = createAnsteelRunCheckpoint({
+						cwd,
+						topic: "Review",
+						roleModels: {
+							"tech-lead": "tech/lead",
+							"staff-engineer": "staff/engineer",
+							"qa-engineer": "qa/engineer",
+						},
+						reviewRoot: cwd,
+						evidencePackageHash: "a".repeat(64),
+						configFingerprint: "b".repeat(64),
+						projectStartedAt: Date.parse("2026-07-28T00:00:00.000Z"),
+						hardProjectDeadline: Date.parse("2026-07-28T01:00:00.000Z"),
+						nextAction: { role: "tech-lead", stage: "architecture" },
+						now: new Date("2026-07-28T00:00:00.000Z"),
+					});
+					expect(checkpoint.state.id).toBe(runId);
+				} else {
+					const checkpointPath = getAnsteelRunCheckpointPath(cwd, runId);
+					updateAnsteelRunCheckpoint(
+						{ path: checkpointPath, state: loadAnsteelRunCheckpoint(checkpointPath) },
+						{ status: "completed" },
+					);
+				}
+				return 0;
+			},
+		});
+
+		expect(result).toMatchObject({ outcome: "terminal", runId, epochsStarted: 2, exitCode: 0 });
+		expect(childArguments).toHaveLength(2);
+		expect(childArguments[0]).toEqual(expect.arrayContaining(["-e", "provider.ts", "--api-key", "test-key", "--ansteel", "Review"]));
+		expect(childArguments[1]).toEqual(expect.arrayContaining(["-e", "provider.ts", "--api-key", "test-key", "--ansteel-resume", runId]));
+		for (const args of childArguments) {
+			expect(args).not.toContain("--ansteel-supervise");
+			expect(args).not.toContain("--ansteel-supervise-max-epochs");
+		}
 	});
 
 	it("rejects a live supervisor lock without starting an epoch", async () => {

@@ -1,5 +1,8 @@
-import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isBunBinary } from "../config.ts";
+import { parseArgs } from "./args.ts";
 import {
 	getAnsteelRunCheckpointPath,
 	loadAnsteelRunCheckpoint,
@@ -39,6 +42,12 @@ export interface AnsteelEpochSupervisorWithLockOptions extends AnsteelEpochSuper
 	isProcessAlive?: (pid: number) => boolean;
 	supervisorPid?: number;
 	now?: () => Date;
+}
+
+export interface AnsteelSupervisorCliOptions {
+	args: readonly string[];
+	cwd: string;
+	spawnEpoch?: (childArgs: readonly string[]) => Promise<number>;
 }
 
 /** Runs bounded review epochs until their durable checkpoint reaches a terminal state. */
@@ -128,6 +137,31 @@ export async function runAnsteelEpochSupervisorWithLock(
 	}
 }
 
+/** Translates supervision arguments into fresh short-lived Ansteel CLI child processes. */
+export async function runAnsteelSupervisorCli(
+	options: AnsteelSupervisorCliOptions,
+): Promise<AnsteelEpochSupervisorResult> {
+	const parsed = parseArgs([...options.args]);
+	if (parsed.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+		throw new Error(parsed.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message).join("; "));
+	}
+	const maxEpochs = parsed.ansteelSuperviseMaxEpochs ?? 64;
+	const topic = parsed.ansteelSupervise;
+	const resumeRunId = parsed.ansteelSuperviseResume;
+	if (topic === undefined && resumeRunId === undefined) {
+		throw new Error("Ansteel supervisor requires a topic or a resumable run ID");
+	}
+	const spawnEpoch = options.spawnEpoch ?? createSubprocessEpochSpawner(options.cwd);
+
+	return await runAnsteelEpochSupervisorWithLock({
+		cwd: options.cwd,
+		maxEpochs,
+		...(topic === undefined ? {} : { topic }),
+		...(resumeRunId === undefined ? {} : { resumeRunId }),
+		runEpoch: async (call) => await spawnEpoch(createAnsteelEpochChildArgs(options.args, call)),
+	});
+}
+
 function getOnlyNewRunId(before: ReadonlySet<string>, after: readonly string[]): string {
 	const newRunIds = after.filter((runId) => !before.has(runId));
 	if (newRunIds.length !== 1) {
@@ -136,6 +170,51 @@ function getOnlyNewRunId(before: ReadonlySet<string>, after: readonly string[]):
 		);
 	}
 	return newRunIds[0]!;
+}
+
+function createAnsteelEpochChildArgs(args: readonly string[], call: AnsteelEpochCall): string[] {
+	const childArgs = [...getCliEntrypointArgs(), ...removeSupervisorArgs(args)];
+	if (call.kind === "new") {
+		childArgs.push("--ansteel", call.topic);
+	} else {
+		childArgs.push("--ansteel-resume", call.runId);
+	}
+	return childArgs;
+}
+
+function removeSupervisorArgs(args: readonly string[]): string[] {
+	const result: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const argument = args[index]!;
+		if (
+			argument === "--ansteel-supervise" ||
+			argument === "--ansteel-supervise-resume" ||
+			argument === "--ansteel-supervise-max-epochs"
+		) {
+			index++;
+			continue;
+		}
+		result.push(argument);
+	}
+	return result;
+}
+
+function getCliEntrypointArgs(): string[] {
+	if (isBunBinary) return [];
+	const entrypoint = process.argv[1];
+	if (entrypoint === undefined || !existsSync(entrypoint)) {
+		throw new Error("Ansteel supervisor cannot locate the current Node CLI entrypoint");
+	}
+	return [entrypoint];
+}
+
+function createSubprocessEpochSpawner(cwd: string): (childArgs: readonly string[]) => Promise<number> {
+	return async (childArgs) =>
+		await new Promise<number>((resolve, reject) => {
+			const child = spawn(process.execPath, [...childArgs], { cwd, env: process.env, stdio: "inherit" });
+			child.once("error", reject);
+			child.once("close", (code) => resolve(code ?? 1));
+		});
 }
 
 function acquireSupervisorLock(
