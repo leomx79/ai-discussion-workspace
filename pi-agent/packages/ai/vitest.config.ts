@@ -1,4 +1,7 @@
 import { defineConfig } from 'vitest/config';
+import { disableLiveE2ECredentials } from './scripts/live-e2e-env.ts';
+
+disableLiveE2ECredentials(process.env);
 
 export default defineConfig({
   test: {
