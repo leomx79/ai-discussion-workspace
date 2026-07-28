@@ -1603,7 +1603,10 @@ describe("runAnsteelDiscussion", () => {
 		const checkpoint = { path: first.runCheckpointPath, state: loadAnsteelRunCheckpoint(first.runCheckpointPath) };
 		checkpoint.state.projectStartedAt = Date.now() - 100;
 		checkpoint.state.hardProjectDeadline = Date.now() - 1;
-		updateAnsteelRunCheckpoint(checkpoint, { status: "ready-to-resume" });
+		updateAnsteelRunCheckpoint(checkpoint, {
+			status: "ready-to-resume",
+			epochStartedAt: checkpoint.state.projectStartedAt,
+		});
 		let resumedSessionCreations = 0;
 
 		const resumed = await runAnsteelProjectReview<TestModel>({
