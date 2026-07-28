@@ -1298,11 +1298,11 @@ describe("runAnsteelDiscussion", () => {
 			allowProviderFallback: true,
 			adaptiveBudgetPolicy: {
 				enabled: true,
-				projectTimeoutMs: 10_000,
+				projectTimeoutMs: 30_000,
 				maxProjectToolCalls: 20,
 				protectedVerificationTimeMs: 100,
 				protectedVerificationToolCalls: 10,
-				epochTimeoutMs: 500,
+				epochTimeoutMs: 5_000,
 			},
 			roles: {
 				"tech-lead": { model: "tech/primary", fallbackModels: ["tech/fallback"], tools: ["read"] },
@@ -1321,13 +1321,14 @@ describe("runAnsteelDiscussion", () => {
 				prompt: async (prompt) => {
 					const stage = getStageFromPrompt(prompt);
 					if (model.id === "primary" && model.provider === "tech") throw new Error("HTTP 503 service unavailable");
-					if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 550));
+					if (stage === "architecture") await new Promise((resolve) => setTimeout(resolve, 5_500));
 					return responseForMutualReviewStage(stage);
 				},
 				dispose: () => {},
 			}),
 		});
 		if (!first.runCheckpointPath) throw new Error("Expected checkpoint path");
+		expect(first.verdict).toBe("paused");
 		const resumedModels: string[] = [];
 
 		const resumed = await runAnsteelProjectReview<TestModel>({
@@ -1347,7 +1348,7 @@ describe("runAnsteelDiscussion", () => {
 
 		expect(resumed.verdict).toBe("approved");
 		expect(resumedModels).toContain("tech/fallback");
-	});
+	}, 15_000);
 
 	it("persists a completed project review to a dedicated run checkpoint when enabled", async () => {
 		type TestModel = { provider: string; id: string };
