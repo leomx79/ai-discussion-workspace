@@ -1,4 +1,4 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -65,6 +65,80 @@ export default function (pi) {
 }
 `;
 
+const DETERMINISTIC_TASK_DELIVERY_PROVIDER_EXTENSION = `
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+
+function register(pi, provider, model, responses) {
+	const faux = fauxProvider({ provider, models: [{ id: model }] });
+	faux.setResponses(responses);
+	const registeredModel = faux.getModel();
+	pi.registerProvider(provider, {
+		api: registeredModel.api,
+		apiKey: "deterministic-test-key",
+		baseUrl: registeredModel.baseUrl,
+		streamSimple: (resolvedModel, context, options) => faux.provider.streamSimple(resolvedModel, context, options),
+		models: [{
+			id: model,
+			name: registeredModel.name,
+			reasoning: registeredModel.reasoning,
+			input: registeredModel.input,
+			cost: registeredModel.cost,
+			contextWindow: registeredModel.contextWindow,
+			maxTokens: registeredModel.maxTokens,
+		}],
+	});
+}
+
+export default function (pi) {
+	register(pi, "deterministic-team-tl", "tl", [
+		fauxAssistantMessage("Tech Lead completed independent investigation."),
+		fauxAssistantMessage("Tech Lead completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_task", {
+				taskId: "TASK-STAFF",
+				verdict: "approve",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Tech Lead approved TASK-STAFF."),
+	]);
+	register(pi, "deterministic-team-staff", "staff", [
+		fauxAssistantMessage("Staff Engineer completed independent investigation."),
+		fauxAssistantMessage("Staff Engineer completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("read", { path: "README.md" }),
+			fauxToolCall("read", { path: "test/staff.test.mjs" }),
+			fauxToolCall("read", { path: "src/staff.ts" }),
+			fauxToolCall("ls", { path: "src" }),
+			fauxToolCall("read", { path: "package.json" }),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage([
+			fauxToolCall("write", {
+				path: "src/staff.ts",
+				content: "export const staff = 'implemented';\\n",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_submit_change", {
+				taskId: "TASK-STAFF",
+				testCommand: "node --test test/staff.test.mjs",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff Engineer submitted TASK-STAFF."),
+	]);
+	register(pi, "deterministic-team-qa", "qa", [
+		fauxAssistantMessage("QA Engineer completed independent investigation."),
+		fauxAssistantMessage("QA Engineer completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_task", {
+				taskId: "TASK-STAFF",
+				verdict: "approve",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("QA Engineer approved TASK-STAFF."),
+	]);
+}
+`;
+
 interface RpcRecord {
 	id?: string;
 	type?: string;
@@ -96,7 +170,10 @@ async function waitForCondition<T>(
 	throw new Error(`Timed out waiting for ${description}`);
 }
 
-function createTemporaryProject(): { agentDir: string; projectDir: string } {
+function createTemporaryProject(providerExtension = DETERMINISTIC_TEAM_PROVIDER_EXTENSION): {
+	agentDir: string;
+	projectDir: string;
+} {
 	const root = mkdtempSync(join(tmpdir(), "pi-ansteel-team-cli-"));
 	temporaryDirectories.push(root);
 	const agentDir = join(root, "agent");
@@ -104,7 +181,7 @@ function createTemporaryProject(): { agentDir: string; projectDir: string } {
 	const extensionsDir = join(projectDir, ".pi", "extensions");
 	mkdirSync(agentDir, { recursive: true });
 	mkdirSync(extensionsDir, { recursive: true });
-	writeFileSync(join(extensionsDir, "deterministic-team-provider.ts"), DETERMINISTIC_TEAM_PROVIDER_EXTENSION, "utf8");
+	writeFileSync(join(extensionsDir, "deterministic-team-provider.ts"), providerExtension, "utf8");
 	writeFileSync(
 		join(projectDir, ".pi", "ansteel.json"),
 		JSON.stringify(
@@ -122,6 +199,30 @@ function createTemporaryProject(): { agentDir: string; projectDir: string } {
 		"utf8",
 	);
 	return { agentDir, projectDir };
+}
+
+function initializeTaskDeliveryProject(projectDir: string): void {
+	mkdirSync(join(projectDir, "src"), { recursive: true });
+	mkdirSync(join(projectDir, "test"), { recursive: true });
+	writeFileSync(join(projectDir, "src", "staff.ts"), "export const staff = 'NOT_IMPLEMENTED';\n", "utf8");
+	writeFileSync(
+		join(projectDir, "test", "staff.test.mjs"),
+		[
+			'import assert from "node:assert/strict";',
+			'import { readFileSync } from "node:fs";',
+			'import test from "node:test";',
+			'test("staff implementation", () => {',
+			'  assert.match(readFileSync("src/staff.ts", "utf8"), /implemented/);',
+			"});",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	execFileSync("git", ["init"], { cwd: projectDir, stdio: "ignore" });
+	execFileSync("git", ["config", "user.email", "ansteel@example.test"], { cwd: projectDir, stdio: "ignore" });
+	execFileSync("git", ["config", "user.name", "Ansteel Test"], { cwd: projectDir, stdio: "ignore" });
+	execFileSync("git", ["add", "src/staff.ts", "test/staff.test.mjs"], { cwd: projectDir, stdio: "ignore" });
+	execFileSync("git", ["commit", "-m", "baseline"], { cwd: projectDir, stdio: "ignore" });
 }
 
 function startRpcCli(projectDir: string, agentDir: string): RpcCliProcess {
@@ -224,7 +325,7 @@ afterEach(() => {
 });
 
 describe("Ansteel team CLI", () => {
-	it("enforces the default task-owner policy through real role tool calls and records the result", async () => {
+	it("prevents role-authored tasks before the coordinator assigns work", async () => {
 		const { agentDir, projectDir } = createTemporaryProject();
 		const rpc = startRpcCli(projectDir, agentDir);
 		try {
@@ -245,11 +346,6 @@ describe("Ansteel team CLI", () => {
 			const teamDirectory = join(projectDir, ".pi", "ansteel-team");
 			const statePath = join(teamDirectory, "team.json");
 			const eventsPath = join(teamDirectory, "events.jsonl");
-			await waitForCondition("the Staff Engineer task claim", () => {
-				if (!existsSync(statePath)) return undefined;
-				const state = JSON.parse(readFileSync(statePath, "utf8")) as { tasks: Array<{ id: string }> };
-				return state.tasks.some((task) => task.id === "TASK-STAFF") ? state : undefined;
-			});
 			expect(existsSync(eventsPath)).toBe(true);
 			const state = JSON.parse(readFileSync(statePath, "utf8")) as {
 				taskOwners: string[];
@@ -261,30 +357,11 @@ describe("Ansteel team CLI", () => {
 				.split("\n")
 				.map((line) => JSON.parse(line) as { type: string; role: string; content: string });
 			expect(state.taskOwners).toEqual(["staff-engineer"]);
-			if (state.tasks.length === 0) {
-				const staffSessionPath = state.roles["staff-engineer"].sessionFile;
-				const staffSession = existsSync(staffSessionPath)
-					? readFileSync(staffSessionPath, "utf8")
-					: "(not created)";
-				throw new Error(
-					`Staff task was not claimed. Events: ${JSON.stringify(events)}. Staff session: ${staffSession}. RPC: ${JSON.stringify(rpc.records())}`,
-				);
-			}
-			expect(state.tasks).toEqual([
-				expect.objectContaining({ id: "TASK-STAFF", owner: "staff-engineer", status: "claimed" }),
-			]);
-			expect(events).toContainEqual(
-				expect.objectContaining({
-					type: "task-claimed",
-					role: "staff-engineer",
-					content: expect.stringContaining("TASK-STAFF"),
-				}),
-			);
+			expect(state.tasks).toEqual([]);
 			expect(events).not.toContainEqual(expect.objectContaining({ type: "task-claimed", role: "tech-lead" }));
-			expect(readFileSync(state.roles["tech-lead"].sessionFile, "utf8")).toContain(
-				"tech-lead is not authorized to claim change tasks",
-			);
-			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).toContain("Claimed TASK-STAFF");
+			expect(events).not.toContainEqual(expect.objectContaining({ type: "task-claimed", role: "staff-engineer" }));
+			expect(readFileSync(state.roles["tech-lead"].sessionFile, "utf8")).not.toContain("Claimed TASK-TL");
+			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).not.toContain("Claimed TASK-STAFF");
 
 			const stop = await rpc.send({ id: "stop", type: "prompt", message: `/${teamCommand} stop` });
 			expect(stop).toMatchObject({ success: true, command: "prompt" });
@@ -297,4 +374,86 @@ describe("Ansteel team CLI", () => {
 			await rpc.stop();
 		}
 	}, 20_000);
+
+	it("delivers a coordinator task through the real RPC CLI, Git diff, test, and dual peer review", async () => {
+		const { agentDir, projectDir } = createTemporaryProject(DETERMINISTIC_TASK_DELIVERY_PROVIDER_EXTENSION);
+		initializeTaskDeliveryProject(projectDir);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+
+			const start = await rpc.send({
+				id: "start",
+				type: "prompt",
+				message: `/${teamCommand} start Deliver a deterministic Staff task`,
+			});
+			expect(start).toMatchObject({ success: true, command: "prompt" });
+			const task = await rpc.send({
+				id: "task",
+				type: "prompt",
+				message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Implement the Staff fixture","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
+			});
+			expect(task).toMatchObject({ success: true, command: "prompt" });
+
+			const teamDirectory = join(projectDir, ".pi", "ansteel-team");
+			const state = JSON.parse(readFileSync(join(teamDirectory, "team.json"), "utf8")) as {
+				roles: { "staff-engineer": { sessionFile: string } };
+				tasks: Array<{
+					id: string;
+					owner: string;
+					status: string;
+					revision: number;
+					submissions: Array<{ diff: string; test: { command: string; isError: boolean } }>;
+					reviews: Array<{ reviewer: string; verdict: string }>;
+				}>;
+			};
+			const events = readFileSync(join(teamDirectory, "events.jsonl"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { type: string; role: string; targetRole?: string });
+			expect(state.tasks).toEqual([
+				expect.objectContaining({
+					id: "TASK-STAFF",
+					owner: "staff-engineer",
+					status: "approved",
+					revision: 1,
+					submissions: [
+						expect.objectContaining({
+							diff: expect.stringContaining("implemented"),
+							test: expect.objectContaining({
+								command: "node --test test/staff.test.mjs",
+								isError: false,
+							}),
+						}),
+					],
+					reviews: expect.arrayContaining([
+						expect.objectContaining({ reviewer: "tech-lead", verdict: "approve" }),
+						expect.objectContaining({ reviewer: "qa-engineer", verdict: "approve" }),
+					]),
+				}),
+			]);
+			expect(events).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "task-assigned",
+						role: "coordinator",
+						targetRole: "staff-engineer",
+					}),
+					expect.objectContaining({ type: "task-submitted", role: "staff-engineer" }),
+					expect.objectContaining({ type: "task-review", role: "tech-lead" }),
+					expect.objectContaining({ type: "task-review", role: "qa-engineer" }),
+				]),
+			);
+			expect(readFileSync(join(projectDir, "src", "staff.ts"), "utf8")).toContain("implemented");
+			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).toContain(
+				"read-only tool budget exhausted after 4 calls",
+			);
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
 });

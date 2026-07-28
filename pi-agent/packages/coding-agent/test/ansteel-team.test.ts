@@ -10,6 +10,7 @@ import {
 	createAnsteelTeamState,
 	getAnsteelTeamEventPath,
 	getAnsteelTeamStatePath,
+	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamTransactionPath,
 	getAnsteelTeamWriteBlockReason,
 	listAnsteelTeamEvents,
@@ -203,6 +204,31 @@ describe("Ansteel team state", () => {
 		expect(readFileSync(getAnsteelTeamEventPath(cwd), "utf8").trim().split("\n")).toHaveLength(2);
 	});
 
+	it("allows the coordinator to assign a task without becoming a review role", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+
+		const assigned = appendAnsteelTeamEvent(cwd, team, {
+			type: "task-assigned",
+			role: "coordinator",
+			targetRole: "staff-engineer",
+			content: "TASK-PARSER assigned to staff-engineer",
+		});
+
+		expect(assigned).toMatchObject({
+			type: "task-assigned",
+			role: "coordinator",
+			targetRole: "staff-engineer",
+		});
+		expect(() =>
+			appendAnsteelTeamEvent(cwd, team, {
+				type: "role-report",
+				role: "coordinator",
+				content: "invalid fourth reviewer",
+			}),
+		).toThrow("coordinator");
+	});
+
 	it("recovers an interrupted event transaction whether the ledger append happened or not", () => {
 		const cwd = createTemporaryProject();
 		const team = createTeam(cwd);
@@ -348,6 +374,28 @@ describe("Ansteel team state", () => {
 				acceptanceCriteria: "The targeted test passes.",
 			}),
 		).toThrow("is not authorized to claim change tasks");
+	});
+
+	it("changes the task progress fingerprint only when governed task evidence changes", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-PARSER",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Update the parser.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const before = getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER");
+
+		writeFileSync(join(cwd, "unrelated.txt"), "not governed\n", "utf8");
+		expect(getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER")).toBe(before);
+
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+		const after = getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER");
+		expect(after).not.toBe(before);
+		expect(getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER")).toBe(after);
 	});
 
 	it("allows an explicitly authorized Tech Lead to claim a change task", () => {

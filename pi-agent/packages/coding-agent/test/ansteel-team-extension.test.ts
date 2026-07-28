@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnsteelConfig } from "../src/core/ansteel-discussion.ts";
+import { listAnsteelTeamEvents, loadAnsteelTeamState } from "../src/core/ansteel-team.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -15,6 +16,7 @@ import {
 	type AnsteelTeamRoleSession,
 	type CreateAnsteelTeamRoleSessionOptions,
 	createAnsteelTeamExtension,
+	getAnsteelTeamEvidenceBlockReason,
 } from "../src/extensions/ansteel-team/index.ts";
 
 const temporaryDirectories: string[] = [];
@@ -80,8 +82,8 @@ function setup(config = createConfig(), rolePrompt?: (role: string, prompt: stri
 			const session: AnsteelTeamRoleSession = {
 				dispose: vi.fn(),
 				prompt: vi.fn(async (prompt: string) => {
-					if (rolePrompt) return await rolePrompt(role, prompt);
 					prompts.push(prompt);
+					if (rolePrompt) return await rolePrompt(role, prompt);
 					if (prompt.startsWith("You are the independent ")) {
 						await options.taskOperations.reviewTask("TASK-1", { verdict: "approve" });
 					}
@@ -132,6 +134,27 @@ afterEach(() => {
 });
 
 describe("Ansteel team extension", () => {
+	it("blocks role tools from reading coordinator-generated state while preserving project evidence", () => {
+		for (const [toolName, args] of [
+			["read", { path: ".pi/ansteel-team/team.json" }],
+			["ls", { path: ".pi" }],
+			["find", { path: "node_modules", pattern: "**/*" }],
+			["read", { path: ".git/config" }],
+			["bash", { command: "cat .pi/ansteel-team/events.jsonl" }],
+		] as const) {
+			expect(getAnsteelTeamEvidenceBlockReason("/workspace/project", toolName, args)).toEqual(
+				expect.stringContaining("cannot access coordinator state"),
+			);
+		}
+		expect(getAnsteelTeamEvidenceBlockReason("/workspace/project", "read", { path: "src/parser.ts" })).toBeUndefined();
+		expect(
+			getAnsteelTeamEvidenceBlockReason("/workspace/project", "read", { path: ".pi/ansteel.json" }),
+		).toBeUndefined();
+		expect(
+			getAnsteelTeamEvidenceBlockReason("/workspace/project", "bash", { command: "git status --short" }),
+		).toBeUndefined();
+	});
+
 	it("starts three independent sessions and publishes their public reports", async () => {
 		const { commands, ctx, prompts, roleSessionOptions, roleSessions, sendMessage } = setup();
 		const command = commands.get("ansteel-team");
@@ -368,5 +391,246 @@ describe("Ansteel team extension", () => {
 			ctx as unknown as ExtensionContext,
 		);
 		expect(afterStopResult).toBeUndefined();
+	});
+
+	it("runs a coordinator task through a truncated progress epoch and immutable peer approval", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 4;
+		config.teamTaskMaxNoProgressEpochs = 2;
+		let taskEpochs = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.startsWith("You are the independent ")) {
+				await roleOptions.taskOperations.reviewTask("TASK-1", { verdict: "approve" });
+				return `${role} approved TASK-1.`;
+			}
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-1")) {
+				taskEpochs++;
+				if (taskEpochs === 1) {
+					writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+					throw new Error("Ansteel role stage failed: output-truncated");
+				}
+				await roleOptions.taskOperations.submitTask("TASK-1", "node --test test/parser.test.mjs");
+				return "Staff submitted TASK-1.";
+			}
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(taskEpochs).toBe(2);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual([
+			expect.objectContaining({ id: "TASK-1", owner: "staff-engineer", status: "approved", revision: 1 }),
+		]);
+		const events = listAnsteelTeamEvents(harness.ctx.cwd);
+		expect(events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "task-assigned",
+					role: "coordinator",
+					targetRole: "staff-engineer",
+				}),
+				expect.objectContaining({
+					type: "role-failure",
+					role: "staff-engineer",
+					content: expect.stringContaining("output-truncated"),
+				}),
+				expect.objectContaining({ type: "task-submitted", role: "staff-engineer" }),
+				expect.objectContaining({ type: "task-review", role: "tech-lead" }),
+				expect.objectContaining({ type: "task-review", role: "qa-engineer" }),
+			]),
+		);
+	});
+
+	it("stops a coordinator task after the configured consecutive no-progress epochs", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 4;
+		config.teamTaskMaxNoProgressEpochs = 2;
+		let taskEpochs = 0;
+		const harness = setup(config, async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-1")) taskEpochs++;
+			return `${role} produced prose without task progress.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(taskEpochs).toBe(2);
+		expect(harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-1"))).toContain(
+			"Read-only tool budget: 4 calls",
+		);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ id: "TASK-1", status: "claimed" });
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).at(-1)).toMatchObject({
+			type: "role-failure",
+			role: "staff-engineer",
+			content: expect.stringContaining("owner-no-progress"),
+		});
+	});
+
+	it("stops a progressing coordinator task at the configured epoch ceiling", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 1;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		const harness = setup(config, async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-1")) {
+				writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+			}
+			return `${role} completed one epoch.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).at(-1)).toMatchObject({
+			type: "role-failure",
+			role: "staff-engineer",
+			content: expect.stringContaining("task-epoch-limit"),
+		});
+	});
+
+	it("resumes one existing unfinished coordinator task without creating a duplicate", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 2;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		let ownerEpochs = 0;
+		const harness = setup(config, async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-1")) ownerEpochs++;
+			return `${role} produced no governed task progress.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const staff = harness.roleSessionOptions.find((options) => options.role === "staff-engineer");
+		if (!staff) throw new Error("Missing Staff Engineer session");
+		await staff.taskOperations.claimTask({
+			id: "TASK-1",
+			files: ["src/parser.ts"],
+			description: "Change parser",
+			acceptanceCriteria: "The parser test passes",
+			dependsOn: [],
+		});
+
+		await command("task TASK-1", harness.ctx);
+
+		expect(ownerEpochs).toBe(1);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toHaveLength(1);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({
+			id: "TASK-1",
+			status: "claimed",
+		});
+	});
+
+	it("rejects malformed, unauthorized, unknown, and approved coordinator tasks before prompting an owner", async () => {
+		const config = createConfig();
+		let ownerEpochs = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.startsWith("You are the independent ")) {
+				await roleOptions.taskOperations.reviewTask("TASK-OK", { verdict: "approve" });
+				return `${role} approved TASK-OK.`;
+			}
+			if (role === "staff-engineer" && prompt.includes("Execute governed task")) {
+				ownerEpochs++;
+				writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+				await roleOptions.taskOperations.submitTask("TASK-OK", "node --test test/parser.test.mjs");
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command("task {bad-json", harness.ctx);
+		await command(
+			'task {"id":"TASK-TL","owner":"tech-lead","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
+			harness.ctx,
+		);
+		await command("task TASK-UNKNOWN", harness.ctx);
+		expect(ownerEpochs).toBe(0);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toHaveLength(0);
+
+		await command(
+			'task {"id":"TASK-OK","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
+			harness.ctx,
+		);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ status: "approved" });
+		await command("task TASK-OK", harness.ctx);
+
+		expect(ownerEpochs).toBe(1);
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("already approved") }),
+			{ triggerTurn: false },
+		);
+	});
+
+	it("resumes only the missing peer review for a submitted coordinator task", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 3;
+		const reviewPrompts = new Map<string, number>();
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.startsWith("You are the independent ")) {
+				reviewPrompts.set(role, (reviewPrompts.get(role) ?? 0) + 1);
+				if (role === "qa-engineer" && reviewPrompts.get(role) === 1) {
+					throw new Error("temporary QA provider failure");
+				}
+				await roleOptions.taskOperations.reviewTask("TASK-1", { verdict: "approve" });
+				return `${role} approved TASK-1.`;
+			}
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-1")) {
+				writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+				await roleOptions.taskOperations.submitTask("TASK-1", "node --test test/parser.test.mjs");
+				return "Staff submitted TASK-1.";
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ status: "approved" });
+		expect(reviewPrompts.get("tech-lead")).toBe(1);
+		expect(reviewPrompts.get("qa-engineer")).toBe(2);
+		expect(
+			listAnsteelTeamEvents(harness.ctx.cwd).filter(
+				(event) =>
+					event.type === "role-failure" &&
+					event.role === "tech-lead" &&
+					event.content.includes("already has a tech-lead review"),
+			),
+		).toHaveLength(0);
 	});
 });

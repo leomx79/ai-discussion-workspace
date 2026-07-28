@@ -18,12 +18,15 @@ export type AnsteelTeamEventType =
 	| "challenge"
 	| "resolution"
 	| "role-failure"
+	| "task-assigned"
 	| "task-claimed"
 	| "task-submitted"
 	| "task-review"
 	| "milestone-planned"
 	| "milestone-submitted"
 	| "milestone-review";
+
+export type AnsteelTeamEventActor = AnsteelRole | "coordinator";
 
 export interface AnsteelTeamRoleState {
 	model: string;
@@ -156,7 +159,7 @@ export interface CreateAnsteelTeamStateOptions {
 
 export interface AnsteelTeamEventInput {
 	type: AnsteelTeamEventType;
-	role: AnsteelRole;
+	role: AnsteelTeamEventActor;
 	targetRole?: AnsteelRole;
 	challengeId?: string;
 	content: string;
@@ -997,7 +1000,7 @@ function runGit(cwd: string, args: string[], allowedExitCodes: readonly number[]
 	return result.stdout;
 }
 
-function captureTaskDiff(cwd: string, task: AnsteelTeamTask): string {
+function collectTaskDiff(cwd: string, task: AnsteelTeamTask): string {
 	const repository = runGit(cwd, ["rev-parse", "--is-inside-work-tree"], [0]).trim();
 	if (repository !== "true") {
 		throw new AnsteelTeamStateError("Ansteel team task submission requires a Git worktree");
@@ -1010,11 +1013,37 @@ function captureTaskDiff(cwd: string, task: AnsteelTeamTask): string {
 	const untrackedDiffs = untrackedFiles.map((file) =>
 		runGit(cwd, ["diff", "--no-index", "--binary", "--", "/dev/null", file], [0, 1]),
 	);
-	const diff = [trackedDiff, ...untrackedDiffs].filter((entry) => entry.length > 0).join("\n");
+	return [trackedDiff, ...untrackedDiffs].filter((entry) => entry.length > 0).join("\n");
+}
+
+function captureTaskDiff(cwd: string, task: AnsteelTeamTask): string {
+	const diff = collectTaskDiff(cwd, task);
 	if (diff.trim().length === 0) {
 		throw new AnsteelTeamStateError(`Ansteel team task ${task.id} has no Git diff for its claimed files`);
 	}
 	return diff;
+}
+
+export function getAnsteelTeamTaskProgressFingerprint(cwd: string, state: AnsteelTeamState, taskId: string): string {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertTaskId(taskId);
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+	const diffHash = createHash("sha256").update(collectTaskDiff(projectDirectory, task), "utf8").digest("hex");
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				status: task.status,
+				revision: task.revision,
+				testEvidence: task.testEvidence.length,
+				submissions: task.submissions.length,
+				reviews: task.reviews.length,
+				diffHash,
+			}),
+			"utf8",
+		)
+		.digest("hex");
 }
 
 export function submitAnsteelTeamTask(
@@ -1280,6 +1309,7 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "challenge" &&
 		event.type !== "resolution" &&
 		event.type !== "role-failure" &&
+		event.type !== "task-assigned" &&
 		event.type !== "task-claimed" &&
 		event.type !== "task-submitted" &&
 		event.type !== "task-review" &&
@@ -1289,7 +1319,13 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
 	}
-	assertRole(event.role, "event role");
+	if (event.role === "coordinator") {
+		if (event.type !== "task-assigned") {
+			throw new AnsteelTeamStateError("Ansteel team coordinator can only record task-assigned events");
+		}
+	} else {
+		assertRole(event.role, "event role");
+	}
 	assertPublicContent(event.content);
 	if (typeof event.createdAt !== "string" || Number.isNaN(Date.parse(event.createdAt))) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid timestamp");
@@ -1301,6 +1337,12 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		assertChallengeId(event.challengeId, "challenge");
 	}
 	if (event.type === "resolution") assertChallengeId(event.challengeId, "resolution");
+	if (event.type === "task-assigned") {
+		if (event.role !== "coordinator") {
+			throw new AnsteelTeamStateError("Ansteel team task-assigned events require the coordinator actor");
+		}
+		assertRole(event.targetRole, "assigned task owner");
+	}
 	return {
 		sequence: event.sequence,
 		type: event.type,
@@ -1394,7 +1436,7 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 		}
 		state.openChallenges.push({
 			id: event.challengeId!,
-			raisedBy: event.role,
+			raisedBy: event.role as AnsteelRole,
 			targetRole: event.targetRole!,
 			status: "open",
 		});

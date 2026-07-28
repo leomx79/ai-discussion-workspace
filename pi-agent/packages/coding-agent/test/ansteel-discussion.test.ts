@@ -1908,14 +1908,20 @@ describe("runAnsteelDiscussion", () => {
 
 	it("resets raw session history before every stage prompt", async () => {
 		const events: string[] = [];
+		const assistantMessages = createAssistantMessageEmitter();
 		const session = createAnsteelRawTurnSession({
 			prompt: async (text) => {
 				events.push(`prompt:${text}`);
+				assistantMessages.emit({
+					role: "assistant",
+					content: [{ type: "text", text: `Completed ${text}` }],
+					stopReason: "stop",
+				});
 			},
 			reset: () => {
 				events.push("reset");
 			},
-			subscribeToAssistantMessageEnd: () => () => {},
+			subscribeToAssistantMessageEnd: assistantMessages.subscribe,
 			dispose: () => {},
 		});
 
@@ -2040,7 +2046,7 @@ describe("runAnsteelDiscussion", () => {
 		});
 	});
 
-	it("does not reuse an older assistant message when no current assistant event is emitted", async () => {
+	it("rejects an empty current turn instead of reusing an older assistant message", async () => {
 		const assistantMessages = createAssistantMessageEmitter();
 		const source: RawTurnSessionSource = {
 			messages: [{ role: "assistant", content: [{ type: "text", text: "VERDICT: APPROVE" }] }],
@@ -2049,9 +2055,30 @@ describe("runAnsteelDiscussion", () => {
 			dispose: () => {},
 		};
 
-		const response = await createAnsteelRawTurnSession(source).prompt("veto");
+		await expect(createAnsteelRawTurnSession(source).prompt("veto")).rejects.toThrow("empty-public-update");
+	});
 
-		expect(response).toBe("");
+	it("rejects an output-length stop instead of publishing an empty role reply", async () => {
+		const assistantMessages = createAssistantMessageEmitter();
+		const session = createAnsteelRawTurnSession({
+			prompt: async () => {
+				assistantMessages.emit({
+					role: "assistant",
+					content: [],
+					stopReason: "length",
+				});
+			},
+			subscribeToAssistantMessageEnd: assistantMessages.subscribe,
+			dispose: () => {},
+		});
+
+		await expect(session.prompt("implement")).rejects.toThrow("output-truncated");
+		expect(session.getLastStageAudit?.().events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "assistant-message-end", stopReason: "length" }),
+				expect.objectContaining({ type: "stage-prompt-error" }),
+			]),
+		);
 	});
 
 	it("surfaces a redacted provider error instead of treating it as an empty role reply", async () => {
@@ -2227,6 +2254,7 @@ describe("runAnsteelDiscussion", () => {
 	});
 
 	it("rejects and archives listener cleanup failure after a successful raw prompt", async () => {
+		const assistantMessages = createAssistantMessageEmitter();
 		const result = await runAnsteelDiscussion({
 			topic: "Review listener cleanup failure",
 			runRole: async ({ role, stage, prompt }) => {
@@ -2235,9 +2263,19 @@ describe("runAnsteelDiscussion", () => {
 				}
 
 				return await createAnsteelRawTurnSession({
-					prompt: async () => {},
-					subscribeToAssistantMessageEnd: () => () => {
-						throw new Error("listener cleanup failed");
+					prompt: async () => {
+						assistantMessages.emit({
+							role: "assistant",
+							content: [{ type: "text", text: "Successful provider response" }],
+							stopReason: "stop",
+						});
+					},
+					subscribeToAssistantMessageEnd: (listener) => {
+						const unsubscribe = assistantMessages.subscribe(listener);
+						return () => {
+							unsubscribe();
+							throw new Error("listener cleanup failed");
+						};
 					},
 					dispose: () => {},
 				}).prompt(prompt);
@@ -2303,9 +2341,18 @@ describe("runAnsteelDiscussion", () => {
 
 		expect(result.verdict).toBe("rejected");
 		expect(result.consensus).toBeUndefined();
-		expect(result.transcript.at(-1)?.response).toBe("");
+		expect(result.failure).toEqual({
+			role: "qa-engineer",
+			stage: "qa-verification",
+			reason: "Ansteel role stage failed: empty-public-update",
+		});
+		expect(result.transcript.at(-1)).toMatchObject({
+			role: "staff-engineer",
+			stage: "staff-verification",
+			response: "VERDICT: APPROVE",
+		});
 		expect(getLegacyCopyText(qaMessages ?? [])).toBe(MUTUAL_REVIEW_RESPONSES["qa-revision"]);
-		expect(result.markdown).toContain("qa-engineer / qa-verification returned an empty or whitespace-only response");
+		expect(result.markdown).toContain("Ansteel role stage failed: empty-public-update");
 		expect(prompts.some(({ text }) => text.includes("Current stage: consensus."))).toBe(false);
 	});
 
@@ -3613,6 +3660,57 @@ describe("runAnsteelDiscussion", () => {
 		);
 
 		expect(loadAnsteelConfig(cwd).teamTaskOwners).toEqual(["staff-engineer", "tech-lead"]);
+	});
+
+	it("loads bounded interactive task epoch controls", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+		temporaryDirectories.push(cwd);
+		mkdirSync(join(cwd, ".pi"));
+		writeFileSync(
+			join(cwd, ".pi", "ansteel.json"),
+			JSON.stringify({
+				teamTaskMaxEpochs: 12,
+				teamTaskMaxNoProgressEpochs: 3,
+				roles: {
+					"tech-lead": { model: "anthropic/claude-sonnet" },
+					"staff-engineer": { model: "openai/gpt-5" },
+					"qa-engineer": { model: "deepseek/deepseek-chat" },
+				},
+			}),
+		);
+
+		expect(loadAnsteelConfig(cwd)).toMatchObject({
+			teamTaskMaxEpochs: 12,
+			teamTaskMaxNoProgressEpochs: 3,
+		});
+	});
+
+	it("rejects invalid interactive task epoch controls", () => {
+		for (const controls of [
+			{ teamTaskMaxEpochs: 0 },
+			{ teamTaskMaxEpochs: 1 },
+			{ teamTaskMaxEpochs: 129 },
+			{ teamTaskMaxNoProgressEpochs: 0 },
+			{ teamTaskMaxNoProgressEpochs: 9 },
+			{ teamTaskMaxEpochs: 2, teamTaskMaxNoProgressEpochs: 3 },
+		]) {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+			temporaryDirectories.push(cwd);
+			mkdirSync(join(cwd, ".pi"));
+			writeFileSync(
+				join(cwd, ".pi", "ansteel.json"),
+				JSON.stringify({
+					...controls,
+					roles: {
+						"tech-lead": { model: "anthropic/claude-sonnet" },
+						"staff-engineer": { model: "openai/gpt-5" },
+						"qa-engineer": { model: "deepseek/deepseek-chat" },
+					},
+				}),
+			);
+
+			expect(() => loadAnsteelConfig(cwd)).toThrow("teamTaskMax");
+		}
 	});
 
 	it("rejects invalid interactive task owner policies", () => {

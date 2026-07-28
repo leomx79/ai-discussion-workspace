@@ -135,3 +135,62 @@ Staff Engineer 三个阶段都以 `stopReason: length` 结束，只产生被截�
 - 不根据模型文字自动延长预算。
 - 不静默更换 provider/model 或自动转移任务 owner。
 - 不降低测试、Git diff、文件所有权或双评审门禁。
+
+## 真实探针反馈：只读工具预算必须接入交互团队
+
+第一轮修复后的新隔离探针已经消除了原故障：coordinator 确定性创建了 `TASK-LEASE-QUEUE`，事件中不再出现空
+`role-report` 或 `task-missing`，两个截断 owner epoch 最终机械归档为 `owner-no-progress`。但是 Staff 在每个
+epoch 中仍重复执行 `ls/read/find/bash`，分别消耗约 8 到 14 个只读调用，直到 provider 以 `length` 结束；没有
+调用 `edit`、`write` 或提交工具，目标文件仍为 `NOT_IMPLEMENTED`。
+
+根因是现有 `maxToolCallsPerStage` 只用于批量治理流程，交互团队 session 没有消费这个已经解析的配置。最终方案
+因此补充以下约束：
+
+- 每个隔离团队 prompt 重置一次只读工具计数，默认使用现有 `maxToolCallsPerStage = 4`；
+- `read`、`grep`、`find`、`ls` 和合法的只读 `bash` 消耗预算；
+- `edit`、`write` 和 Ansteel 结构化任务工具不消耗只读预算；
+- 达到预算后拒绝继续扫描，owner prompt 要求先在受控文件留下语法有效的 Git diff checkpoint；
+- 非 owner 角色在预算耗尽后只能发布简洁的证据结论，不能通过更多扫描无限延长阶段。
+
+该约束不是把任意工具调用当成进展。只有任务状态和精确文件 diff 指纹变化才能获得下一个 owner epoch；只读预算
+只是确保有限工具被用于从调查转向可恢复实现。
+
+## 最终根因闭环
+
+后续隔离探针又暴露出三条相互独立的故障链，必须分别处理，不能只靠增加总超时：
+
+1. **GLM 返回空公开文本。** 两个自定义 GLM provider 的模型元数据没有正确声明思考协议，单轮的 16384
+   token 被隐藏 thinking 消耗，最终没有可发布文本。运行环境中的模型配置已分别声明 `reasoning: true`，
+   并按接口使用 `thinkingFormat: qwen` 或 `thinkingFormat: zai`，同时把模型输出上限设置到 provider
+   支持的范围。该修复属于本机 provider 元数据，不写入仓库，也不在文档或事件中保存凭据。
+2. **角色读取协调器自身证据。** 角色曾读取 `.pi/ansteel-team/team.json`、历史报告和自己的 session，
+   造成自引用、上下文膨胀及错误的任务认知。团队工具现在复用审查证据策略，并额外隔离
+   `.pi/ansteel-team`、`.pi/ansteel-reports`、`.pi/ansteel-runs`、`.pi/ansteel-memory`、`.git`
+   和 `node_modules`；普通项目源码、测试和受控 Git diff 仍可读取。
+3. **角色抢先创建任务。** Staff Engineer 曾在 coordinator 注册任务前调用 `ansteel_claim_task`，
+   形成两个不同任务争用同一文件。交互角色的可用工具集合不再暴露该工具；只有
+   `/ansteel-team task <JSON>` 能创建任务，`/ansteel-team task TASK-ID` 只恢复已存在任务。
+
+这三项修复与进展驱动 epoch 的关系是：provider 元数据保证模型能结束一轮，证据隔离保证有限上下文只用于项目
+事实，coordinator-only 入口保证只有一条任务主线，而只读预算和任务指纹决定是否允许继续下一个 epoch。运行几
+个小时的真实工作由多个有界、可恢复 epoch 组成；任何单轮仍受超时和工具上限约束，只有受控 diff、任务状态、
+测试提交或评审计数发生变化才获得续跑资格。
+
+## 最终真实 Canary 结果
+
+2026-07-29 的全新隔离项目使用三个彼此不同的显式 `provider/model`：
+
+- Tech Lead：`qwen-token-plan-cn/glm-5.2`
+- Staff Engineer：`micuapi/gpt-5.5`
+- QA Engineer：`volcengine-agent-plan/glm-5.2`
+
+协调器只创建了 `TASK-LEASE-QUEUE`，owner 为 Staff Engineer。Staff 实际调用了 `edit` 四次和
+`ansteel_submit_change` 一次，只修改探针项目的 `src/lease-queue.mjs`；提交时 `npm test` 为
+`10/10`。Tech Lead 与 QA Engineer 随后分别调用一次 `ansteel_review_task`，共同批准 revision 1，
+团队最终状态为 `stopped`，任务状态为 `approved`。
+
+独立 Oracle 另外执行了 6 项未向角色公开的 DAG、并发幂等、租约过期、重复恢复、尾部损坏和失败依赖测试，
+结果为 `6/6`。证据审计确认 13 条事件连续、SHA-256 链有效、链头与 `team.json` 一致、下一事件序号正确，
+三个 session 均无 JSON 解析错误，且进程结束后没有遗留 `run-team-probe.mjs`。这证明的是交互团队能在真实
+provider、真实工具、受控 Git diff、真实测试和双评审门禁下完成一次代码任务；它不把模型标识当作事实正确性
+证明，也不把临时探针实现混入产品仓库。

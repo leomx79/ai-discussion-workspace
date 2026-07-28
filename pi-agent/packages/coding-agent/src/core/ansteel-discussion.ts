@@ -350,6 +350,10 @@ export interface AnsteelConfig {
 	requiredEvidencePaths?: string[];
 	/** Interactive roles permitted to claim code-change tasks; defaults to Staff Engineer only. */
 	teamTaskOwners?: AnsteelRole[];
+	/** Maximum isolated owner epochs for one interactive task command. */
+	teamTaskMaxEpochs?: number;
+	/** Maximum consecutive owner epochs without a governed task-state change. */
+	teamTaskMaxNoProgressEpochs?: number;
 	stageTimeoutMs?: number;
 	maxToolCallsPerStage?: number;
 	stageBudgetPolicy?: AnsteelStageBudgetPolicyInput;
@@ -735,6 +739,12 @@ function rawAssistantProviderError(message: unknown): string | undefined {
 	return `Ansteel role provider error: ${reason}`;
 }
 
+function rawAssistantCompletionError(message: unknown): string | undefined {
+	if (!isRecord(message) || message.role !== "assistant") return undefined;
+	if (message.stopReason === "length") return "Ansteel role stage failed: output-truncated";
+	return rawAssistantProviderError(message);
+}
+
 function elapsedSince(startedAt: number): number {
 	return Math.max(0, Date.now() - startedAt);
 }
@@ -835,8 +845,25 @@ export function createAnsteelRawTurnSession(source: AnsteelRawTurnSessionSource)
 				promptFailure = error;
 				auditEvents.push({ type: "stage-prompt-error", elapsedMs: elapsedSince(startedAt) });
 			}
-			const providerError = promptFailed ? undefined : rawAssistantProviderError(assistantMessages.at(-1));
-			const primaryFailure = promptFailed ? promptFailure : providerError ? new Error(providerError) : undefined;
+			const lastAssistantMessage = assistantMessages.at(-1);
+			const lastNonblankAssistantText = assistantMessages
+				.slice()
+				.reverse()
+				.map((message) => rawAssistantText(message))
+				.find((text) => text !== undefined && text.trim().length > 0);
+			const response = lastNonblankAssistantText ?? rawAssistantText(lastAssistantMessage) ?? "";
+			const completionError = promptFailed ? undefined : rawAssistantCompletionError(lastAssistantMessage);
+			const emptyOutputError =
+				!promptFailed && completionError === undefined && response.trim().length === 0
+					? "Ansteel role stage failed: empty-public-update"
+					: undefined;
+			const primaryFailure = promptFailed
+				? promptFailure
+				: completionError
+					? new Error(completionError)
+					: emptyOutputError
+						? new Error(emptyOutputError)
+						: undefined;
 			if (!promptFailed) {
 				auditEvents.push({
 					type: primaryFailure ? "stage-prompt-error" : "stage-prompt-end",
@@ -874,12 +901,7 @@ export function createAnsteelRawTurnSession(source: AnsteelRawTurnSessionSource)
 				);
 			}
 
-			const lastNonblankAssistantText = assistantMessages
-				.slice()
-				.reverse()
-				.map((message) => rawAssistantText(message))
-				.find((text) => text !== undefined && text.trim().length > 0);
-			return lastNonblankAssistantText ?? rawAssistantText(assistantMessages.at(-1)) ?? "";
+			return response;
 		},
 		...(source.abort ? { abort: () => source.abort!() } : {}),
 		dispose: () => source.dispose(),
@@ -1210,6 +1232,22 @@ function normalizeAnsteelMaxToolCallsPerStage(value: unknown): number {
 	return maxToolCalls;
 }
 
+function normalizeAnsteelTeamTaskMaxEpochs(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 128) {
+		throw new Error("Ansteel teamTaskMaxEpochs must be an integer between 1 and 128");
+	}
+	return value as number;
+}
+
+function normalizeAnsteelTeamTaskMaxNoProgressEpochs(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 8) {
+		throw new Error("Ansteel teamTaskMaxNoProgressEpochs must be an integer between 1 and 8");
+	}
+	return value as number;
+}
+
 function normalizeAnsteelPositiveInteger(value: unknown, field: string, maximum: number): number {
 	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > maximum) {
 		throw new Error(`Ansteel ${field} must be an integer between 1 and ${maximum}`);
@@ -1385,11 +1423,23 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 	const teamTaskOwners = parseAnsteelTeamTaskOwners(value.teamTaskOwners);
 	let stageTimeoutMs: number;
 	let maxToolCallsPerStage: number;
+	let teamTaskMaxEpochs: number | undefined;
+	let teamTaskMaxNoProgressEpochs: number | undefined;
 	let stageBudgetPolicy: AnsteelStageBudgetPolicy | undefined;
 	let adaptiveBudgetPolicy: AnsteelAdaptiveBudgetPolicy | undefined;
 	try {
 		stageTimeoutMs = normalizeAnsteelStageTimeoutMs(value.stageTimeoutMs);
 		maxToolCallsPerStage = normalizeAnsteelMaxToolCallsPerStage(value.maxToolCallsPerStage);
+		teamTaskMaxEpochs = normalizeAnsteelTeamTaskMaxEpochs(value.teamTaskMaxEpochs);
+		teamTaskMaxNoProgressEpochs = normalizeAnsteelTeamTaskMaxNoProgressEpochs(
+			value.teamTaskMaxNoProgressEpochs,
+		);
+		if (
+			teamTaskMaxEpochs !== undefined &&
+			(teamTaskMaxNoProgressEpochs ?? 2) > teamTaskMaxEpochs
+		) {
+			throw new Error("Ansteel teamTaskMaxNoProgressEpochs cannot exceed teamTaskMaxEpochs");
+		}
 		stageBudgetPolicy =
 			value.stageBudgetPolicy === undefined
 				? undefined
@@ -1433,6 +1483,8 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		...(adaptiveBudgetPolicy ? { adaptiveBudgetPolicy } : {}),
 		allowProviderFallback: value.allowProviderFallback === true,
 		teamTaskOwners,
+		...(teamTaskMaxEpochs === undefined ? {} : { teamTaskMaxEpochs }),
+		...(teamTaskMaxNoProgressEpochs === undefined ? {} : { teamTaskMaxNoProgressEpochs }),
 		allowSingleModel: value.allowSingleModel ?? false,
 	};
 }
