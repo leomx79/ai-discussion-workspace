@@ -134,7 +134,8 @@ Run `npm test`. The Staff Engineer may claim and modify only `src/lease-queue.mj
 Run:
 
 ```powershell
-git init -b main
+git init
+git checkout -b main
 git config user.name 'Ansteel Runtime Probe'
 git config user.email 'ansteel-probe@localhost'
 ```
@@ -482,6 +483,8 @@ Expected: 非零退出，且隐藏测试文件不在夹具 Git 仓库中。
 
 - [ ] **Step 1: 创建 RPC 驱动**
 
+源码 CLI 已内置 Ansteel Team 扩展，驱动不得再用 `-e` 重复加载；重复加载会把命令重命名为 `ansteel-team:1` 和 `ansteel-team:2`，导致文档入口 `/ansteel-team` 无法命中。
+
 `run-team-probe.mjs` 必须完整写入：
 
 ```javascript
@@ -496,10 +499,9 @@ const eventPath = join(projectRoot, ".pi", "ansteel-team", "events.jsonl");
 const rpcLogPath = join(oracleRoot, "rpc-events.jsonl");
 const stderrPath = join(oracleRoot, "stderr.log");
 const piScript = "F:\\codex\\ai群讨论\\pi-agent\\pi-test.ps1";
-const teamExtension = "F:\\codex\\ai群讨论\\pi-agent\\packages\\coding-agent\\src\\extensions\\ansteel-team\\index.ts";
 const child = spawn(
   "powershell.exe",
-  ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", piScript, "--mode", "rpc", "-e", teamExtension],
+  ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", piScript, "--mode", "rpc"],
   { cwd: projectRoot, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] }
 );
 
@@ -566,13 +568,13 @@ child.on("exit", (code) => {
   waiters.clear();
 });
 
-function sendPrompt(message) {
+function sendPrompt(message, timeoutMs = 60 * 60 * 1_000) {
   const id = `probe-${nextId++}`;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       waiters.delete(id);
       reject(new Error(`RPC response timeout for ${id}`));
-    }, 30_000);
+    }, timeoutMs);
     waiters.set(id, {
       resolve: (record) => {
         clearTimeout(timer);
@@ -626,7 +628,7 @@ async function waitFor(description, predicate, deadline) {
 async function stopTeam() {
   if (child.exitCode !== null) return;
   try {
-    await sendPrompt("/ansteel-team stop");
+    await sendPrompt("/ansteel-team stop", 60_000);
     await waitFor(
       "team stop",
       () => {
