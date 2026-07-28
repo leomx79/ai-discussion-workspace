@@ -1,0 +1,137 @@
+# Ansteel Team 进展驱动恢复设计
+
+## 背景与根因
+
+真实耐久租约队列探针运行约 28 分 40 秒，最终为 `stopped / task-missing`。公开测试
+`0/10`、隐藏测试 `0/6`，实现文件仍是 `NOT_IMPLEMENTED` 桩。事件链本身连续且哈希有效，
+因此问题不是账本损坏、Bash 缺失或写入门禁误拦截。
+
+Staff Engineer 三个阶段都以 `stopReason: length` 结束，只产生被截断的思考内容，没有公开文本，
+也没有调用 `ansteel_claim_task`、`edit`、`write` 或 `ansteel_submit_change`。当前原始轮次适配器把
+`length` 当作正常结束并返回空字符串，团队扩展随后把空字符串写成普通 `role-report`。同时，
+任务存在与否完全依赖模型主动调用认领工具，所以协调器最终只能看到 `tasks: []`。
+
+## 方案比较
+
+### 方案一：只更换 Staff 模型
+
+优点是改动小，并能在替代模型通过工具调用 canary 时绕过当前 provider 的长思考行为。缺点是没有修复协调器误判，另一个模型
+出现截断或空输出时仍会重现；配置的模型名也不能证明后端实际模型身份。
+
+### 方案二：只把截断改成失败
+
+优点是 fail-closed 结果更准确，不会再把空输出写成正常报告。缺点是只能把 `task-missing` 改写为
+显式角色失败，仍不能确定性创建任务，也不能支持需要多个阶段的长时间编码工作。
+
+### 方案三：截断识别、协调器任务入口和进展驱动 epoch
+
+这是采用的方案。协调器先以结构化输入登记任务，任务所有者只负责真实实现；每个实现 epoch
+从隔离上下文开始，只依据工具和持久状态判断进展。截断可以恢复，但纯思考不能获得无限续期。
+该方案保持三角色评审和写入门禁不变，同时消除任务创建对模型自觉行为的依赖。
+
+## 命令与状态
+
+新增命令：
+
+```text
+/ansteel-team task {"id":"TASK-ID","owner":"staff-engineer","files":["src/file.ts"],"description":"...","acceptanceCriteria":"...","dependsOn":[]}
+```
+
+协调器解析 JSON 后调用现有任务校验和文件所有权逻辑。成功后：
+
+1. 任务以现有 `claimed` 状态登记，只有配置允许的 owner 能写入精确文件集合。
+2. 账本追加 `task-assigned`，actor 为 `coordinator`，`targetRole` 为任务 owner。
+3. 协调器直接进入 owner 的任务 epoch，不要求 Tech Lead 或模型先用自然语言重建任务。
+
+已存在且尚未批准的任务可用以下命令恢复：
+
+```text
+/ansteel-team task TASK-ID
+```
+
+`coordinator` 只可作为 `task-assigned` 的事件 actor，不构成第四个评审或会签角色。任务提交后仍由
+另外两个角色分别检查同一不可变 diff 和测试证据。
+
+## 角色轮次完整性
+
+`createAnsteelRawTurnSession` 必须把以下情况作为阶段失败：
+
+- 最后一条 assistant message 的 `stopReason` 为 `length`；
+- provider 明确返回错误；
+- 本轮没有任何非空公开文本。
+
+失败原因只包含稳定错误码或安全描述，不记录私有思考内容。普通调查阶段把这些情况写为
+`role-failure`，不得写为 `role-report`，角色状态保持 `failed`。
+
+团队角色的每个提示都从空对话分支开始。旧消息继续保存在 append-only session JSONL 中用于审计，
+但不再自动进入下一阶段上下文；跨阶段事实通过公开账本、任务状态和当前文件重新注入。这避免连续
+截断内容污染后续实现 epoch。
+
+## 进展驱动任务 epoch
+
+每个任务 epoch 使用现有 `stageTimeoutMs` 作为单轮上限，并使用新增配置：
+
+```json
+{
+  "teamTaskMaxEpochs": 8,
+  "teamTaskMaxNoProgressEpochs": 2
+}
+```
+
+两个字段均为可选正整数。`teamTaskMaxEpochs` 范围为 `1..128`，默认 `8`；
+`teamTaskMaxNoProgressEpochs` 范围为 `1..8`，默认 `2`，且不能大于最大 epoch 数。
+
+协调器在每轮前后计算任务进展指纹，指纹包括：
+
+- 状态和 revision；
+- 测试证据数、提交数和评审数；
+- 精确任务文件的 Git diff SHA-256。
+
+任一字段变化才算进展。读取文件、输出长分析或重复相同工具请求不算进展。
+
+- 截断但指纹变化：记录 `role-failure/output-truncated`，开启新隔离 epoch。
+- 正常公开输出且指纹变化：记录 `role-report`，继续到任务终态。
+- 指纹不变：连续无进展计数加一。
+- 达到连续无进展上限：停止任务循环，记录 `role-failure/owner-no-progress`。
+- 达到最大 epoch：停止并记录 `role-failure/task-epoch-limit`。
+- `approved`：任务成功终止。
+- `revision-required`：owner 收到最新评审问题并进入下一实现 epoch。
+
+任务循环停止不伪造批准，也不删除已有 diff、测试证据或角色 session。
+
+## 提示边界
+
+任务 owner 每轮只接收：
+
+- 任务 ID、精确文件、依赖、描述和验收条件；
+- 当前状态、revision 和最新评审问题；
+- 明确动作顺序：检查当前文件，修改已授权文件，通过 `ansteel_submit_change` 提交；
+- 禁止把公开说明当成交付，必须产生受控状态变化。
+
+不注入完整通用讨论账本，避免与实现无关的角色文本膨胀上下文。独立评审仍使用现有不可变证据包。
+
+## 测试与证明
+
+自动化回归必须覆盖：
+
+1. `stopReason: length` 被拒绝，不能返回空成功文本。
+2. 空 assistant 输出被拒绝。
+3. 协调器任务命令登记唯一任务和 `task-assigned` 事件。
+4. 非法 owner、重复任务、越界文件和错误 JSON 继续 fail-closed。
+5. 只有任务指纹变化才能获得下一 epoch。
+6. 连续无进展和最大 epoch 都能有界停止。
+7. 截断但已有文件进展时可以用新隔离 epoch 恢复。
+8. 真实 RPC CLI 能完成 `task-assigned -> task-submitted -> 双评审` 的确定性夹具。
+
+最后重新运行原耐久租约队列探针。证明分为两层：
+
+- 产品缺陷证明：不得再出现空 `role-report` 或 `task-missing`；截断、无进展和任务状态必须机械可见。
+- 编码能力证明：只有真实 Staff 产生受控 diff、公开和隐藏测试通过、两名非 owner 独立批准时才算通过。
+  若 provider 仍失败，应准确归档为角色/provider 失败，不得把产品门禁正确性冒充为编码成功。
+
+## 非目标
+
+- 不重写现有批量 `/ansteel` epoch supervisor。
+- 不根据模型文字自动延长预算。
+- 不静默更换 provider/model 或自动转移任务 owner。
+- 不降低测试、Git diff、文件所有权或双评审门禁。
