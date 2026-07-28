@@ -1,6 +1,6 @@
 # Ansteel 自适应预算与恢复 Implementation Plan
 
-> 执行状态（2026-07-28）：项目工具硬上限、五个强制门禁 reserve、epoch 恢复边界、checkpoint 耐久工具账本与基础状态机均已实现并通过定向回归。根构建仍在 `models.dev:443` 的目录下载连接超时处失败，未将该外部故障标记为构建通过。
+> 执行状态（2026-07-28）：项目工具硬上限、覆盖最多两轮修订的十个最小门禁 reserve、epoch 恢复边界、checkpoint 耐久工具账本与状态机均已实现并通过定向回归。根构建仍在 `models.dev:443` 的目录下载连接超时处失败，未将该外部故障标记为构建通过。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -24,11 +24,11 @@
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-discussion.ts`
 - Test: `pi-agent/packages/coding-agent/test/ansteel-discussion.test.ts`
 
-- [ ] 写出固定工具上限大于自适应上限时仍只能执行较小上限的失败测试。
-- [ ] 写出普通阶段不能消费验证预留、验证阶段可以消费的失败测试。
-- [ ] 运行单测，确认当前实现失败。
-- [ ] 实现有效上限和阶段感知 reserve。
-- [ ] 重跑单测，确认通过。
+- [x] 写出固定工具上限大于自适应上限时仍只能执行较小上限的失败测试。
+- [x] 写出普通阶段不能消费验证预留、验证阶段可以消费的失败测试。
+- [x] 运行单测，确认当前实现失败。
+- [x] 实现有效上限和阶段感知 reserve。
+- [x] 重跑单测，确认通过。
 
 ### Task 2: 可恢复 epoch 状态
 
@@ -37,10 +37,10 @@
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-run.ts`
 - Test: `pi-agent/packages/coding-agent/test/ansteel-discussion.test.ts`
 
-- [ ] 写出恢复后新 epoch 使用新计时窗口、项目 deadline 保持不变的失败测试。
-- [ ] 写出 checkpoint 终态不能倒退为可恢复状态的失败测试。
-- [ ] 实现 epoch 起点、合法状态转换和完整恢复身份持久化。
-- [ ] 重跑对应测试，确认通过。
+- [x] 写出恢复后新 epoch 使用新计时窗口、项目 deadline 保持不变的失败测试。
+- [x] 写出 checkpoint 终态不能倒退为可恢复状态的失败测试。
+- [x] 实现 epoch 起点、合法状态转换和完整恢复身份持久化。
+- [x] 重跑对应测试，确认通过。
 
 ### Task 3: 门禁和目录构建
 
@@ -49,7 +49,7 @@
 - Modify: `.github/workflows/ansteel-delivery.yml`
 - Modify: `pi-agent/packages/ai/src/providers/data/`
 
-- [ ] 将自适应预算测试加入两个工作流。
+- [x] 将自适应预算测试加入两个工作流。
 - [ ] 用仓库生成器同步模型数据，或在离线条件下拒绝无来源的目录更新。
 - [ ] 运行 `npm run build:offline`，确认目录检查通过。
 
@@ -58,7 +58,7 @@
 **Files:**
 - Test: `pi-agent/packages/coding-agent/test/ansteel-*.test.ts`
 
-- [ ] 运行完整 Ansteel 定向测试和 TypeScript 检查。
+- [x] 运行完整 Ansteel 定向测试和 TypeScript 检查。
 - [ ] 运行离线构建和 diff 检查。
-- [ ] 请求独立代码审查并修正有效问题。
-- [ ] 使用详细中文提交信息提交所有受控文件，并直接推送 `main`。
+- [x] 请求独立代码审查并修正有效问题。
+- [x] 使用详细中文提交信息提交所有受控文件，并直接推送 `main`。
