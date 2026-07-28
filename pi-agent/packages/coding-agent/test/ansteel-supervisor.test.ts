@@ -181,6 +181,30 @@ describe("runAnsteelEpochSupervisor", () => {
 		expect(calls).toHaveLength(1);
 	});
 
+	it.each(["completed", "ready-to-resume"] as const)(
+		"fails closed when a $status checkpoint belongs to a different run",
+		async (status) => {
+			const calls: AnsteelEpochCall[] = [];
+			const result = await runAnsteelEpochSupervisor({
+				resumeRunId: "ansteel-run-selected",
+				maxEpochs: 2,
+				loadCheckpoint: () => ({ id: "ansteel-run-foreign", status }),
+				runEpoch: async (call) => {
+					calls.push(call);
+					return 0;
+				},
+			});
+
+			expect(result).toMatchObject({
+				outcome: "invalid-checkpoint",
+				runId: "ansteel-run-selected",
+				epochsStarted: 1,
+				exitCode: 1,
+			});
+			expect(calls).toEqual([{ kind: "resume", runId: "ansteel-run-selected" }]);
+		},
+	);
+
 	it("does not choose another run when resuming and stops at the epoch limit", async () => {
 		const calls: Array<{ kind: "new" | "resume"; runId?: string; topic?: string }> = [];
 		const result = await runAnsteelEpochSupervisor({
@@ -265,10 +289,80 @@ describe("runAnsteelEpochSupervisor", () => {
 		}
 	});
 
+	it("records the active epoch PID in the lock until its child exits", async () => {
+		const { cwd, lockPath } = createSupervisorDirectory();
+		let releaseChild: (() => void) | undefined;
+		const childReleased = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let markChildStarted: (() => void) | undefined;
+		const childStarted = new Promise<void>((resolve) => {
+			markChildStarted = resolve;
+		});
+
+		const operation = runAnsteelSupervisorCli({
+			args: ["--ansteel-supervise", "Review"],
+			cwd,
+			spawnEpoch: async (...args: unknown[]) => {
+				const onEpochStarted = args[1] as ((pid: number) => void) | undefined;
+				onEpochStarted?.(73);
+				markChildStarted?.();
+				await childReleased;
+				const checkpoint = createAnsteelRunCheckpoint({
+					cwd,
+					topic: "Review",
+					roleModels: {
+						"tech-lead": "tech/lead",
+						"staff-engineer": "staff/engineer",
+						"qa-engineer": "qa/engineer",
+					},
+					reviewRoot: cwd,
+					evidencePackageHash: "a".repeat(64),
+					configFingerprint: "b".repeat(64),
+					projectStartedAt: Date.parse("2026-07-28T00:00:00.000Z"),
+					hardProjectDeadline: Date.parse("2026-07-28T01:00:00.000Z"),
+					nextAction: { role: "tech-lead", stage: "architecture" },
+					now: new Date("2026-07-28T00:00:00.000Z"),
+				});
+				updateAnsteelRunCheckpoint(
+					{ path: checkpoint.path, state: loadAnsteelRunCheckpoint(checkpoint.path) },
+					{ status: "completed" },
+				);
+				return 0;
+			},
+		});
+
+		try {
+			await childStarted;
+			expect(JSON.parse(readFileSync(lockPath, "utf8"))).toMatchObject({ epochState: "running", epochPid: 73 });
+		} finally {
+			releaseChild?.();
+			await operation;
+		}
+	});
+
+	it("persists an epoch startup claim before invoking its child runner", async () => {
+		const { cwd, lockPath } = createSupervisorDirectory();
+		const { options } = createTerminalEpochOptions(cwd);
+
+		const result = await runAnsteelEpochSupervisorWithLock({
+			...options,
+			runEpoch: async (call) => {
+				expect(JSON.parse(readFileSync(lockPath, "utf8"))).toMatchObject({ epochState: "starting" });
+				return await options.runEpoch(call);
+			},
+		});
+
+		expect(result).toMatchObject({ outcome: "terminal", exitCode: 0 });
+	});
+
 	it("rejects a live supervisor lock without starting an epoch", async () => {
 		const { cwd, lockPath } = createSupervisorDirectory();
 		const { calls, options } = createTerminalEpochOptions(cwd);
-		writeFileSync(lockPath, JSON.stringify({ version: 1, pid: 42, startedAt: "2026-07-28T00:00:00.000Z" }));
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ version: 2, pid: 42, startedAt: "2026-07-28T00:00:00.000Z", epochState: "idle" }),
+		);
 
 		await expect(
 			runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: (pid) => pid === 42 }),
@@ -281,7 +375,10 @@ describe("runAnsteelEpochSupervisor", () => {
 	it("takes over a confirmed-dead lock and releases its own lock after terminal completion", async () => {
 		const { cwd, lockPath } = createSupervisorDirectory();
 		const { options } = createTerminalEpochOptions(cwd);
-		writeFileSync(lockPath, JSON.stringify({ version: 1, pid: 41, startedAt: "2026-07-28T00:00:00.000Z" }));
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ version: 2, pid: 41, startedAt: "2026-07-28T00:00:00.000Z", epochState: "idle" }),
+		);
 
 		const result = await runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false });
 
@@ -289,12 +386,85 @@ describe("runAnsteelEpochSupervisor", () => {
 		expect(existsSync(lockPath)).toBe(false);
 	});
 
+	it("does not take over a confirmed-dead legacy v1 lock", async () => {
+		const { cwd, lockPath } = createSupervisorDirectory();
+		const { calls, options } = createTerminalEpochOptions(cwd);
+		const lock = JSON.stringify({ version: 1, pid: 41, startedAt: "2026-07-28T00:00:00.000Z" });
+		writeFileSync(lockPath, lock);
+
+		await expect(
+			runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false }),
+		).rejects.toThrow(/legacy lock cannot be safely recovered/i);
+
+		expect(calls).toHaveLength(0);
+		expect(readFileSync(lockPath, "utf8")).toBe(lock);
+	});
+
+	it("does not take over an orphaned supervisor lock while its epoch child is alive", async () => {
+		const { cwd, lockPath } = createSupervisorDirectory();
+		const { calls, options } = createTerminalEpochOptions(cwd);
+		const lock = JSON.stringify({
+			version: 2,
+			pid: 41,
+			startedAt: "2026-07-28T00:00:00.000Z",
+			epochState: "running",
+			epochPid: 42,
+		});
+		writeFileSync(lockPath, lock);
+
+		await expect(
+			runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: (pid) => pid === 42 }),
+		).rejects.toThrow(/epoch child.*42/i);
+
+		expect(calls).toHaveLength(0);
+		expect(readFileSync(lockPath, "utf8")).toBe(lock);
+	});
+
+	it("takes over an orphaned running supervisor lock after its owner and epoch child exit", async () => {
+		const { cwd, lockPath } = createSupervisorDirectory();
+		const { options } = createTerminalEpochOptions(cwd);
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				version: 2,
+				pid: 41,
+				startedAt: "2026-07-28T00:00:00.000Z",
+				epochState: "running",
+				epochPid: 42,
+			}),
+		);
+
+		const result = await runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false });
+
+		expect(result).toMatchObject({ outcome: "terminal", exitCode: 0 });
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("does not take over an orphaned supervisor lock with an unconfirmed epoch startup", async () => {
+		const { cwd, lockPath } = createSupervisorDirectory();
+		const { calls, options } = createTerminalEpochOptions(cwd);
+		const lock = JSON.stringify({
+			version: 2,
+			pid: 41,
+			startedAt: "2026-07-28T00:00:00.000Z",
+			epochState: "starting",
+		});
+		writeFileSync(lockPath, lock);
+
+		await expect(
+			runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false }),
+		).rejects.toThrow(/epoch startup cannot be safely recovered/i);
+
+		expect(calls).toHaveLength(0);
+		expect(readFileSync(lockPath, "utf8")).toBe(lock);
+	});
+
 	it.each([
 		{ name: "malformed JSON", lock: "{", alive: () => false },
 		{ name: "missing integer PID", lock: JSON.stringify({ version: 1, startedAt: "2026-07-28T00:00:00.000Z" }), alive: () => false },
 		{
 			name: "unverifiable PID due to EPERM",
-			lock: JSON.stringify({ version: 1, pid: 42, startedAt: "2026-07-28T00:00:00.000Z" }),
+			lock: JSON.stringify({ version: 2, pid: 42, startedAt: "2026-07-28T00:00:00.000Z", epochState: "idle" }),
 			alive: () => {
 				throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
 			},

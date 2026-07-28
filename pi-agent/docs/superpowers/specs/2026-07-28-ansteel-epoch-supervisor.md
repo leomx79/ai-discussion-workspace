@@ -24,7 +24,7 @@ pi --ansteel-supervise-resume <run-id> [--ansteel-supervise-max-epochs N] [其�
 
 ## 架构与数据流
 
-监督器在创建第一个子进程前，原子创建项目目录下的 `.pi/ansteel-supervisor.lock`。锁文件保存版本、父进程 PID、启动时间和当前 run ID（若已知）。第二个监督器发现仍存活的 PID 时立即失败；发现确认已退出的孤儿锁时才清理并接管。无法解析、权限不足或无法安全确认的锁一律失败关闭。
+监督器在创建第一个子进程前，原子创建项目目录下的 `.pi/ansteel-supervisor.lock`。新锁格式为版本 2，保存父进程 PID、启动时间、当前 run ID（若已知）和显式 `epochState`。每次 `spawn` 前必须先原子写入 `epochState: starting`；子进程已创建且 PID 可用后才原子升级为 `epochState: running` 并记录该 PID；子进程关闭后恢复 `idle`。第二个监督器发现仍存活或不可验证的父 PID 时立即失败；父 PID 已退出但仍为 `starting` 时也必须失败关闭，因为无法证明子进程尚未创建；只有父 PID 已退出、锁为 `idle` 或已确认运行中子进程也退出时才能清理并接管。版本 1 没有 child 状态，父 PID 已退出的版本 1 锁必须保留并由人工核实，不得自动接管。无法解析、权限不足或无法安全确认的锁一律失败关闭。
 
 首次子进程运行与用户等价的 `pi --ansteel <topic>`；后续子进程运行 `pi --ansteel-resume <run-id>`。子进程继承当前工作目录、环境和标准输入输出，父进程只等待退出，不转发或缓存任何模型协议数据。每轮结束后：
 
@@ -35,7 +35,7 @@ pi --ansteel-supervise-resume <run-id> [--ansteel-supervise-max-epochs N] [其�
 
 监督器使用已有 `loadAnsteelRunCheckpoint()` 读取状态，绝不从 Markdown、终端文本或模型回答推导续跑决定。`ready-to-resume` 以外的任何非终态或异常状态都停止，并给出检查点路径和原因。
 
-无论正常退出、异常、SIGINT 或 SIGTERM，父进程都在子进程退出后尝试删除自己的锁。SIGKILL 无法清理时，由下一次启动的 PID 存活检查处理，不使用基于时间的猜测性抢锁。
+正常退出和可等待的异常路径中，父进程在子进程已退出后通过 `finally` 尝试删除自己的锁。SIGINT、SIGTERM、SIGKILL 等进程终止不保证异步清理会运行；下一次启动必须按持久化的版本 2 锁状态恢复，不使用基于时间的猜测性抢锁。`starting` 与已退出父 PID 的版本 1 锁均保留给人工核实，`idle` 或父、子 PID 都确认退出的 `running` 锁才可自动接管。
 
 ## 错误、并发与成本语义
 
@@ -51,7 +51,7 @@ pi --ansteel-supervise-resume <run-id> [--ansteel-supervise-max-epochs N] [其�
 1. 新建审查从首次暂停自动恢复，直到终态，且每个 epoch 只调用一次子进程执行器。
 2. 恢复审查只使用指定 run ID，不能扫描并误选另一个项目的检查点。
 3. 子进程非零、零退出但检查点缺失、多个新检查点、非法状态和达到 epoch 上限都停止且不再启动下一轮。
-4. 存活锁拒绝并发启动；死亡 PID 的锁可恢复；退出后锁被删除。
+4. 存活锁拒绝并发启动；版本 2 的 `idle` 与父、子 PID 均死亡的 `running` 锁可恢复；`starting` 和死亡父 PID 的版本 1 锁失败关闭；正常可等待退出后锁被删除。
 5. 参数解析拒绝冲突、路径式 run ID 和非法 epoch 上限。
 6. 真实 CLI 集成测试使用现有确定性 Provider 扩展，让第一个 epoch 暂停、第二个 epoch 完成，验证报告、检查点和子进程参数。
 

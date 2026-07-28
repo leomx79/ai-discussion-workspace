@@ -228,7 +228,7 @@ interface AdaptiveBudgetEvent {
 4. 在任何可选续配前为后续强制治理阶段预留预算。
 5. 将每个预算事件持久化至运行检查点和 Markdown 报告。
 6. 将批处理执行拆分为可恢复 epoch，增加 `--ansteel-resume <run-id>` 和检查点状态机校验。
-7. 实现本地 `pi --ansteel-supervise` 监督器：它以项目锁保护 `ready-to-resume` 检查点，只读取持久化状态决定续跑，并为每个 epoch 启动新的 CLI 子进程；前台子进程不得长期持有模型连接。外部调度器可以调用该命令，但不得绕过它直接猜测检查点状态。
+7. 实现本地 `pi --ansteel-supervise` 监督器：它以项目锁保护 `ready-to-resume` 检查点，只读取持久化状态决定续跑，并为每个 epoch 启动新的 CLI 子进程；锁必须在 `spawn` 前持久化 `starting` 声明，随后记录运行中子进程 PID，不能仅依赖父进程 PID 接管孤儿锁。前台子进程不得长期持有模型连接。外部调度器可以调用该命令，但不得绕过它直接猜测检查点状态。
 8. 更新 `ansteel.md`，说明配置、恢复、保证和拒绝语义。
 9. 添加确定性核心、CLI、检查点和恢复回归。
 

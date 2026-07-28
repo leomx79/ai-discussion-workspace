@@ -21,7 +21,8 @@ export interface AnsteelEpochSupervisorOptions {
 	listRunIds?: () => string[];
 	loadCheckpoint?: (runId: string) => { id: string; status: AnsteelRunCheckpointStatus | string };
 	onRunId?: (runId: string) => void;
-	runEpoch: (call: AnsteelEpochCall) => Promise<number>;
+	onEpochStarted?: (pid: number) => void;
+	runEpoch: (call: AnsteelEpochCall, onEpochStarted?: (pid: number) => void) => Promise<number>;
 }
 
 export interface AnsteelEpochSupervisorResult {
@@ -32,11 +33,23 @@ export interface AnsteelEpochSupervisorResult {
 }
 
 export interface AnsteelSupervisorLockOwner {
+	version: 2;
+	pid: number;
+	startedAt: string;
+	runId?: string;
+	epochState: "idle" | "starting" | "running";
+	epochPid?: number;
+}
+
+interface AnsteelLegacySupervisorLockOwner {
 	version: 1;
 	pid: number;
 	startedAt: string;
 	runId?: string;
 }
+
+type StoredAnsteelSupervisorLock = AnsteelSupervisorLockOwner | AnsteelLegacySupervisorLockOwner;
+type AnsteelSupervisorLockPatch = Partial<Pick<AnsteelSupervisorLockOwner, "runId" | "epochState" | "epochPid">>;
 
 export interface AnsteelEpochSupervisorWithLockOptions extends AnsteelEpochSupervisorOptions {
 	isProcessAlive?: (pid: number) => boolean;
@@ -47,7 +60,7 @@ export interface AnsteelEpochSupervisorWithLockOptions extends AnsteelEpochSuper
 export interface AnsteelSupervisorCliOptions {
 	args: readonly string[];
 	cwd: string;
-	spawnEpoch?: (childArgs: readonly string[]) => Promise<number>;
+	spawnEpoch?: (childArgs: readonly string[], onEpochStarted?: (pid: number) => void) => Promise<number>;
 }
 
 /** Runs bounded review epochs until their durable checkpoint reaches a terminal state. */
@@ -83,6 +96,7 @@ export async function runAnsteelEpochSupervisor(
 		}
 		const exitCode = await options.runEpoch(
 			runId === undefined ? { kind: "new", topic: options.topic! } : { kind: "resume", runId },
+			options.onEpochStarted,
 		);
 		if (exitCode !== 0) return { outcome: "child-failed", runId, epochsStarted: epoch + 1, exitCode };
 		if (runId === undefined) {
@@ -94,6 +108,9 @@ export async function runAnsteelEpochSupervisor(
 		try {
 			checkpoint = loadCheckpoint(runId);
 		} catch {
+			return { outcome: "invalid-checkpoint", runId, epochsStarted: epoch + 1, exitCode: 1 };
+		}
+		if (checkpoint.id !== runId) {
 			return { outcome: "invalid-checkpoint", runId, epochsStarted: epoch + 1, exitCode: 1 };
 		}
 		if (checkpoint.status === "ready-to-resume") continue;
@@ -117,9 +134,10 @@ export async function runAnsteelEpochSupervisorWithLock(
 	const cwd = options.cwd ?? process.cwd();
 	const lockPath = join(cwd, ".pi", "ansteel-supervisor.lock");
 	const owner: AnsteelSupervisorLockOwner = {
-		version: 1,
+		version: 2,
 		pid: options.supervisorPid ?? process.pid,
 		startedAt: (options.now ?? (() => new Date()))().toISOString(),
+		epochState: "idle",
 	};
 	const isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
 
@@ -127,9 +145,21 @@ export async function runAnsteelEpochSupervisorWithLock(
 	try {
 		return await runAnsteelEpochSupervisor({
 			...options,
+			runEpoch: async (call, onEpochStarted) => {
+				markSupervisorEpochStarting(lockPath, owner);
+				try {
+					return await options.runEpoch(call, onEpochStarted);
+				} finally {
+					clearSupervisorLockEpochPid(lockPath, owner);
+				}
+			},
 			onRunId: (runId) => {
 				updateSupervisorLockRunId(lockPath, owner, runId);
 				options.onRunId?.(runId);
+		},
+			onEpochStarted: (pid) => {
+				markSupervisorEpochRunning(lockPath, owner, pid);
+				options.onEpochStarted?.(pid);
 			},
 		});
 	} finally {
@@ -158,7 +188,8 @@ export async function runAnsteelSupervisorCli(
 		maxEpochs,
 		...(topic === undefined ? {} : { topic }),
 		...(resumeRunId === undefined ? {} : { resumeRunId }),
-		runEpoch: async (call) => await spawnEpoch(createAnsteelEpochChildArgs(options.args, call)),
+		runEpoch: async (call, onEpochStarted) =>
+			await spawnEpoch(createAnsteelEpochChildArgs(options.args, call), onEpochStarted),
 	});
 }
 
@@ -208,12 +239,31 @@ function getCliEntrypointArgs(): string[] {
 	return [entrypoint];
 }
 
-function createSubprocessEpochSpawner(cwd: string): (childArgs: readonly string[]) => Promise<number> {
-	return async (childArgs) =>
+function createSubprocessEpochSpawner(
+	cwd: string,
+): (childArgs: readonly string[], onEpochStarted?: (pid: number) => void) => Promise<number> {
+	return async (childArgs, onEpochStarted) =>
 		await new Promise<number>((resolve, reject) => {
 			const child = spawn(process.execPath, [...childArgs], { cwd, env: process.env, stdio: "inherit" });
-			child.once("error", reject);
-			child.once("close", (code) => resolve(code ?? 1));
+			let startupFailure: unknown;
+			child.once("error", (error) => {
+				if (startupFailure === undefined) reject(error);
+			});
+			child.once("close", (code) => {
+				if (startupFailure !== undefined) reject(startupFailure);
+				else resolve(code ?? 1);
+			});
+			if (onEpochStarted === undefined) return;
+			if (child.pid === undefined) {
+				reject(new Error("Ansteel supervisor child process has no PID"));
+				return;
+			}
+			try {
+				onEpochStarted(child.pid);
+			} catch (error) {
+				startupFailure = error;
+				child.kill();
+			}
 		});
 }
 
@@ -240,6 +290,23 @@ function acquireSupervisorLock(
 	if (isAlive !== false) {
 		throw new Error(`Ansteel supervisor already owns this project (PID ${existingOwner.pid})`);
 	}
+	if (existingOwner.version === 1) {
+		throw new Error("Ansteel supervisor legacy lock cannot be safely recovered");
+	}
+	if (existingOwner.epochState === "starting") {
+		throw new Error("Ansteel supervisor epoch startup cannot be safely recovered");
+	}
+	if (existingOwner.epochState === "running") {
+		let isEpochAlive: boolean;
+		try {
+			isEpochAlive = isProcessAlive(existingOwner.epochPid!);
+		} catch (error) {
+			throw new Error(`Ansteel supervisor epoch child cannot be verified: ${formatError(error)}`);
+		}
+		if (isEpochAlive !== false) {
+			throw new Error(`Ansteel supervisor epoch child still owns this project (PID ${existingOwner.epochPid!})`);
+		}
+	}
 
 	try {
 		unlinkSync(lockPath);
@@ -257,14 +324,14 @@ function acquireSupervisorLock(
 }
 
 function releaseSupervisorLock(lockPath: string, owner: AnsteelSupervisorLockOwner): void {
-	let currentOwner: AnsteelSupervisorLockOwner;
+	let currentOwner: StoredAnsteelSupervisorLock;
 	try {
 		currentOwner = readSupervisorLock(lockPath);
 	} catch (error) {
 		if (getErrorCode(error) === "ENOENT") return;
 		throw error;
 	}
-	if (currentOwner.pid !== owner.pid || currentOwner.startedAt !== owner.startedAt) {
+	if (currentOwner.version !== owner.version || currentOwner.pid !== owner.pid || currentOwner.startedAt !== owner.startedAt) {
 		throw new Error("Ansteel supervisor lock ownership changed before release");
 	}
 	try {
@@ -276,16 +343,43 @@ function releaseSupervisorLock(lockPath: string, owner: AnsteelSupervisorLockOwn
 
 function updateSupervisorLockRunId(lockPath: string, owner: AnsteelSupervisorLockOwner, runId: string): void {
 	if (owner.runId === runId) return;
-	const nextOwner: AnsteelSupervisorLockOwner = { ...owner, runId };
+	updateSupervisorLock(lockPath, owner, { runId });
+}
+
+function markSupervisorEpochStarting(lockPath: string, owner: AnsteelSupervisorLockOwner): void {
+	if (owner.epochState !== "idle") {
+		throw new Error("Ansteel supervisor lock has an uncleared epoch state");
+	}
+	updateSupervisorLock(lockPath, owner, { epochState: "starting", epochPid: undefined });
+}
+
+function markSupervisorEpochRunning(lockPath: string, owner: AnsteelSupervisorLockOwner, epochPid: number): void {
+	if (owner.epochState !== "starting") {
+		throw new Error("Ansteel supervisor lock has no epoch startup claim");
+	}
+	updateSupervisorLock(lockPath, owner, { epochState: "running", epochPid });
+}
+
+function clearSupervisorLockEpochPid(lockPath: string, owner: AnsteelSupervisorLockOwner): void {
+	if (owner.epochState === "idle") return;
+	updateSupervisorLock(lockPath, owner, { epochState: "idle", epochPid: undefined });
+}
+
+function updateSupervisorLock(
+	lockPath: string,
+	owner: AnsteelSupervisorLockOwner,
+	patch: AnsteelSupervisorLockPatch,
+): void {
+	const nextOwner: AnsteelSupervisorLockOwner = { ...owner, ...patch };
 	const temporaryPath = `${lockPath}.${owner.pid}.tmp`;
 	writeFileSync(temporaryPath, JSON.stringify(nextOwner), "utf8");
 	try {
 		const currentOwner = readSupervisorLock(lockPath);
-		if (currentOwner.pid !== owner.pid || currentOwner.startedAt !== owner.startedAt) {
+		if (currentOwner.version !== owner.version || currentOwner.pid !== owner.pid || currentOwner.startedAt !== owner.startedAt) {
 			throw new Error("Ansteel supervisor lock ownership changed before run ID update");
 		}
 		renameSync(temporaryPath, lockPath);
-		owner.runId = runId;
+		Object.assign(owner, patch);
 	} catch (error) {
 		try {
 			unlinkSync(temporaryPath);
@@ -296,7 +390,7 @@ function updateSupervisorLockRunId(lockPath: string, owner: AnsteelSupervisorLoc
 	}
 }
 
-function readSupervisorLock(lockPath: string): AnsteelSupervisorLockOwner {
+function readSupervisorLock(lockPath: string): StoredAnsteelSupervisorLock {
 	let value: unknown;
 	try {
 		value = JSON.parse(readFileSync(lockPath, "utf8"));
@@ -304,23 +398,34 @@ function readSupervisorLock(lockPath: string): AnsteelSupervisorLockOwner {
 		if (getErrorCode(error) === "ENOENT") throw error;
 		throw new Error(`Ansteel supervisor lock is invalid and was not removed: ${formatError(error)}`);
 	}
-	if (!isSupervisorLockOwner(value)) {
+	if (!isStoredSupervisorLock(value)) {
 		throw new Error("Ansteel supervisor lock is invalid and was not removed");
 	}
 	return value;
 }
 
-function isSupervisorLockOwner(value: unknown): value is AnsteelSupervisorLockOwner {
+function isStoredSupervisorLock(value: unknown): value is StoredAnsteelSupervisorLock {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const owner = value as Record<string, unknown>;
 	return (
-		owner.version === 1 &&
 		typeof owner.pid === "number" &&
 		Number.isInteger(owner.pid) &&
 		owner.pid >= 0 &&
 		typeof owner.startedAt === "string" &&
 		isIsoTimestamp(owner.startedAt) &&
-		(owner.runId === undefined || typeof owner.runId === "string")
+		(owner.runId === undefined || typeof owner.runId === "string") &&
+		((owner.version === 1 && owner.epochState === undefined && owner.epochPid === undefined) ||
+			(owner.version === 2 && isValidSupervisorEpochState(owner)))
+	);
+}
+
+function isValidSupervisorEpochState(owner: Record<string, unknown>): boolean {
+	const hasValidEpochPid =
+		typeof owner.epochPid === "number" && Number.isInteger(owner.epochPid) && owner.epochPid >= 0;
+	return (
+		(owner.epochState === "idle" && owner.epochPid === undefined) ||
+		(owner.epochState === "starting" && owner.epochPid === undefined) ||
+		(owner.epochState === "running" && hasValidEpochPid)
 	);
 }
 
