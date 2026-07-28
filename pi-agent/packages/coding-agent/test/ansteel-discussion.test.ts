@@ -1795,6 +1795,21 @@ describe("runAnsteelDiscussion", () => {
 		expect(policy.beforeToolCall("grep", { pattern: "ISSUE", path: "src" })).toBeUndefined();
 	});
 
+	it("blocks direct traversal of the Ansteel coordinator state directory during review", () => {
+		const policy = createAnsteelReviewToolPolicy("/workspace/project");
+
+		for (const [toolName, args] of [
+			["ls", { path: ".pi" }],
+			["find", { path: ".pi", pattern: "**/*" }],
+			["grep", { path: ".pi", pattern: "ISSUE" }],
+		] as const) {
+			expect(policy.beforeToolCall(toolName, args)).toEqual({
+				block: true,
+				reason: "Ansteel review tools cannot access coordinator state: .pi",
+			});
+		}
+	});
+
 	it("rejects a QA challenge that uses the Staff Engineer issue namespace", async () => {
 		const result = await runAnsteelDiscussion({
 			topic: "Review role-specific challenge namespaces",

@@ -921,7 +921,7 @@ export function createAnsteelReviewToolPolicy(cwd: string): AnsteelReviewToolPol
 					reason: `Ansteel review tools must stay inside the reviewed project: ${path}`,
 				};
 			}
-			if (isExcludedFromAnsteelEvidence(relativePath)) {
+			if (relativePath === ".pi" || isExcludedFromAnsteelEvidence(relativePath)) {
 				return {
 					block: true,
 					reason: `Ansteel review tools cannot access coordinator state: ${normalizeAnsteelEvidencePath(relativePath)}`,
