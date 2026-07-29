@@ -383,6 +383,21 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
+	it("rejects an active-team board when the persisted team state is damaged", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		writeFileSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "team.json"), "{", "utf8");
+
+		await expect(command("board", harness.ctx)).rejects.toThrow();
+
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
+			{ triggerTurn: false },
+		);
+	});
+
 	it("reports persistent status and disposes live sessions without deleting the team", async () => {
 		const { commands, ctx, roleSessions, sendMessage } = setup();
 		const command = commands.get("ansteel-team");

@@ -251,6 +251,209 @@ export default function (pi) {
 }
 `;
 
+function createDeterministicFailureProviderExtension(responses: {
+	techLead: string;
+	staffEngineer: string;
+	qaEngineer: string;
+}): string {
+	return `
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+
+function register(pi, provider, model, responses) {
+	const faux = fauxProvider({ provider, models: [{ id: model }] });
+	faux.setResponses(responses);
+	const registeredModel = faux.getModel();
+	pi.registerProvider(provider, {
+		api: registeredModel.api,
+		apiKey: "deterministic-test-key",
+		baseUrl: registeredModel.baseUrl,
+		streamSimple: (resolvedModel, context, options) => faux.provider.streamSimple(resolvedModel, context, options),
+		models: [{
+			id: model,
+			name: registeredModel.name,
+			reasoning: registeredModel.reasoning,
+			input: registeredModel.input,
+			cost: registeredModel.cost,
+			contextWindow: registeredModel.contextWindow,
+			maxTokens: registeredModel.maxTokens,
+		}],
+	});
+}
+
+export default function (pi) {
+	register(pi, "deterministic-team-tl", "tl", [${responses.techLead}]);
+	register(pi, "deterministic-team-staff", "staff", [${responses.staffEngineer}]);
+	register(pi, "deterministic-team-qa", "qa", [${responses.qaEngineer}]);
+}
+`;
+}
+
+const DETERMINISTIC_TASK_OWNER_COLLABORATION_FAILURE_EXTENSION = createDeterministicFailureProviderExtension({
+	techLead: `
+		fauxAssistantMessage("Tech Lead completed independent investigation."),
+		fauxAssistantMessage("Tech Lead completed cross-examination.")
+	`,
+	staffEngineer: `
+		fauxAssistantMessage("Staff completed independent investigation."),
+		fauxAssistantMessage("Staff completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_publish_checkpoint", {
+				id: "CP-OWNER-FAIL-0001",
+				taskId: "TASK-OWNER-FAIL",
+				goal: "Exercise task owner failure propagation",
+				currentUnderstanding: "The replacement checkpoint is missing",
+				assumptions: [],
+				evidenceRefs: ["test:task-owner-failure"],
+				uncertainties: [],
+				nextAction: { kind: "edit", target: "src/staff.ts", expectedResult: "The task changes" },
+				risk: "yellow",
+				confidence: "L2",
+				supersedesCheckpointId: "CP-UNKNOWN",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff observed the rejected checkpoint."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_publish_checkpoint", {
+				id: "CP-OWNER-FAIL-0002",
+				taskId: "TASK-OWNER-FAIL",
+				goal: "Exercise task owner failure propagation",
+				currentUnderstanding: "The replacement checkpoint is still missing",
+				assumptions: [],
+				evidenceRefs: ["test:task-owner-failure"],
+				uncertainties: [],
+				nextAction: { kind: "edit", target: "src/staff.ts", expectedResult: "The task changes" },
+				risk: "yellow",
+				confidence: "L2",
+				supersedesCheckpointId: "CP-UNKNOWN",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff observed the second rejected checkpoint.")
+	`,
+	qaEngineer: `
+		fauxAssistantMessage("QA completed independent investigation."),
+		fauxAssistantMessage("QA completed cross-examination.")
+	`,
+});
+
+const DETERMINISTIC_TASK_REVIEW_COLLABORATION_FAILURE_EXTENSION = createDeterministicFailureProviderExtension({
+	techLead: `
+		fauxAssistantMessage("Tech Lead completed independent investigation."),
+		fauxAssistantMessage("Tech Lead completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_raise_process_issue", {
+				id: "PI-TASK-REVIEW-FAIL-0001",
+				targetCheckpointId: "CP-UNKNOWN",
+				severity: "blocking",
+				claim: "The referenced checkpoint does not exist",
+				evidenceRefs: ["test:task-review-failure"],
+				suggestedCorrection: "Publish the checkpoint before challenging it",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Tech Lead observed the rejected process issue."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_raise_process_issue", {
+				id: "PI-TASK-REVIEW-FAIL-0002",
+				targetCheckpointId: "CP-UNKNOWN",
+				severity: "blocking",
+				claim: "The referenced checkpoint still does not exist",
+				evidenceRefs: ["test:task-review-failure"],
+				suggestedCorrection: "Publish the checkpoint before challenging it",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Tech Lead observed the second rejected process issue.")
+	`,
+	staffEngineer: `
+		fauxAssistantMessage("Staff completed independent investigation."),
+		fauxAssistantMessage("Staff completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("write", { path: "src/staff.ts", content: "export const staff = 'implemented';\\n" }),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_submit_change", {
+				taskId: "TASK-STAFF",
+				testCommand: "node --test test/staff.test.mjs",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff submitted TASK-STAFF.")
+	`,
+	qaEngineer: `
+		fauxAssistantMessage("QA completed independent investigation."),
+		fauxAssistantMessage("QA completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_task", { taskId: "TASK-STAFF", verdict: "approve" }),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("QA approved TASK-STAFF.")
+	`,
+});
+
+const DETERMINISTIC_MILESTONE_REVIEW_COLLABORATION_FAILURE_EXTENSION = createDeterministicFailureProviderExtension({
+	techLead: `
+			fauxAssistantMessage("Tech Lead completed independent investigation."),
+			fauxAssistantMessage("Tech Lead completed cross-examination."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_review_task", { taskId: "TASK-STAFF", verdict: "approve" }),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Tech Lead approved TASK-STAFF."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_plan_milestone", {
+					id: "MILESTONE-RPC-0001",
+					taskIds: ["TASK-STAFF"],
+					description: "Exercise milestone review failure propagation",
+					acceptanceCriteria: "The integration command passes",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_submit_integration", {
+					milestoneId: "MILESTONE-RPC-0001",
+					testCommand: "node --test test/staff.test.mjs",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Tech Lead submitted the integration milestone.")
+		`,
+	staffEngineer: `
+			fauxAssistantMessage("Staff completed independent investigation."),
+			fauxAssistantMessage("Staff completed cross-examination."),
+			fauxAssistantMessage([
+				fauxToolCall("write", { path: "src/staff.ts", content: "export const staff = 'implemented';\\n" }),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_submit_change", {
+					taskId: "TASK-STAFF",
+					testCommand: "node --test test/staff.test.mjs",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Staff submitted TASK-STAFF."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_resolve_process_issue", {
+					id: "PR-MILESTONE-FAIL-0001",
+					issueId: "PI-UNKNOWN",
+					outcome: "EXPERIMENT_REQUIRED",
+					summary: "The issue does not exist",
+					evidenceRefs: ["test:milestone-review-failure"],
+					experiment: "Create the missing issue first",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Staff observed the rejected process resolution."),
+			fauxAssistantMessage("Staff completed milestone cross-examination.")
+		`,
+	qaEngineer: `
+			fauxAssistantMessage("QA completed independent investigation."),
+			fauxAssistantMessage("QA completed cross-examination."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_review_task", { taskId: "TASK-STAFF", verdict: "approve" }),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("QA approved TASK-STAFF."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_review_integration", {
+					milestoneId: "MILESTONE-RPC-0001",
+					verdict: "approve",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("QA approved the integration milestone."),
+			fauxAssistantMessage("QA completed milestone cross-examination.")
+		`,
+});
+
 interface RpcRecord {
 	id?: string;
 	type?: string;
@@ -575,6 +778,119 @@ describe("Ansteel team CLI", () => {
 			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).toContain(
 				"read-only tool budget exhausted after 4 calls",
 			);
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("fails a task RPC when the owner public checkpoint mutation is rejected", async () => {
+		const { agentDir, projectDir } = createTemporaryProject(DETERMINISTIC_TASK_OWNER_COLLABORATION_FAILURE_EXTENSION);
+		initializeTaskDeliveryProject(projectDir);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+			expect(
+				await rpc.send({
+					id: "start",
+					type: "prompt",
+					message: `/${teamCommand} start Exercise task owner failure propagation`,
+				}),
+			).toMatchObject({ success: true, command: "prompt" });
+
+			const task = await rpc.send({
+				id: "task-owner-failure",
+				type: "prompt",
+				message: `/${teamCommand} task {"id":"TASK-OWNER-FAIL","owner":"staff-engineer","files":["src/staff.ts"],"description":"Exercise owner failure propagation","acceptanceCriteria":"The rejected checkpoint fails the RPC","dependsOn":[]}`,
+			});
+
+			expect(task).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("ansteel_publish_checkpoint"),
+			});
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("fails a task RPC when a peer public process issue mutation is rejected", async () => {
+		const { agentDir, projectDir } = createTemporaryProject(
+			DETERMINISTIC_TASK_REVIEW_COLLABORATION_FAILURE_EXTENSION,
+		);
+		initializeTaskDeliveryProject(projectDir);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+			expect(
+				await rpc.send({
+					id: "start",
+					type: "prompt",
+					message: `/${teamCommand} start Exercise task peer failure propagation`,
+				}),
+			).toMatchObject({ success: true, command: "prompt" });
+
+			const task = await rpc.send({
+				id: "task-review-failure",
+				type: "prompt",
+				message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Exercise peer failure propagation","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
+			});
+
+			expect(task).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("ansteel_raise_process_issue"),
+			});
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("fails an ask RPC when a milestone peer public resolution mutation is rejected", async () => {
+		const { agentDir, projectDir } = createTemporaryProject(
+			DETERMINISTIC_MILESTONE_REVIEW_COLLABORATION_FAILURE_EXTENSION,
+		);
+		initializeTaskDeliveryProject(projectDir);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+			expect(
+				await rpc.send({
+					id: "start",
+					type: "prompt",
+					message: `/${teamCommand} start Exercise milestone peer failure propagation`,
+				}),
+			).toMatchObject({ success: true, command: "prompt" });
+			expect(
+				await rpc.send({
+					id: "task",
+					type: "prompt",
+					message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Prepare milestone input","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
+				}),
+			).toMatchObject({ success: true, command: "prompt" });
+
+			const ask = await rpc.send({
+				id: "milestone-review-failure",
+				type: "prompt",
+				message: `/${teamCommand} ask Exercise milestone review failure propagation`,
+			});
+
+			expect(ask).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("ansteel_resolve_process_issue"),
+			});
 		} finally {
 			await rpc.stop();
 		}

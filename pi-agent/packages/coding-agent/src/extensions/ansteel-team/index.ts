@@ -179,6 +179,7 @@ interface CoordinatorTaskInput {
 interface ActiveAnsteelObservation {
 	logger: AnsteelRuntimeLogger;
 	root: AnsteelRuntimeSpan;
+	failClosedCollaborationError?: Error;
 }
 
 function classifyAnsteelRuntimeError(error: unknown): AnsteelRuntimeReasonCode {
@@ -1009,10 +1010,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			message: `Ansteel team command started: ${command}`,
 			data: { command },
 		});
-		const observation = { logger, root };
+		const observation: ActiveAnsteelObservation = { logger, root };
 		activeObservations.set(cwd, observation);
 		try {
 			const result = await action(logger, root);
+			if (observation.failClosedCollaborationError !== undefined) {
+				throw observation.failClosedCollaborationError;
+			}
 			root.end({
 				outcome: "succeeded",
 				message: `Ansteel team command completed: ${command}`,
@@ -1020,16 +1024,19 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			});
 			return result;
 		} catch (error) {
-			const reasonCode = classifyAnsteelRuntimeError(error);
+			const propagatedError = observation.failClosedCollaborationError ?? error;
+			const reasonCode = classifyAnsteelRuntimeError(propagatedError);
 			root.end({
 				outcome: "failed",
 				reasonCode,
-				message: error instanceof Error ? error.message : String(error),
+				message: propagatedError instanceof Error ? propagatedError.message : String(propagatedError),
 				data: { command },
 				artifacts:
-					error instanceof Error && error.stack ? [{ kind: "exception-stack", content: error.stack }] : undefined,
+					propagatedError instanceof Error && propagatedError.stack
+						? [{ kind: "exception-stack", content: propagatedError.stack }]
+						: undefined,
 			});
-			throw error;
+			throw propagatedError;
 		} finally {
 			try {
 				await logger.forceFlush();
@@ -1073,7 +1080,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS.some((toolName) => toolName === event.toolName),
 				)?.toolName;
 			if (failedCollaborationTool !== undefined) {
-				throw new Error(`Ansteel team role stage failed: ${failedCollaborationTool} returned an error`);
+				const error = new Error(`Ansteel team role stage failed: ${failedCollaborationTool} returned an error`);
+				observation.failClosedCollaborationError ??= error;
+				throw error;
 			}
 			if (response.trim().length === 0) {
 				throw new AnsteelObservabilityError(
@@ -2011,7 +2020,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					}
 					if (command === "board") {
 						if (argument.length > 0) throw new Error("Usage: /ansteel-team board");
-						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						const state = loadAnsteelTeamState(ctx.cwd);
 						if (!state) throw new Error("No Ansteel team state exists for this project.");
 						await runObservedCommand(ctx.cwd, state.id, "board", async (logger) => {
 							const events = listAnsteelTeamEvents(ctx.cwd);

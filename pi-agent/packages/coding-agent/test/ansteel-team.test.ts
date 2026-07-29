@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type AnsteelWorkCheckpoint,
+	type AnsteelWorkCheckpointInput,
 	appendAnsteelTeamEvent,
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
@@ -302,7 +303,7 @@ describe("public collaboration state", () => {
 	it("requires the issue author to verify a checkpoint correction", () => {
 		const cwd = createTemporaryProject();
 		const state = createTeam(cwd);
-		const checkpointInput = {
+		const checkpointInput: AnsteelWorkCheckpointInput = {
 			id: "CP-LEASE-0001",
 			goal: "Prevent lease timestamp overflow",
 			currentUnderstanding: "The sum must remain a safe integer",
@@ -312,7 +313,7 @@ describe("public collaboration state", () => {
 			nextAction: { kind: "edit", target: "src/lease.ts", expectedResult: "Overflow is rejected" },
 			risk: "yellow",
 			confidence: "L2",
-		} as const;
+		};
 		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", checkpointInput);
 		raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
 			id: "PI-LEASE-0001",
