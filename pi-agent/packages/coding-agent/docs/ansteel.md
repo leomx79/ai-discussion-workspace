@@ -70,6 +70,36 @@ For a monorepo review, do not rely on a topic's relative paths to reach a parent
 
 Project state lives under `.pi/ansteel-team/`: `team.json` records the team, role-session locations, immutable task-owner policy, task ownership, evidence packages, and peer verdicts; `events.jsonl` is an append-only public ledger. `stop` disposes live role sessions but retains these files so a later `start` can resume the team. Resume requires the current `teamTaskOwners` configuration to match the persisted policy. Starting a different topic requires removing or archiving the existing team state first.
 
+## Interactive observability and diagnosis
+
+The interactive team keeps four distinct durable record classes under `.pi/ansteel-team/`:
+
+| Record | Path | Purpose |
+|---|---|---|
+| Public collaboration ledger | `events.jsonl` | Hash-chained role reports, failures, task events, reviews, and milestones |
+| Structured runtime traces | `logs/run-<runId>-<segment>.jsonl` | Hash-chained command, role, provider, tool, and persistence span records |
+| Content-addressed artifacts | `artifacts/<sha256>` | Redacted exception stacks and other large evidence referenced by runtime records |
+| State and incident manifests | `team.json`, `transactions/`, `incidents/incident-<runId>-<sha256>.json` | Restart state, pending durable transactions, and mechanically assembled failure bundles |
+
+The public ledger, current state, pending transactions, and incident manifests are governance or recovery records and must be retained until an explicit project retention policy archives them. Runtime logs and unreferenced artifacts are the high-volume record class intended for later time/size rotation. This release deliberately does not run an automatic retention or deletion job: logs and artifacts remain on disk, and no deletion is silently inferred from age. A future collector must preserve every segment or artifact referenced by a ledger event, incident, commit, or delivery record and append an auditable deletion event.
+
+Every runtime command receives a `runId` and `traceId`; each operation receives a `spanId` and, when nested, a `parentSpanId`. Records can also carry `teamId`, `role`, `taskId`, `checkpointId`, `toolCallId`, provider/process identifiers, revision information, and a direct cause identifier. Failures use the versioned reason-code set, including `provider-timeout`, `provider-empty-public-output`, `provider-rate-limited`, `provider-authentication-failed`, `tool-exit-nonzero`, `tool-timeout`, `tool-policy-denied`, `event-chain-invalid`, `event-fsync-failed`, `artifact-missing`, `state-projection-mismatch`, `budget-exhausted`, `no-governed-progress`, `coordinator-restarted`, and `unclassified-runtime-error`.
+
+Use the read-only diagnostic commands from the host session:
+
+```text
+/ansteel-team status --explain
+/ansteel-team trace <runId|traceId|taskId|issueId|toolCallId>
+/ansteel-team doctor [runId]
+/ansteel-team incident <runId>
+```
+
+`status --explain` combines persistent team status with the most recent completed run diagnosis. `trace` reloads and validates matching runtime records from disk. `doctor` reloads the selected run, verifies its log chain and artifact hashes, and fails the command when the run is unhealthy. `incident` creates an always-redacted, content-addressed JSON manifest from existing facts; it does not ask a model to guess the cause. Extension-command errors are rethrown after the visible timeline message, so RPC returns `success: false` instead of reporting a failed command as successful.
+
+Redaction happens before hashing and writing. Runtime records and artifacts must not contain API keys, authorization headers, cookies, private keys, environment-variable secret values, raw provider request bodies, private provider payloads, or hidden chain-of-thought. Public role updates remain project data in the separate collaboration ledger. Logs keep only the structured result, correlation metadata, output length, reason code, and redacted evidence needed to diagnose the run.
+
+This release establishes the observability foundation only. Public work checkpoints and process-correction threads, the shared work board, dynamic ownership and green/yellow/red gates, three-axis collaboration/governance/delivery state, retention automation, and independent final delivery verification remain later phases of the continuous-collaboration protocol.
+
 ## Interactive change gate
 
 Interactive roles use ordinary project tools, but code changes are governed by the coordinator task entry and role-specific task tools:

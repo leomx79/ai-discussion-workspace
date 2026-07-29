@@ -53,7 +53,7 @@
 - Create: `pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts`
 - Test: `pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts`
 
-- [ ] **Step 1: 写出原因码、运行上下文和标识格式的失败测试**
+- [x] **Step 1: 写出原因码、运行上下文和标识格式的失败测试**
 
 ```ts
 import { mkdtempSync, rmSync } from "node:fs";
@@ -96,7 +96,7 @@ describe("Ansteel team observability", () => {
 });
 ```
 
-- [ ] **Step 2: 运行定向测试并确认因模块不存在而失败**
+- [x] **Step 2: 运行定向测试并确认因模块不存在而失败**
 
 Run:
 
@@ -106,7 +106,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: FAIL，错误包含 `Cannot find module '../src/core/ansteel-team-observability.ts'`。
 
-- [ ] **Step 3: 增加固定版本依赖并更新根锁文件**
+- [x] **Step 3: 增加固定版本依赖并更新根锁文件**
 
 在 `dependencies` 增加：
 
@@ -124,7 +124,7 @@ npm install @opentelemetry/api@1.9.1 @opentelemetry/sdk-trace-base@2.10.0 --work
 该命令从 `pi-agent` 根目录执行。Expected: `package-lock.json` 包含 coding-agent workspace 的两个固定
 依赖，命令退出 0。
 
-- [ ] **Step 4: 实现公共类型、原因码和上下文创建**
+- [x] **Step 4: 实现公共类型、原因码和上下文创建**
 
 ```ts
 import { randomBytes, randomUUID } from "node:crypto";
@@ -189,7 +189,7 @@ export function createAnsteelRunContext(input: {
 }
 ```
 
-- [ ] **Step 5: 运行测试并确认通过**
+- [x] **Step 5: 运行测试并确认通过**
 
 Run:
 
@@ -199,7 +199,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: PASS，1 test。
 
-- [ ] **Step 6: 提交第一块类型基础**
+- [x] **Step 6: 提交第一块类型基础**
 
 ```powershell
 git add -- packages/coding-agent/package.json package-lock.json packages/coding-agent/src/core/ansteel-team-observability.ts packages/coding-agent/test/ansteel-team-observability.test.ts
@@ -213,7 +213,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts`
 
-- [ ] **Step 1: 写出脱敏、产物哈希和日志落盘失败测试**
+- [x] **Step 1: 写出脱敏、产物哈希和日志落盘失败测试**
 
 ```ts
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -247,7 +247,7 @@ it("redacts secrets, stores large output by hash, and writes structured JSONL", 
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认缺少 writer**
+- [x] **Step 2: 运行测试并确认缺少 writer**
 
 Run:
 
@@ -257,7 +257,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: FAIL，错误指向 `createAnsteelRuntimeLogger` 未导出。
 
-- [ ] **Step 3: 实现规范日志类型、递增序号和递归脱敏**
+- [x] **Step 3: 实现规范日志类型、递增序号和递归脱敏**
 
 定义：
 
@@ -318,7 +318,7 @@ export type AnsteelRuntimeLogInput = Omit<
 `password` 和 `privateKey`，字符串内容额外识别 `Bearer ...`、`sk-...` 和环境变量赋值。产物在计算哈希
 与落盘前使用同一脱敏器。
 
-- [ ] **Step 4: 用同步文件描述符实现关键记录落盘**
+- [x] **Step 4: 用同步文件描述符实现关键记录落盘**
 
 `createAnsteelRuntimeLogger()` 必须：
 
@@ -330,7 +330,7 @@ export type AnsteelRuntimeLogInput = Omit<
 6. `close()` 后拒绝继续写入；
 7. `readAnsteelRuntimeLogs()` 校验序号、前序哈希和当前哈希。
 
-- [ ] **Step 5: 运行日志测试并确认通过**
+- [x] **Step 5: 运行日志测试并确认通过**
 
 Run:
 
@@ -340,7 +340,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: PASS，脱敏后的日志和产物中均不存在测试秘密。
 
-- [ ] **Step 6: 提交耐久日志 writer**
+- [x] **Step 6: 提交耐久日志 writer**
 
 ```powershell
 git add -- packages/coding-agent/src/core/ansteel-team-observability.ts packages/coding-agent/test/ansteel-team-observability.test.ts
@@ -354,7 +354,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts`
 
-- [ ] **Step 1: 写出父子 span 和完成出口失败测试**
+- [x] **Step 1: 写出父子 span 和完成出口失败测试**
 
 ```ts
 it("exports nested OpenTelemetry spans with the same trace and parent relationship", async () => {
@@ -376,7 +376,7 @@ it("exports nested OpenTelemetry spans with the same trace and parent relationsh
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认 `startSpan` 不存在**
+- [x] **Step 2: 运行测试并确认 `startSpan` 不存在**
 
 Run:
 
@@ -386,7 +386,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: FAIL，错误指向 `logger.startSpan`。
 
-- [ ] **Step 3: 实现显式父子 span**
+- [x] **Step 3: 实现显式父子 span**
 
 使用 `BasicTracerProvider`、自定义 `IdGenerator` 和自定义 `SpanExporter`。不要注册全局 tracer
 provider，避免覆盖宿主应用。每个 logger 拥有一个 provider；`IdGenerator.generateTraceId()` 固定返回
@@ -394,7 +394,7 @@ provider，避免覆盖宿主应用。每个 logger 拥有一个 provider；`IdG
 context，开始时写 `started`，结束 exporter 写终态；`forceFlush()` 调用 provider 的 `forceFlush()`。
 Ansteel 关联字段作为 span attributes，同时保留日志顶层字段便于本地查询。
 
-- [ ] **Step 4: 覆盖重复 end 和 exporter 失败**
+- [x] **Step 4: 覆盖重复 end 和 exporter 失败**
 
 增加测试确保：
 
@@ -403,7 +403,7 @@ Ansteel 关联字段作为 span attributes，同时保留日志顶层字段便�
 - exporter 失败写入最小 stderr 告警，但不包含秘密；
 - 未结束 span 在 logger 恢复时追加 `abandoned/coordinator-restarted`。
 
-- [ ] **Step 5: 运行测试并确认通过**
+- [x] **Step 5: 运行测试并确认通过**
 
 Run:
 
@@ -413,7 +413,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交 OpenTelemetry bridge**
+- [x] **Step 6: 提交 OpenTelemetry bridge**
 
 ```powershell
 git add -- packages/coding-agent/src/core/ansteel-team-observability.ts packages/coding-agent/test/ansteel-team-observability.test.ts
@@ -427,7 +427,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-team.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team.test.ts`
 
-- [ ] **Step 1: 写出事件和状态使用同一 trace 的失败测试**
+- [x] **Step 1: 写出事件和状态使用同一 trace 的失败测试**
 
 ```ts
 it("records ledger append, fsync, and state persistence under one trace", () => {
@@ -452,7 +452,7 @@ it("records ledger append, fsync, and state persistence under one trace", () => 
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认函数签名尚不支持日志上下文**
+- [x] **Step 2: 运行测试并确认函数签名尚不支持日志上下文**
 
 Run:
 
@@ -462,7 +462,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team.test.ts -t "records led
 
 Expected: FAIL，TypeScript 或断言表明缺少可观测性选项。
 
-- [ ] **Step 3: 增加可选持久化上下文而不破坏旧调用者**
+- [x] **Step 3: 增加可选持久化上下文而不破坏旧调用者**
 
 定义：
 
@@ -476,7 +476,7 @@ export interface AnsteelTeamPersistenceContext {
 给 `appendAnsteelTeamEvent`、`saveAnsteelTeamState` 和事务恢复增加最后一个可选参数。每个关键边界记录
 `started/succeeded/failed`，失败必须带稳定原因码；不传上下文时保持现有测试和公共 API 行为。
 
-- [ ] **Step 4: 把普通 append 替换为显式 fsync**
+- [x] **Step 4: 把普通 append 替换为显式 fsync**
 
 协作事件与 pending transaction 必须使用共享的 `writeDurableFile`/`appendDurableLine` 辅助函数：
 
@@ -486,7 +486,7 @@ export interface AnsteelTeamPersistenceContext {
 - 任一步失败记录精确原因并保留 transaction；
 - 恢复时记录 `run.resumed`、原事务状态和采取的分支。
 
-- [ ] **Step 5: 运行原有与新增核心测试**
+- [x] **Step 5: 运行原有与新增核心测试**
 
 Run:
 
@@ -496,7 +496,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team.test.ts test/ansteel-te
 
 Expected: PASS；原有迁移、哈希链和中断事务测试不得回归。
 
-- [ ] **Step 6: 提交核心持久化接入**
+- [x] **Step 6: 提交核心持久化接入**
 
 ```powershell
 git add -- packages/coding-agent/src/core/ansteel-team.ts packages/coding-agent/test/ansteel-team.test.ts
@@ -510,7 +510,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts`
 
-- [ ] **Step 1: 写出查询、完整性诊断和事故包失败测试**
+- [x] **Step 1: 写出查询、完整性诊断和事故包失败测试**
 
 ```ts
 it("explains the first cause and returns non-healthy for a damaged artifact", () => {
@@ -539,7 +539,7 @@ it("explains the first cause and returns non-healthy for a damaged artifact", ()
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认诊断函数不存在**
+- [x] **Step 2: 运行测试并确认诊断函数不存在**
 
 Run:
 
@@ -549,7 +549,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: FAIL。
 
-- [ ] **Step 3: 实现只读查询**
+- [x] **Step 3: 实现只读查询**
 
 实现：
 
@@ -570,7 +570,7 @@ formatAnsteelTeamDiagnosis(diagnosis)
 - 事故包只引用既有机械事实并对 manifest 自身计算 SHA-256；
 - 健康返回 `healthy: true`，任何完整性或终态问题返回 `healthy: false`。
 
-- [ ] **Step 4: 运行模块测试**
+- [x] **Step 4: 运行模块测试**
 
 Run:
 
@@ -580,7 +580,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交诊断能力**
+- [x] **Step 5: 提交诊断能力**
 
 ```powershell
 git add -- packages/coding-agent/src/core/ansteel-team-observability.ts packages/coding-agent/test/ansteel-team-observability.test.ts
@@ -594,7 +594,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/extensions/ansteel-team/index.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team-extension.test.ts`
 
-- [ ] **Step 1: 写出 `status --explain`、`trace` 和失败角色 span 测试**
+- [x] **Step 1: 写出 `status --explain`、`trace` 和失败角色 span 测试**
 
 在扩展 harness 中启动团队，使 Tech Lead prompt 抛出 `provider timeout`，然后断言：
 
@@ -610,7 +610,7 @@ expect(harness.notifications.at(-2)?.message).toContain(capturedRunId!);
 expect(harness.notifications.at(-1)?.message).toContain("role.session");
 ```
 
-- [ ] **Step 2: 运行测试并确认当前命令解析拒绝诊断子命令**
+- [x] **Step 2: 运行测试并确认当前命令解析拒绝诊断子命令**
 
 Run:
 
@@ -620,7 +620,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-extension.test.ts -t "e
 
 Expected: FAIL。
 
-- [ ] **Step 3: 为每条命令创建 run 和根 span**
+- [x] **Step 3: 为每条命令创建 run 和根 span**
 
 新增 `runObservedCommand()`：
 
@@ -643,7 +643,7 @@ async function runObservedCommand<T>(
 - finally 强制 flush 和 close；
 - 原异常继续抛出，CLI/RPC 不得错误退出零。
 
-- [ ] **Step 4: 扩展命令解析**
+- [x] **Step 4: 扩展命令解析**
 
 支持：
 
@@ -657,7 +657,7 @@ async function runObservedCommand<T>(
 所有命令只读。`doctor` 不信任内存状态，必须重新读取账本、日志和产物；不健康时向调用方返回错误状态，
 同时仍显示诊断内容。
 
-- [ ] **Step 5: 运行扩展和 CLI/RPC 回归**
+- [x] **Step 5: 运行扩展和 CLI/RPC 回归**
 
 Run:
 
@@ -667,7 +667,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-extension.test.ts test/
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交扩展接入**
+- [x] **Step 6: 提交扩展接入**
 
 ```powershell
 git add -- packages/coding-agent/src/extensions/ansteel-team/index.ts packages/coding-agent/test/ansteel-team-extension.test.ts
@@ -681,7 +681,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/docs/ansteel.md`
 - Modify: `docs/superpowers/plans/2026-07-29-ansteel-team-observability-foundation.md`
 
-- [ ] **Step 1: 更新运行文档**
+- [x] **Step 1: 更新运行文档**
 
 文档必须精确说明：
 
@@ -692,7 +692,7 @@ git push origin main
 - 日志不包含 API Key、认证头、环境变量值和隐藏思维链；
 - 本阶段只完成可观测性基础，持续协作工具和三轴状态仍在后续阶段。
 
-- [ ] **Step 2: 运行定向测试**
+- [x] **Step 2: 运行定向测试**
 
 Run:
 
@@ -702,7 +702,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-observability.test.ts t
 
 Expected: 全部 PASS，无挂起进程。
 
-- [ ] **Step 3: 运行 coding-agent 构建**
+- [x] **Step 3: 运行 coding-agent 构建**
 
 Run:
 
@@ -712,7 +712,7 @@ npm run build
 
 Expected: 退出 0，TypeScript 构建和资源复制完成。
 
-- [ ] **Step 4: 运行依赖一致性检查**
+- [x] **Step 4: 运行依赖一致性检查**
 
 从 `pi-agent` 根目录运行：
 
@@ -725,7 +725,7 @@ npm run check:install-lock:coding-agent
 Expected: 全部退出 0。若 install-lock 因新增依赖变化，运行项目提供的生成脚本更新
 `packages/coding-agent/install-lock`，重新执行检查。
 
-- [ ] **Step 5: 做日志安全审计**
+- [x] **Step 5: 做日志安全审计**
 
 在测试临时目录生成包含伪 API Key 的失败运行，递归搜索 `.pi/ansteel-team/`：
 
@@ -735,7 +735,7 @@ rg -n "top-secret|Bearer test|sk-test" <temporary-project>/.pi/ansteel-team
 
 Expected: 没有匹配；`doctor` 仍能通过哈希引用定位脱敏事故。
 
-- [ ] **Step 6: 更新计划复选框并提交阶段结果**
+- [x] **Step 6: 更新计划复选框并提交阶段结果**
 
 ```powershell
 git add -- packages/coding-agent/docs/ansteel.md docs/superpowers/plans/2026-07-29-ansteel-team-observability-foundation.md
@@ -743,7 +743,7 @@ git commit -m "docs(鞍钢日志): 完成可观测性基础阶段验收"
 git push origin main
 ```
 
-- [ ] **Step 7: 阶段完成审计**
+- [x] **Step 7: 阶段完成审计**
 
 逐项核对本计划 Goal：
 
@@ -755,3 +755,20 @@ git push origin main
 
 只有以上全部有当前测试、构建和磁盘产物证据时，才把实施总计划的“可观测性基础”标为完成。不得把本
 阶段完成描述为整个持续协作协议已经完成。
+
+## 2026-07-29 阶段验收证据
+
+- 定向回归：`ansteel-team-observability.test.ts`、`ansteel-team.test.ts`、
+  `ansteel-team-extension.test.ts`、`ansteel-team-cli.test.ts` 共 `51/51` 通过。
+- RPC/AgentSession 回归：`rpc-prompt-response-semantics.test.ts` 与
+  `suite/agent-session-prompt.test.ts` 共 `16/16` 通过。
+- 构建：`packages/coding-agent` 的 `npm run build` 退出码为 `0`。
+- 依赖：`check:pinned-deps`、`check:ts-imports`、`check:shrinkwrap`、
+  `check:install-lock:coding-agent` 全部退出码为 `0`；OpenTelemetry API 在实际安装树中统一解析为
+  `1.9.1`，Trace SDK 为 `2.10.0`。
+- 脱敏：向真实日志、内容寻址产物和事故包写入 `top-secret`、`Bearer test`、`sk-test` 三类伪秘密后，
+  对 `.pi/ansteel-team/` 下三个持久文件递归搜索为零匹配。
+- 完整性：运行记录使用 `runId/traceId/spanId/reasonCode`，持久化事件记录账本
+  `eventSequence/eventHash`，产物和事故包使用 SHA-256；`doctor` 从磁盘校验日志链与产物哈希。
+- 当前边界：这只完成可观测性基础。自动轮转、公开工作检查点、过程问题纠正、共享工作板、动态负责人、
+  绿黄红门禁、三轴状态和独立最终交付验收仍属于后续阶段。
