@@ -1069,8 +1069,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			...fields,
 			message: `${role} provider request started`,
 		});
-		try {
-			const response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+		const getFailedCollaborationToolError = (): Error | undefined => {
+			// The audit is authoritative even when the provider aborts before returning public prose.
 			const failedCollaborationTool = session
 				.getLastStageAudit?.()
 				.events.find(
@@ -1079,11 +1079,16 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						event.isError === true &&
 						ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS.some((toolName) => toolName === event.toolName),
 				)?.toolName;
-			if (failedCollaborationTool !== undefined) {
-				const error = new Error(`Ansteel team role stage failed: ${failedCollaborationTool} returned an error`);
-				observation.failClosedCollaborationError ??= error;
-				throw error;
-			}
+			if (failedCollaborationTool === undefined) return undefined;
+			observation.failClosedCollaborationError ??= new Error(
+				`Ansteel team role stage failed: ${failedCollaborationTool} returned an error`,
+			);
+			return observation.failClosedCollaborationError;
+		};
+		try {
+			const response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+			const failedCollaborationToolError = getFailedCollaborationToolError();
+			if (failedCollaborationToolError !== undefined) throw failedCollaborationToolError;
 			if (response.trim().length === 0) {
 				throw new AnsteelObservabilityError(
 					"provider-empty-public-output",
@@ -1102,13 +1107,16 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			});
 			return response;
 		} catch (error) {
-			const reasonCode = classifyAnsteelRuntimeError(error);
-			const message = error instanceof Error ? error.message : String(error);
+			const propagatedError = getFailedCollaborationToolError() ?? error;
+			const reasonCode = classifyAnsteelRuntimeError(propagatedError);
+			const message = propagatedError instanceof Error ? propagatedError.message : String(propagatedError);
 			const artifacts =
-				error instanceof Error && error.stack ? [{ kind: "exception-stack", content: error.stack }] : undefined;
+				propagatedError instanceof Error && propagatedError.stack
+					? [{ kind: "exception-stack", content: propagatedError.stack }]
+					: undefined;
 			providerSpan.end({ outcome: "failed", reasonCode, message, data: {}, artifacts });
 			roleSpan.end({ outcome: "failed", reasonCode, message, data: {} });
-			throw error;
+			throw propagatedError;
 		}
 	};
 
@@ -2027,6 +2035,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							const runtimeEntries = listAnsteelRuntimeRuns(ctx.cwd)
 								.filter((run) => run.runId !== logger.context.runId)
 								.flatMap((run) => readAnsteelRuntimeLogs(ctx.cwd, run.runId));
+							if (runtimeEntries.length === 0) {
+								throw new Error("No verifiable historical runtime run exists for the shared board.");
+							}
 							const board = getAnsteelTeamSharedBoard(state, events, runtimeEntries);
 							emitTimelineMessage(pi, formatSharedBoard(board));
 						});

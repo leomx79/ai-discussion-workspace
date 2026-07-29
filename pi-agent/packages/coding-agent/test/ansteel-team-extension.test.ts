@@ -398,6 +398,22 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
+	it("fails closed instead of rendering a board when every historical runtime log is missing", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		// The current board command must not treat an empty runtime projection as verified history.
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "logs"), { force: true, recursive: true });
+
+		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
+			{ triggerTurn: false },
+		);
+	});
+
 	it("reports persistent status and disposes live sessions without deleting the team", async () => {
 		const { commands, ctx, roleSessions, sendMessage } = setup();
 		const command = commands.get("ansteel-team");
@@ -759,6 +775,36 @@ describe("Ansteel team extension", () => {
 		expect(
 			operationEntries.find((entry) => entry.eventName === "tool.call" && entry.outcome === "succeeded"),
 		).toMatchObject({ taskId: "TASK-1", outcome: "succeeded" });
+	});
+
+	it("fails a task command with the audited collaboration tool when the owner provider also errors", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 1;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		const harness = setup(config, async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-AUDIT-FAIL")) {
+				throw new Error("provider failed after the collaboration tool error");
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const staff = harness.roleSessions.find((entry) => entry.role === "staff-engineer");
+		if (!staff) throw new Error("Missing Staff Engineer session");
+
+		// This audit represents a rejected public collaboration mutation before the provider failure.
+		staff.session.getLastStageAudit = () => ({
+			events: [{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: true }],
+		});
+
+		await expect(
+			command(
+				'task {"id":"TASK-AUDIT-FAIL","owner":"staff-engineer","files":["src/parser.ts"],"description":"Exercise owner error handling","acceptanceCriteria":"The command fails closed","dependsOn":[]}',
+				harness.ctx,
+			),
+		).rejects.toThrow("ansteel_publish_checkpoint returned an error");
 	});
 
 	it("stops a coordinator task after the configured consecutive no-progress epochs", async () => {

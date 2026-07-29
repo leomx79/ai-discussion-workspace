@@ -530,6 +530,9 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/extensions/ansteel-team/index.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team-extension.test.ts`
 - Modify: `pi-agent/packages/coding-agent/test/ansteel-team-cli.test.ts`
+- Validation-only fix: `pi-agent/packages/coding-agent/test/ansteel-team.test.ts`
+  - 全仓类型检查发现既有检查点夹具被 `as const` 推断为只读元组；仅改为显式
+    `AnsteelWorkCheckpointInput` 类型，不改变 Task 5 行为或核心状态机。
 
 - [ ] **Step 1: 写出 `board` 只读命令失败测试**
 
