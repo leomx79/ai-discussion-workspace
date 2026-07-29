@@ -16,7 +16,7 @@ import { getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import { ANSTEEL_ROLES, type AnsteelRole, DEFAULT_ANSTEEL_TEAM_TASK_OWNERS } from "./ansteel-discussion.ts";
 import type { AnsteelRuntimeLogger } from "./ansteel-team-observability.ts";
 
-const ANSTEEL_TEAM_STATE_VERSION = 6;
+const ANSTEEL_TEAM_STATE_VERSION = 7;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
 const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
@@ -50,6 +50,64 @@ export interface AnsteelTeamChallenge {
 	raisedBy: AnsteelRole;
 	targetRole: AnsteelRole;
 	status: "open" | "resolved";
+}
+
+export type AnsteelCheckpointRisk = "green" | "yellow" | "red";
+export type AnsteelCheckpointConfidence = "L1" | "L2" | "L3" | "L4";
+export type AnsteelProcessIssueSeverity = "advisory" | "blocking" | "critical";
+export type AnsteelProcessResolutionOutcome = "ACCEPTED" | "REFUTED" | "EXPERIMENT_REQUIRED" | "SCOPE_ESCALATION";
+
+export interface AnsteelWorkCheckpoint {
+	id: string;
+	taskId?: string;
+	actor: AnsteelRole;
+	goal: string;
+	currentUnderstanding: string;
+	assumptions: string[];
+	evidenceRefs: string[];
+	uncertainties: string[];
+	nextAction: {
+		kind: "read" | "experiment" | "edit" | "test" | "commit" | "publish" | "decision";
+		target: string;
+		expectedResult: string;
+	};
+	risk: AnsteelCheckpointRisk;
+	confidence: AnsteelCheckpointConfidence;
+	status: "active" | "superseded";
+	supersedesCheckpointId?: string;
+	createdAt: string;
+}
+
+export interface AnsteelProcessResolution {
+	id: string;
+	issueId: string;
+	actor: AnsteelRole;
+	outcome: AnsteelProcessResolutionOutcome;
+	summary: string;
+	evidenceRefs: string[];
+	replacementCheckpointId?: string;
+	experiment?: string;
+	createdAt: string;
+	review?: {
+		reviewer: AnsteelRole;
+		verdict: "accept" | "reject";
+		reason: string;
+		reviewedAt: string;
+	};
+}
+
+export interface AnsteelProcessIssue {
+	id: string;
+	targetCheckpointId: string;
+	author: AnsteelRole;
+	targetRole: AnsteelRole;
+	severity: AnsteelProcessIssueSeverity;
+	claim: string;
+	evidenceRefs: string[];
+	suggestedCorrection: string;
+	status: "open" | "resolution-proposed" | "closed" | "escalated";
+	resolutions: AnsteelProcessResolution[];
+	createdAt: string;
 }
 
 export interface AnsteelTeamTask {
@@ -157,6 +215,8 @@ export interface AnsteelTeamState {
 	openChallenges: AnsteelTeamChallenge[];
 	tasks: AnsteelTeamTask[];
 	milestones: AnsteelTeamMilestone[];
+	workCheckpoints: AnsteelWorkCheckpoint[];
+	processIssues: AnsteelProcessIssue[];
 	ledgerHeadHash: string | null;
 }
 
@@ -267,6 +327,42 @@ function assertTaskId(id: unknown): asserts id is string {
 function assertMilestoneId(id: unknown): asserts id is string {
 	if (typeof id !== "string" || !/^MILESTONE-[A-Z0-9-]+$/.test(id)) {
 		throw new AnsteelTeamStateError("Ansteel team milestone IDs must use the MILESTONE-<UPPERCASE-ID> form");
+	}
+}
+
+function assertCheckpointId(id: unknown): asserts id is string {
+	if (typeof id !== "string" || !/^CP-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(id)) {
+		throw new AnsteelTeamStateError("Ansteel team checkpoint IDs must use the CP-<UPPERCASE-ID> form");
+	}
+}
+
+function assertProcessIssueId(id: unknown): asserts id is string {
+	if (typeof id !== "string" || !/^PI-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(id)) {
+		throw new AnsteelTeamStateError("Ansteel team process issue IDs must use the PI-<UPPERCASE-ID> form");
+	}
+}
+
+function assertProcessResolutionId(id: unknown): asserts id is string {
+	if (typeof id !== "string" || !/^PR-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(id)) {
+		throw new AnsteelTeamStateError("Ansteel team process resolution IDs must use the PR-<UPPERCASE-ID> form");
+	}
+}
+
+function assertNonEmptyStateString(value: unknown, field: string): asserts value is string {
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new AnsteelTeamStateError(`Ansteel team ${field} must be a non-empty string`);
+	}
+}
+
+function assertStateStringArray(value: unknown, field: string): asserts value is string[] {
+	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim().length === 0)) {
+		throw new AnsteelTeamStateError(`Ansteel team ${field} must be a list of non-empty strings`);
+	}
+}
+
+function assertStateTimestamp(value: unknown, field: string): asserts value is string {
+	if (typeof value !== "string" || value.trim().length === 0 || Number.isNaN(Date.parse(value))) {
+		throw new AnsteelTeamStateError(`Ansteel team ${field} must be a valid timestamp`);
 	}
 }
 
@@ -419,6 +515,7 @@ function assertState(state: AnsteelTeamState): void {
 	}
 	assertAnsteelTeamTaskDependencyGraph(state.tasks);
 	assertAnsteelTeamMilestones(state.tasks, state.milestones);
+	assertAnsteelPublicCollaborationState(state);
 }
 
 function assertAnsteelTeamTaskDependencyGraph(tasks: readonly AnsteelTeamTask[]): void {
@@ -555,6 +652,233 @@ function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], mileston
 	}
 }
 
+function assertAnsteelPublicCollaborationState(state: AnsteelTeamState): void {
+	if (!Array.isArray(state.workCheckpoints)) {
+		throw new AnsteelTeamStateError("Ansteel team state has invalid work checkpoints");
+	}
+	if (!Array.isArray(state.processIssues)) {
+		throw new AnsteelTeamStateError("Ansteel team state has invalid process issues");
+	}
+
+	const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
+	const checkpointsById = new Map<string, { actor: AnsteelRole; index: number }>();
+	const publicIds = new Set<string>();
+	const registerPublicId = (id: string, kind: "checkpoint" | "process issue" | "resolution"): void => {
+		if (publicIds.has(id)) throw new AnsteelTeamStateError(`Ansteel team ${kind} ${id} is duplicated`);
+		publicIds.add(id);
+	};
+
+	for (const [index, checkpoint] of state.workCheckpoints.entries()) {
+		if (!isRecord(checkpoint)) {
+			throw new AnsteelTeamStateError("Ansteel team state has invalid work checkpoint entries");
+		}
+		assertCheckpointId(checkpoint.id);
+		registerPublicId(checkpoint.id, "checkpoint");
+		assertRole(checkpoint.actor, `checkpoint ${checkpoint.id} actor`);
+		if (checkpoint.taskId !== undefined) {
+			assertTaskId(checkpoint.taskId);
+			const task = tasksById.get(checkpoint.taskId);
+			if (!task) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team checkpoint ${checkpoint.id} references unknown task ${checkpoint.taskId}`,
+				);
+			}
+			if (task.owner !== checkpoint.actor) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team checkpoint ${checkpoint.id} must be written by task owner ${task.owner}`,
+				);
+			}
+		}
+		assertNonEmptyStateString(checkpoint.goal, `checkpoint ${checkpoint.id} goal`);
+		assertNonEmptyStateString(checkpoint.currentUnderstanding, `checkpoint ${checkpoint.id} current understanding`);
+		assertStateStringArray(checkpoint.assumptions, `checkpoint ${checkpoint.id} assumptions`);
+		assertStateStringArray(checkpoint.evidenceRefs, `checkpoint ${checkpoint.id} evidence references`);
+		assertStateStringArray(checkpoint.uncertainties, `checkpoint ${checkpoint.id} uncertainties`);
+		if (!isRecord(checkpoint.nextAction)) {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} has an invalid next action`);
+		}
+		if (
+			checkpoint.nextAction.kind !== "read" &&
+			checkpoint.nextAction.kind !== "experiment" &&
+			checkpoint.nextAction.kind !== "edit" &&
+			checkpoint.nextAction.kind !== "test" &&
+			checkpoint.nextAction.kind !== "commit" &&
+			checkpoint.nextAction.kind !== "publish" &&
+			checkpoint.nextAction.kind !== "decision"
+		) {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} has an invalid next action kind`);
+		}
+		assertNonEmptyStateString(checkpoint.nextAction.target, `checkpoint ${checkpoint.id} next action target`);
+		assertNonEmptyStateString(
+			checkpoint.nextAction.expectedResult,
+			`checkpoint ${checkpoint.id} next action expected result`,
+		);
+		if (checkpoint.risk !== "green" && checkpoint.risk !== "yellow" && checkpoint.risk !== "red") {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} has invalid risk`);
+		}
+		if (
+			checkpoint.confidence !== "L1" &&
+			checkpoint.confidence !== "L2" &&
+			checkpoint.confidence !== "L3" &&
+			checkpoint.confidence !== "L4"
+		) {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} has invalid confidence`);
+		}
+		if (checkpoint.status !== "active" && checkpoint.status !== "superseded") {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} has invalid status`);
+		}
+		assertStateTimestamp(checkpoint.createdAt, `checkpoint ${checkpoint.id} creation time`);
+		checkpointsById.set(checkpoint.id, { actor: checkpoint.actor, index });
+	}
+
+	for (const [index, checkpoint] of state.workCheckpoints.entries()) {
+		if (checkpoint.supersedesCheckpointId === undefined) continue;
+		assertCheckpointId(checkpoint.supersedesCheckpointId);
+		const superseded = checkpointsById.get(checkpoint.supersedesCheckpointId);
+		if (!superseded) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team checkpoint ${checkpoint.id} supersedes unknown checkpoint ${checkpoint.supersedesCheckpointId}`,
+			);
+		}
+		if (superseded.index >= index) {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} must supersede an older checkpoint`);
+		}
+		if (superseded.actor !== checkpoint.actor) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team checkpoint ${checkpoint.id} must supersede a checkpoint from the same role`,
+			);
+		}
+	}
+
+	for (const issue of state.processIssues) {
+		if (!isRecord(issue)) {
+			throw new AnsteelTeamStateError("Ansteel team state has invalid process issue entries");
+		}
+		assertProcessIssueId(issue.id);
+		registerPublicId(issue.id, "process issue");
+		assertCheckpointId(issue.targetCheckpointId);
+		const targetCheckpoint = checkpointsById.get(issue.targetCheckpointId);
+		if (!targetCheckpoint) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team process issue ${issue.id} references unknown checkpoint ${issue.targetCheckpointId}`,
+			);
+		}
+		assertRole(issue.author, `process issue ${issue.id} author`);
+		assertRole(issue.targetRole, `process issue ${issue.id} target`);
+		if (issue.author === targetCheckpoint.actor) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team process issue ${issue.id} cannot be written by the checkpoint actor`,
+			);
+		}
+		if (issue.targetRole !== targetCheckpoint.actor) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team process issue ${issue.id} must target checkpoint actor ${targetCheckpoint.actor}`,
+			);
+		}
+		if (issue.severity !== "advisory" && issue.severity !== "blocking" && issue.severity !== "critical") {
+			throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} has invalid severity`);
+		}
+		assertNonEmptyStateString(issue.claim, `process issue ${issue.id} claim`);
+		assertStateStringArray(issue.evidenceRefs, `process issue ${issue.id} evidence references`);
+		assertNonEmptyStateString(issue.suggestedCorrection, `process issue ${issue.id} suggested correction`);
+		if (
+			issue.status !== "open" &&
+			issue.status !== "resolution-proposed" &&
+			issue.status !== "closed" &&
+			issue.status !== "escalated"
+		) {
+			throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} has invalid status`);
+		}
+		if (!Array.isArray(issue.resolutions)) {
+			throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} has invalid resolutions`);
+		}
+		assertStateTimestamp(issue.createdAt, `process issue ${issue.id} creation time`);
+
+		for (const resolution of issue.resolutions) {
+			if (!isRecord(resolution)) {
+				throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} has invalid resolution entries`);
+			}
+			assertProcessResolutionId(resolution.id);
+			registerPublicId(resolution.id, "resolution");
+			assertProcessIssueId(resolution.issueId);
+			if (resolution.issueId !== issue.id) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team resolution ${resolution.id} must reference containing issue ${issue.id}`,
+				);
+			}
+			assertRole(resolution.actor, `resolution ${resolution.id} actor`);
+			if (resolution.actor !== issue.targetRole) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team resolution ${resolution.id} must be written by ${issue.targetRole}`,
+				);
+			}
+			if (
+				resolution.outcome !== "ACCEPTED" &&
+				resolution.outcome !== "REFUTED" &&
+				resolution.outcome !== "EXPERIMENT_REQUIRED" &&
+				resolution.outcome !== "SCOPE_ESCALATION"
+			) {
+				throw new AnsteelTeamStateError(`Ansteel team resolution ${resolution.id} has an invalid outcome`);
+			}
+			assertNonEmptyStateString(resolution.summary, `resolution ${resolution.id} summary`);
+			assertStateStringArray(resolution.evidenceRefs, `resolution ${resolution.id} evidence references`);
+			if (resolution.replacementCheckpointId !== undefined) {
+				assertCheckpointId(resolution.replacementCheckpointId);
+				const replacement = checkpointsById.get(resolution.replacementCheckpointId);
+				if (!replacement) {
+					throw new AnsteelTeamStateError(
+						`Ansteel team resolution ${resolution.id} references unknown replacement checkpoint ${resolution.replacementCheckpointId}`,
+					);
+				}
+				if (replacement.actor !== resolution.actor) {
+					throw new AnsteelTeamStateError(
+						`Ansteel team resolution ${resolution.id} replacement checkpoint must belong to ${resolution.actor}`,
+					);
+				}
+			}
+			if (resolution.experiment !== undefined) {
+				assertNonEmptyStateString(resolution.experiment, `resolution ${resolution.id} experiment`);
+			}
+			assertStateTimestamp(resolution.createdAt, `resolution ${resolution.id} creation time`);
+			if (resolution.review !== undefined) {
+				if (!isRecord(resolution.review)) {
+					throw new AnsteelTeamStateError(`Ansteel team resolution ${resolution.id} has an invalid review`);
+				}
+				assertRole(resolution.review.reviewer, `resolution ${resolution.id} reviewer`);
+				if (resolution.review.reviewer !== issue.author) {
+					throw new AnsteelTeamStateError(
+						`Ansteel team resolution ${resolution.id} must be reviewed by ${issue.author}`,
+					);
+				}
+				if (resolution.review.verdict !== "accept" && resolution.review.verdict !== "reject") {
+					throw new AnsteelTeamStateError(
+						`Ansteel team resolution ${resolution.id} has an invalid review verdict`,
+					);
+				}
+				assertNonEmptyStateString(resolution.review.reason, `resolution ${resolution.id} review reason`);
+				assertStateTimestamp(resolution.review.reviewedAt, `resolution ${resolution.id} review time`);
+			}
+		}
+
+		if (
+			issue.status === "closed" &&
+			!issue.resolutions.some((resolution) => resolution.review?.verdict === "accept")
+		) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team process issue ${issue.id} is closed without an accepted resolution`,
+			);
+		}
+		if (
+			issue.status === "escalated" &&
+			!issue.resolutions.some((resolution) => resolution.outcome === "SCOPE_ESCALATION")
+		) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team process issue ${issue.id} is escalated without a SCOPE_ESCALATION resolution`,
+			);
+		}
+	}
+}
+
 export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): AnsteelTeamState {
 	const cwd = assertProjectDirectory(options.cwd);
 	if (typeof options.topic !== "string" || options.topic.trim().length === 0) {
@@ -582,6 +906,8 @@ export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): 
 		openChallenges: [],
 		tasks: [],
 		milestones: [],
+		workCheckpoints: [],
+		processIssues: [],
 		ledgerHeadHash: null,
 	};
 	assertState(state);
@@ -1301,7 +1627,10 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 				: state.tasks,
 		};
 	}
-	if (state.version === 5) state = { ...state, version: ANSTEEL_TEAM_STATE_VERSION, milestones: [] };
+	if (state.version === 5) state = { ...state, version: 6, milestones: [] };
+	if (state.version === 6) {
+		state = { ...state, version: ANSTEEL_TEAM_STATE_VERSION, workCheckpoints: [], processIssues: [] };
+	}
 	return state;
 }
 

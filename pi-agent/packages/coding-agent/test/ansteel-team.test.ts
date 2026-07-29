@@ -25,8 +25,8 @@ import {
 	submitAnsteelTeamTask,
 } from "../src/core/ansteel-team.ts";
 import {
-	createAnsteelRuntimeLogger,
 	createAnsteelRunContext,
+	createAnsteelRuntimeLogger,
 	readAnsteelRuntimeLogs,
 } from "../src/core/ansteel-team-observability.ts";
 
@@ -51,6 +51,69 @@ function createTeam(cwd: string) {
 	});
 }
 
+function createValidPublicCollaborationState(cwd: string): Record<string, unknown> {
+	const state = createTeam(cwd);
+	Object.assign(state, {
+		workCheckpoints: [
+			{
+				id: "CP-PARSER-0001",
+				actor: "staff-engineer",
+				goal: "Prevent malformed parser input",
+				currentUnderstanding: "The parser currently accepts an empty token",
+				assumptions: ["The public parser is the only entry point"],
+				evidenceRefs: ["file:src/parser.ts:10"],
+				uncertainties: ["Whether whitespace-only input follows the same path"],
+				nextAction: {
+					kind: "test",
+					target: "test/parser.test.ts",
+					expectedResult: "Empty input is rejected",
+				},
+				risk: "yellow",
+				confidence: "L2",
+				status: "active",
+				createdAt: "2026-07-24T00:01:00.000Z",
+			},
+		],
+		processIssues: [
+			{
+				id: "PI-PARSER-0001",
+				targetCheckpointId: "CP-PARSER-0001",
+				author: "qa-engineer",
+				targetRole: "staff-engineer",
+				severity: "blocking",
+				claim: "Whitespace-only input is not covered",
+				evidenceRefs: ["test:parser-whitespace"],
+				suggestedCorrection: "Add a whitespace-only regression",
+				status: "closed",
+				resolutions: [
+					{
+						id: "PR-PARSER-0001",
+						issueId: "PI-PARSER-0001",
+						actor: "staff-engineer",
+						outcome: "ACCEPTED",
+						summary: "Cover empty and whitespace-only input",
+						evidenceRefs: ["test:parser-whitespace"],
+						createdAt: "2026-07-24T00:02:00.000Z",
+						review: {
+							reviewer: "qa-engineer",
+							verdict: "accept",
+							reason: "The regression now covers the reported gap",
+							reviewedAt: "2026-07-24T00:03:00.000Z",
+						},
+					},
+				],
+				createdAt: "2026-07-24T00:01:30.000Z",
+			},
+		],
+	});
+	return state as unknown as Record<string, unknown>;
+}
+
+function writePersistedTeamState(cwd: string, state: Record<string, unknown>): void {
+	mkdirSync(join(cwd, ".pi", "ansteel-team"), { recursive: true });
+	writeFileSync(getAnsteelTeamStatePath(cwd), `${JSON.stringify(state)}\n`, "utf8");
+}
+
 function initializeGitProject(cwd: string): void {
 	mkdirSync(join(cwd, "src"), { recursive: true });
 	writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'before';\n", "utf8");
@@ -65,6 +128,258 @@ afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { force: true, recursive: true });
 	}
+});
+
+describe("public collaboration state", () => {
+	it("migrates v6 teams to empty public collaboration state without changing existing state", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, state, {
+			id: "TASK-PARSER",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Reject malformed parser input.",
+			acceptanceCriteria: "The parser regression passes.",
+		});
+		const statePath = getAnsteelTeamStatePath(cwd);
+		const legacy = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+		legacy.version = 6;
+		delete legacy.workCheckpoints;
+		delete legacy.processIssues;
+		const preserved = {
+			tasks: structuredClone(legacy.tasks),
+			milestones: structuredClone(legacy.milestones),
+			roles: structuredClone(legacy.roles),
+			ledgerHeadHash: legacy.ledgerHeadHash,
+			nextEventSequence: legacy.nextEventSequence,
+		};
+		writePersistedTeamState(cwd, legacy);
+
+		const migrated = loadAnsteelTeamState(cwd);
+		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+
+		expect(migrated).toMatchObject({
+			version: 7,
+			workCheckpoints: [],
+			processIssues: [],
+			...preserved,
+		});
+		expect(persisted).toMatchObject({
+			version: 7,
+			workCheckpoints: [],
+			processIssues: [],
+			...preserved,
+		});
+	});
+
+	it("loads a valid public collaboration state", () => {
+		const cwd = createTemporaryProject();
+		writePersistedTeamState(cwd, createValidPublicCollaborationState(cwd));
+
+		expect(loadAnsteelTeamState(cwd)).toMatchObject({
+			version: 7,
+			workCheckpoints: [{ id: "CP-PARSER-0001" }],
+			processIssues: [{ id: "PI-PARSER-0001" }],
+		});
+	});
+
+	it("rejects duplicate checkpoint IDs", () => {
+		const cwd = createTemporaryProject();
+		const state = createValidPublicCollaborationState(cwd);
+		const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+		checkpoints.push({ ...checkpoints[0], createdAt: "2026-07-24T00:04:00.000Z" });
+		writePersistedTeamState(cwd, state);
+
+		expect(() => loadAnsteelTeamState(cwd)).toThrow("checkpoint CP-PARSER-0001 is duplicated");
+	});
+
+	it("rejects process issues that target an unknown checkpoint", () => {
+		const cwd = createTemporaryProject();
+		const state = createValidPublicCollaborationState(cwd);
+		const issues = state.processIssues as Array<Record<string, unknown>>;
+		issues[0].targetCheckpointId = "CP-UNKNOWN-0001";
+		writePersistedTeamState(cwd, state);
+
+		expect(() => loadAnsteelTeamState(cwd)).toThrow("references unknown checkpoint CP-UNKNOWN-0001");
+	});
+
+	it("rejects checkpoint confidence outside L1 through L4", () => {
+		const cwd = createTemporaryProject();
+		const state = createValidPublicCollaborationState(cwd);
+		const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+		checkpoints[0].confidence = "L0";
+		writePersistedTeamState(cwd, state);
+
+		expect(() => loadAnsteelTeamState(cwd)).toThrow("checkpoint CP-PARSER-0001 has invalid confidence");
+	});
+
+	it("rejects resolutions written by a role other than the issue target", () => {
+		const cwd = createTemporaryProject();
+		const state = createValidPublicCollaborationState(cwd);
+		const issues = state.processIssues as Array<Record<string, unknown>>;
+		const resolutions = issues[0].resolutions as Array<Record<string, unknown>>;
+		resolutions[0].actor = "tech-lead";
+		writePersistedTeamState(cwd, state);
+
+		expect(() => loadAnsteelTeamState(cwd)).toThrow("resolution PR-PARSER-0001 must be written by staff-engineer");
+	});
+
+	it.each([
+		{
+			name: "checkpoint IDs outside CP-<UPPERCASE-ID>",
+			mutate(state: Record<string, unknown>) {
+				const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+				checkpoints[0].id = "cp-parser-0001";
+			},
+			message: "checkpoint IDs must use the CP-<UPPERCASE-ID> form",
+		},
+		{
+			name: "process issue IDs outside PI-<UPPERCASE-ID>",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				issues[0].id = "pi-parser-0001";
+			},
+			message: "process issue IDs must use the PI-<UPPERCASE-ID> form",
+		},
+		{
+			name: "process resolution IDs outside PR-<UPPERCASE-ID>",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				const resolutions = issues[0].resolutions as Array<Record<string, unknown>>;
+				resolutions[0].id = "pr-parser-0001";
+			},
+			message: "process resolution IDs must use the PR-<UPPERCASE-ID> form",
+		},
+		{
+			name: "unknown task references",
+			mutate(state: Record<string, unknown>) {
+				const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+				checkpoints[0].taskId = "TASK-UNKNOWN";
+			},
+			message: "references unknown task TASK-UNKNOWN",
+		},
+		{
+			name: "checkpoint actors that do not own the referenced task",
+			mutate(state: Record<string, unknown>) {
+				const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+				checkpoints[0].taskId = "TASK-PARSER";
+				(state.tasks as Array<Record<string, unknown>>).push({
+					id: "TASK-PARSER",
+					owner: "qa-engineer",
+					files: ["src/parser.ts"],
+					description: "Reject malformed parser input.",
+					acceptanceCriteria: "The parser regression passes.",
+					dependsOn: [],
+					status: "claimed",
+					revision: 0,
+					testEvidence: [],
+					submissions: [],
+					reviews: [],
+				});
+			},
+			message: "must be written by task owner qa-engineer",
+		},
+		{
+			name: "unknown superseded checkpoints",
+			mutate(state: Record<string, unknown>) {
+				const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+				checkpoints[0].supersedesCheckpointId = "CP-UNKNOWN-0001";
+			},
+			message: "supersedes unknown checkpoint CP-UNKNOWN-0001",
+		},
+		{
+			name: "superseded checkpoints from another role",
+			mutate(state: Record<string, unknown>) {
+				const checkpoints = state.workCheckpoints as Array<Record<string, unknown>>;
+				checkpoints.push({
+					...checkpoints[0],
+					id: "CP-PARSER-0002",
+					actor: "qa-engineer",
+					supersedesCheckpointId: "CP-PARSER-0001",
+					createdAt: "2026-07-24T00:04:00.000Z",
+				});
+			},
+			message: "must supersede a checkpoint from the same role",
+		},
+		{
+			name: "issues authored by the checkpoint actor",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				issues[0].author = "staff-engineer";
+			},
+			message: "cannot be written by the checkpoint actor",
+		},
+		{
+			name: "issue target roles that differ from the checkpoint actor",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				issues[0].targetRole = "tech-lead";
+			},
+			message: "must target checkpoint actor staff-engineer",
+		},
+		{
+			name: "resolution reviews written by anyone except the issue author",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				const resolutions = issues[0].resolutions as Array<Record<string, unknown>>;
+				(resolutions[0].review as Record<string, unknown>).reviewer = "tech-lead";
+			},
+			message: "must be reviewed by qa-engineer",
+		},
+		{
+			name: "resolutions that reference a different issue",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				const resolutions = issues[0].resolutions as Array<Record<string, unknown>>;
+				resolutions[0].issueId = "PI-OTHER-0001";
+			},
+			message: "must reference containing issue PI-PARSER-0001",
+		},
+		{
+			name: "resolutions that reference an unknown replacement checkpoint",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				const resolutions = issues[0].resolutions as Array<Record<string, unknown>>;
+				resolutions[0].replacementCheckpointId = "CP-UNKNOWN-0001";
+			},
+			message: "references unknown replacement checkpoint CP-UNKNOWN-0001",
+		},
+		{
+			name: "closed issues without an accepted resolution",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				const resolutions = issues[0].resolutions as Array<Record<string, unknown>>;
+				(resolutions[0].review as Record<string, unknown>).verdict = "reject";
+			},
+			message: "closed without an accepted resolution",
+		},
+		{
+			name: "escalated issues without a scope-escalation resolution",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				issues[0].status = "escalated";
+			},
+			message: "escalated without a SCOPE_ESCALATION resolution",
+		},
+		{
+			name: "duplicate resolution IDs across issues",
+			mutate(state: Record<string, unknown>) {
+				const issues = state.processIssues as Array<Record<string, unknown>>;
+				const duplicate = structuredClone(issues[0]);
+				duplicate.id = "PI-PARSER-0002";
+				(duplicate.resolutions as Array<Record<string, unknown>>)[0].issueId = "PI-PARSER-0002";
+				issues.push(duplicate);
+			},
+			message: "resolution PR-PARSER-0001 is duplicated",
+		},
+	])("rejects $name", ({ mutate, message }) => {
+		const cwd = createTemporaryProject();
+		const state = createValidPublicCollaborationState(cwd);
+		mutate(state);
+		writePersistedTeamState(cwd, state);
+
+		expect(() => loadAnsteelTeamState(cwd)).toThrow(message);
+	});
 });
 
 describe("Ansteel team state", () => {
@@ -94,7 +409,14 @@ describe("Ansteel team state", () => {
 
 		const migrated = loadAnsteelTeamState(cwd);
 
-		expect(migrated).toMatchObject({ version: 6, tasks: [], milestones: [], ledgerHeadHash: null });
+		expect(migrated).toMatchObject({
+			version: 7,
+			tasks: [],
+			milestones: [],
+			workCheckpoints: [],
+			processIssues: [],
+			ledgerHeadHash: null,
+		});
 		expect(migrated?.roles).toEqual(team.roles);
 	});
 
@@ -129,8 +451,8 @@ describe("Ansteel team state", () => {
 			previousHash: null,
 			hash: expect.stringMatching(/^[a-f0-9]{64}$/),
 		});
-		expect(migrated).toMatchObject({ version: 6, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
-		expect(persistedState).toMatchObject({ version: 6, ledgerHeadHash: events[0]?.hash });
+		expect(migrated).toMatchObject({ version: 7, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
+		expect(persistedState).toMatchObject({ version: 7, ledgerHeadHash: events[0]?.hash });
 		expect(persistedEvent).toMatchObject({ previousHash: null, hash: events[0]?.hash });
 	});
 
@@ -145,9 +467,9 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		const persistedState = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
 
-		expect(migrated).toMatchObject({ version: 6, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
+		expect(migrated).toMatchObject({ version: 7, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
 		expect(persistedState).toMatchObject({
-			version: 6,
+			version: 7,
 			taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"],
 		});
 	});
@@ -697,12 +1019,7 @@ describe("Ansteel team state", () => {
 		const context = createAnsteelRunContext({ teamId: team.id, command: "ask" });
 		const logger = createAnsteelRuntimeLogger(cwd, context);
 
-		appendAnsteelTeamEvent(
-			cwd,
-			team,
-			{ type: "role-report", role: "tech-lead", content: "checkpoint" },
-			{ logger },
-		);
+		appendAnsteelTeamEvent(cwd, team, { type: "role-report", role: "tech-lead", content: "checkpoint" }, { logger });
 		logger.close();
 
 		const logs = readAnsteelRuntimeLogs(cwd, context.runId);
