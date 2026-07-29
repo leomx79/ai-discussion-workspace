@@ -25,6 +25,7 @@ import {
 	type AnsteelTeamMilestoneReview,
 	type AnsteelTeamMilestoneSubmission,
 	type AnsteelTeamPersistenceContext,
+	type AnsteelTeamSharedBoard,
 	type AnsteelTeamState,
 	type AnsteelTeamTask,
 	type AnsteelTeamTaskReview,
@@ -35,6 +36,7 @@ import {
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
+	getAnsteelTeamSharedBoard,
 	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamWriteBlockReason,
 	isAnsteelTeamGovernancePath,
@@ -63,6 +65,7 @@ import {
 	diagnoseAnsteelTeamRun,
 	formatAnsteelTeamDiagnosis,
 	listAnsteelRuntimeRuns,
+	readAnsteelRuntimeLogs,
 	traceAnsteelTeamRuntime,
 } from "../../core/ansteel-team-observability.ts";
 import {
@@ -88,6 +91,12 @@ const ANSTEEL_TEAM_TASK_TOOL_NAMES = [
 	"ansteel_plan_milestone",
 	"ansteel_submit_integration",
 	"ansteel_review_integration",
+	"ansteel_publish_checkpoint",
+	"ansteel_raise_process_issue",
+	"ansteel_resolve_process_issue",
+	"ansteel_review_process_resolution",
+] as const;
+const ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS = [
 	"ansteel_publish_checkpoint",
 	"ansteel_raise_process_issue",
 	"ansteel_resolve_process_issue",
@@ -907,6 +916,61 @@ function formatStatus(state: AnsteelTeamState): string {
 	].join("\n");
 }
 
+export function formatSharedBoard(board: AnsteelTeamSharedBoard): string {
+	const roleLines = ANSTEEL_ROLES.map((role) => {
+		const state = board.roles[role];
+		return `- ${role}: ${state.status}; active checkpoint: ${state.activeCheckpointId ?? "none"}; open issues: ${
+			state.openIssueIds.length === 0 ? "none" : state.openIssueIds.join(", ")
+		}`;
+	});
+	const taskLines = board.tasks.map(
+		(task) =>
+			`- ${task.id}: owner=${task.owner}; status=${task.status}; dependencies=${
+				task.dependsOn.length === 0 ? "none" : task.dependsOn.join(", ")
+			}`,
+	);
+	const checkpointLines = board.activeCheckpoints.map(
+		(checkpoint) =>
+			`- ${checkpoint.id}: actor=${checkpoint.actor}; risk=${checkpoint.risk}; confidence=${checkpoint.confidence}; next=${checkpoint.nextAction.kind} ${checkpoint.nextAction.target}`,
+	);
+	const issueLines = (["critical", "blocking", "advisory"] as const).flatMap((severity) => {
+		const issues = board.openProcessIssues.filter((issue) => issue.severity === severity);
+		return [
+			`Open process issues (${severity}):`,
+			...(issues.length === 0
+				? ["- none"]
+				: issues.map(
+						(issue) =>
+							`- ${issue.id}: checkpoint=${issue.targetCheckpointId}; author=${issue.author}; target=${issue.targetRole}; status=${issue.status}`,
+					)),
+		];
+	});
+	const toolFactLines = board.recentToolFacts.map(
+		(fact) =>
+			`- [${fact.sequence}] ${fact.eventName}: ${fact.outcome}${
+				fact.reasonCode === undefined ? "" : ` (${fact.reasonCode})`
+			}`,
+	);
+	return [
+		`Goal: ${board.currentGoal}`,
+		`Team status: ${board.teamStatus}`,
+		"Role status and active checkpoint:",
+		...roleLines,
+		"Tasks:",
+		...(taskLines.length === 0 ? ["- none"] : taskLines),
+		"Active checkpoint details:",
+		...(checkpointLines.length === 0 ? ["- none"] : checkpointLines),
+		...issueLines,
+		"Recent tool facts:",
+		...(toolFactLines.length === 0 ? ["- none"] : toolFactLines),
+		"Mechanically derived counts:",
+		`Active checkpoints: ${board.counts.activeCheckpoints}`,
+		`Open process issues: ${board.counts.openProcessIssues}`,
+		`Blocking process issues: ${board.counts.blockingProcessIssues}`,
+		`Escalated process issues: ${board.counts.escalatedProcessIssues}`,
+	].join("\n");
+}
+
 function hasSameTaskOwnerPolicy(left: readonly AnsteelRole[], right: readonly AnsteelRole[]): boolean {
 	return left.length === right.length && left.every((role) => right.includes(role));
 }
@@ -1000,6 +1064,17 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		});
 		try {
 			const response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+			const failedCollaborationTool = session
+				.getLastStageAudit?.()
+				.events.find(
+					(event) =>
+						event.type === "tool-execution-end" &&
+						event.isError === true &&
+						ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS.some((toolName) => toolName === event.toolName),
+				)?.toolName;
+			if (failedCollaborationTool !== undefined) {
+				throw new Error(`Ansteel team role stage failed: ${failedCollaborationTool} returned an error`);
+			}
 			if (response.trim().length === 0) {
 				throw new AnsteelObservabilityError(
 					"provider-empty-public-output",
@@ -1934,6 +2009,20 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						});
 						return;
 					}
+					if (command === "board") {
+						if (argument.length > 0) throw new Error("Usage: /ansteel-team board");
+						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						if (!state) throw new Error("No Ansteel team state exists for this project.");
+						await runObservedCommand(ctx.cwd, state.id, "board", async (logger) => {
+							const events = listAnsteelTeamEvents(ctx.cwd);
+							const runtimeEntries = listAnsteelRuntimeRuns(ctx.cwd)
+								.filter((run) => run.runId !== logger.context.runId)
+								.flatMap((run) => readAnsteelRuntimeLogs(ctx.cwd, run.runId));
+							const board = getAnsteelTeamSharedBoard(state, events, runtimeEntries);
+							emitTimelineMessage(pi, formatSharedBoard(board));
+						});
+						return;
+					}
 					if (command === "status") {
 						const activeTeam = activeTeams.get(ctx.cwd);
 						const state = activeTeam?.state ?? loadAnsteelTeamState(ctx.cwd);
@@ -2037,7 +2126,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						});
 						return;
 					}
-					throw new Error("Usage: /ansteel-team <start|ask|task|status|trace|doctor|incident|stop> [argument]");
+					throw new Error(
+						"Usage: /ansteel-team <start|ask|task|board|status|trace|doctor|incident|stop> [argument]",
+					);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					emitTimelineMessage(pi, `Ansteel team command failed: ${message}`);

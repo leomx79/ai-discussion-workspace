@@ -326,6 +326,63 @@ describe("Ansteel team extension", () => {
 		expect(staff.taskOperations.state.processIssues[0].status).toBe("escalated");
 	});
 
+	it("renders a mechanically derived shared board and rejects a damaged public ledger", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		const qa = harness.roleSessionOptions.find((entry) => entry.role === "qa-engineer");
+		if (!staff || !qa) throw new Error("Missing collaboration role operations");
+		const checkpoint = await staff.taskOperations.publishCheckpoint({
+			id: "CP-BOARD-CMD-0001",
+			goal: "Expose the durable collaboration state",
+			currentUnderstanding: "The board must be derived from the event ledger",
+			assumptions: [],
+			evidenceRefs: ["event:public-ledger"],
+			uncertainties: ["Whether the ledger was modified"],
+			nextAction: {
+				kind: "read",
+				target: ".pi/ansteel-team/events.jsonl",
+				expectedResult: "The event chain verifies",
+			},
+			risk: "green",
+			confidence: "L1",
+		});
+		await qa.taskOperations.raiseProcessIssue({
+			id: "PI-BOARD-CMD-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "The ledger integrity still needs verification",
+			evidenceRefs: ["event:public-ledger"],
+			suggestedCorrection: "Verify the complete hash chain before rendering",
+		});
+
+		await command("board", harness.ctx);
+
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				content: expect.stringMatching(
+					/Goal:[\s\S]*Role status and active checkpoint[\s\S]*Active checkpoints: 1[\s\S]*Open process issues: 1[\s\S]*Blocking process issues: 1/,
+				),
+			}),
+			{ triggerTurn: false },
+		);
+		const eventPath = join(harness.ctx.cwd, ".pi", "ansteel-team", "events.jsonl");
+		const events = readFileSync(eventPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		events[0].content = `${String(events[0].content)} tampered`;
+		writeFileSync(eventPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+
+		await expect(command("board", harness.ctx)).rejects.toThrow();
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
+			{ triggerTurn: false },
+		);
+	});
+
 	it("reports persistent status and disposes live sessions without deleting the team", async () => {
 		const { commands, ctx, roleSessions, sendMessage } = setup();
 		const command = commands.get("ansteel-team");

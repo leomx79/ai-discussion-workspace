@@ -139,6 +139,118 @@ export default function (pi) {
 }
 `;
 
+const DETERMINISTIC_CORRECTION_LOOP_PROVIDER_EXTENSION = `
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+
+function register(pi, provider, model, responses) {
+	const faux = fauxProvider({ provider, models: [{ id: model }] });
+	faux.setResponses(responses);
+	const registeredModel = faux.getModel();
+	pi.registerProvider(provider, {
+		api: registeredModel.api,
+		apiKey: "deterministic-test-key",
+		baseUrl: registeredModel.baseUrl,
+		streamSimple: (resolvedModel, context, options) => faux.provider.streamSimple(resolvedModel, context, options),
+		models: [{
+			id: model,
+			name: registeredModel.name,
+			reasoning: registeredModel.reasoning,
+			input: registeredModel.input,
+			cost: registeredModel.cost,
+			contextWindow: registeredModel.contextWindow,
+			maxTokens: registeredModel.maxTokens,
+		}],
+	});
+}
+
+export default function (pi) {
+	register(pi, "deterministic-team-tl", "tl", [
+		fauxAssistantMessage("Tech Lead completed independent investigation."),
+		fauxAssistantMessage("Tech Lead completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_process_resolution", {
+				issueId: "PI-RPC-0001",
+				verdict: "accept",
+				reason: "Tech Lead is not the issue author.",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Tech Lead attempted an unauthorized review."),
+	]);
+	register(pi, "deterministic-team-staff", "staff", [
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_publish_checkpoint", {
+				id: "CP-RPC-0001",
+				goal: "Validate calculated lease expiry",
+				currentUnderstanding: "Only the input operands are currently validated",
+				assumptions: ["Clock and duration are safe integers"],
+				evidenceRefs: ["file:src/lease.ts:10"],
+				uncertainties: ["The calculated sum can overflow"],
+				nextAction: {
+					kind: "test",
+					target: "test/lease.test.ts",
+					expectedResult: "The overflow boundary is reproduced",
+				},
+				risk: "yellow",
+				confidence: "L2",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff published the initial checkpoint."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_publish_checkpoint", {
+				id: "CP-RPC-0002",
+				goal: "Validate calculated lease expiry",
+				currentUnderstanding: "The calculated expiry must also be a safe integer",
+				assumptions: ["Clock and duration are safe integers"],
+				evidenceRefs: ["test:lease-overflow:passed"],
+				uncertainties: [],
+				nextAction: {
+					kind: "edit",
+					target: "src/lease.ts",
+					expectedResult: "Unsafe expiry is rejected before persistence",
+				},
+				risk: "yellow",
+				confidence: "L1",
+				supersedesCheckpointId: "CP-RPC-0001",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_resolve_process_issue", {
+				id: "PR-RPC-0001",
+				issueId: "PI-RPC-0001",
+				outcome: "ACCEPTED",
+				summary: "Validate the calculated expiry",
+				evidenceRefs: ["test:lease-overflow:passed"],
+				replacementCheckpointId: "CP-RPC-0002",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff proposed the corrected checkpoint."),
+		fauxAssistantMessage("Staff observed the unauthorized review attempt."),
+	]);
+	register(pi, "deterministic-team-qa", "qa", [
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_raise_process_issue", {
+				id: "PI-RPC-0001",
+				targetCheckpointId: "CP-RPC-0001",
+				severity: "blocking",
+				claim: "Safe operands do not guarantee a safe sum",
+				evidenceRefs: ["test:lease-overflow"],
+				suggestedCorrection: "Validate the calculated expiry before persistence",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("QA raised the boundary issue."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_process_resolution", {
+				issueId: "PI-RPC-0001",
+				verdict: "accept",
+				reason: "The replacement checkpoint contains the overflow regression.",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("QA accepted the correction."),
+		fauxAssistantMessage("QA observed the unauthorized review attempt."),
+	]);
+}
+`;
+
 interface RpcRecord {
 	id?: string;
 	type?: string;
@@ -463,6 +575,97 @@ describe("Ansteel team CLI", () => {
 			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).toContain(
 				"read-only tool budget exhausted after 4 calls",
 			);
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("completes a public correction loop through real RPC and rejects a non-author resolution review", async () => {
+		const { agentDir, projectDir } = createTemporaryProject(DETERMINISTIC_CORRECTION_LOOP_PROVIDER_EXTENSION);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+
+			const start = await rpc.send({
+				id: "start",
+				type: "prompt",
+				message: `/${teamCommand} start Exercise the public correction loop`,
+			});
+			expect(start).toMatchObject({ success: true, command: "prompt" });
+
+			const teamDirectory = join(projectDir, ".pi", "ansteel-team");
+			const state = JSON.parse(readFileSync(join(teamDirectory, "team.json"), "utf8")) as {
+				workCheckpoints: Array<{ id: string; status: string; supersedesCheckpointId?: string }>;
+				processIssues: Array<{
+					id: string;
+					status: string;
+					targetCheckpointId: string;
+					resolutions: Array<{
+						id: string;
+						replacementCheckpointId?: string;
+						review?: { reviewer: string; verdict: string };
+					}>;
+				}>;
+			};
+			expect(state.workCheckpoints).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ id: "CP-RPC-0001", status: "superseded" }),
+					expect.objectContaining({
+						id: "CP-RPC-0002",
+						status: "active",
+						supersedesCheckpointId: "CP-RPC-0001",
+					}),
+				]),
+			);
+			expect(state.processIssues).toEqual([
+				expect.objectContaining({
+					id: "PI-RPC-0001",
+					status: "closed",
+					targetCheckpointId: "CP-RPC-0001",
+					resolutions: [
+						expect.objectContaining({
+							id: "PR-RPC-0001",
+							replacementCheckpointId: "CP-RPC-0002",
+							review: expect.objectContaining({ reviewer: "qa-engineer", verdict: "accept" }),
+						}),
+					],
+				}),
+			]);
+			const events = readFileSync(join(teamDirectory, "events.jsonl"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { type: string });
+			expect(events.map((event) => event.type)).toEqual(
+				expect.arrayContaining([
+					"work-checkpoint",
+					"process-issue",
+					"process-resolution",
+					"process-resolution-review",
+				]),
+			);
+
+			const board = await rpc.send({
+				id: "board",
+				type: "prompt",
+				message: `/${teamCommand} board`,
+			});
+			expect(board).toMatchObject({ success: true, command: "prompt" });
+			expect(JSON.stringify(rpc.records())).toContain("Open process issues: 0");
+
+			const unauthorized = await rpc.send({
+				id: "unauthorized-review",
+				type: "prompt",
+				message: `/${teamCommand} ask Attempt a non-author resolution review`,
+			});
+			expect(unauthorized).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("ansteel_review_process_resolution"),
+			});
 		} finally {
 			await rpc.stop();
 		}
