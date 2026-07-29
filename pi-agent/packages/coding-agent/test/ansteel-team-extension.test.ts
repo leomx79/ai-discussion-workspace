@@ -178,6 +178,154 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
+	it("publishes public checkpoints, corrections, timeline entries, and correlated runtime spans", async () => {
+		let exercised = false;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(createConfig(), async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Exercise public collaboration workflow") && !exercised) {
+				exercised = true;
+				const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+				const qa = harness.roleSessionOptions.find((entry) => entry.role === "qa-engineer");
+				if (!staff || !qa) throw new Error("Missing collaboration role operations");
+				const first = await staff.taskOperations.publishCheckpoint({
+					id: "CP-TOOLS-0001",
+					goal: "Validate calculated lease expiry",
+					currentUnderstanding: "Inputs are validated but the calculated result is not",
+					assumptions: ["Clock and duration are safe integers"],
+					evidenceRefs: ["file:src/lease.ts:10"],
+					uncertainties: ["The addition can overflow"],
+					nextAction: {
+						kind: "test",
+						target: "test/lease.test.ts",
+						expectedResult: "The boundary overflow is reproduced",
+					},
+					risk: "yellow",
+					confidence: "L2",
+				});
+				const issue = await qa.taskOperations.raiseProcessIssue({
+					id: "PI-TOOLS-0001",
+					targetCheckpointId: first.id,
+					severity: "blocking",
+					claim: "Safe operands do not guarantee a safe sum",
+					evidenceRefs: ["test:lease-overflow"],
+					suggestedCorrection: "Validate the calculated expiry before persistence",
+				});
+				const replacement = await staff.taskOperations.publishCheckpoint({
+					id: "CP-TOOLS-0002",
+					goal: first.goal,
+					currentUnderstanding: "The calculated expiry must also be a safe integer",
+					assumptions: first.assumptions,
+					evidenceRefs: ["test:lease-overflow:passed"],
+					uncertainties: [],
+					nextAction: {
+						kind: "edit",
+						target: "src/lease.ts",
+						expectedResult: "Unsafe expiry is rejected before persistence",
+					},
+					risk: "yellow",
+					confidence: "L1",
+					supersedesCheckpointId: first.id,
+				});
+				await staff.taskOperations.resolveProcessIssue({
+					id: "PR-TOOLS-0001",
+					issueId: issue.id,
+					outcome: "ACCEPTED",
+					summary: "Validate the calculated expiry",
+					evidenceRefs: ["test:lease-overflow:passed"],
+					replacementCheckpointId: replacement.id,
+				});
+				await qa.taskOperations.reviewProcessResolution(issue.id, {
+					verdict: "accept",
+					reason: "The replacement checkpoint includes the boundary regression",
+				});
+			}
+			return `${role} completed collaboration.`;
+		});
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+
+		await command("start Review the parser", harness.ctx);
+		await command("ask Exercise public collaboration workflow", harness.ctx);
+
+		const events = listAnsteelTeamEvents(harness.ctx.cwd);
+		expect(events.map((event) => event.type)).toEqual(
+			expect.arrayContaining([
+				"work-checkpoint",
+				"process-issue",
+				"process-resolution",
+				"process-resolution-review",
+			]),
+		);
+		const timeline = harness.sendMessage.mock.calls
+			.map(([message]) => ("content" in message ? message.content : ""))
+			.join("\n");
+		expect(timeline).toContain("CP-TOOLS-0001");
+		expect(timeline).toContain("PI-TOOLS-0001");
+		expect(timeline).toContain("PR-TOOLS-0001");
+
+		const run = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(run).toBeDefined();
+		const runtimeEvents = readAnsteelRuntimeLogs(harness.ctx.cwd, run!.runId);
+		expect(runtimeEvents.map((entry) => entry.eventName)).toEqual(
+			expect.arrayContaining(["checkpoint.publish", "process.issue", "process.resolve", "process.review"]),
+		);
+		expect(
+			runtimeEvents.find(
+				(entry) =>
+					entry.eventName === "process.issue" &&
+					entry.outcome === "succeeded" &&
+					entry.checkpointId === "CP-TOOLS-0001",
+			),
+		).toMatchObject({ issueId: "PI-TOOLS-0001", role: "qa-engineer" });
+	});
+
+	it("reports scope escalation as requiring a user decision instead of issue-author review", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		const qa = harness.roleSessionOptions.find((entry) => entry.role === "qa-engineer");
+		if (!staff || !qa) throw new Error("Missing collaboration role operations");
+		const checkpoint = await staff.taskOperations.publishCheckpoint({
+			id: "CP-SCOPE-0001",
+			goal: "Clarify an authorization boundary",
+			currentUnderstanding: "The requested change may expand user-authorized scope",
+			assumptions: [],
+			evidenceRefs: ["goal:user-request"],
+			uncertainties: ["Whether the user permits external publication"],
+			nextAction: {
+				kind: "decision",
+				target: "user",
+				expectedResult: "The authorization boundary is explicit",
+			},
+			risk: "red",
+			confidence: "L3",
+		});
+		const issue = await qa.taskOperations.raiseProcessIssue({
+			id: "PI-SCOPE-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "The external publication scope is not authorized",
+			evidenceRefs: ["goal:user-request"],
+			suggestedCorrection: "Ask the user before publishing",
+		});
+
+		await staff.taskOperations.resolveProcessIssue({
+			id: "PR-SCOPE-0001",
+			issueId: issue.id,
+			outcome: "SCOPE_ESCALATION",
+			summary: "Request an explicit user decision",
+			evidenceRefs: ["goal:user-request"],
+		});
+
+		const timeline = harness.sendMessage.mock.calls
+			.map(([message]) => ("content" in message ? message.content : ""))
+			.join("\n");
+		expect(timeline).toMatch(/PR-SCOPE-0001[\s\S]*Next: user decision required/);
+		expect(staff.taskOperations.state.processIssues[0].status).toBe("escalated");
+	});
+
 	it("reports persistent status and disposes live sessions without deleting the team", async () => {
 		const { commands, ctx, roleSessions, sendMessage } = setup();
 		const command = commands.get("ansteel-team");
