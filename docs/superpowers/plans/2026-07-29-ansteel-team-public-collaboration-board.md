@@ -599,10 +599,17 @@ git push origin main
 ### Task 6: 文档、完整验证和阶段验收
 
 **Files:**
+- Modify: `pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts`
+- Modify: `pi-agent/packages/coding-agent/src/extensions/ansteel-team/index.ts`
+- Modify: `pi-agent/packages/coding-agent/test/ansteel-team.test.ts`
+- Modify: `pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts`
+- Modify: `pi-agent/packages/coding-agent/test/ansteel-team-extension.test.ts`
+- Modify: `pi-agent/packages/coding-agent/test/ansteel-team-cli.test.ts`
 - Modify: `pi-agent/packages/coding-agent/docs/ansteel.md`
 - Modify: `docs/superpowers/plans/2026-07-29-ansteel-team-public-collaboration-board.md`
+- Create: `.superpowers/sdd/2026-07-29-ansteel-team-public-collaboration-board/task-6-report.md`
 
-- [ ] **Step 1: 更新用户文档**
+- [x] **Step 1: 更新用户文档**
 
 文档精确说明：
 
@@ -612,7 +619,7 @@ git push origin main
 - 问题提出者复核关闭规则；
 - 本阶段尚未实施黄色/红色动作阻断。
 
-- [ ] **Step 2: 运行定向回归**
+- [x] **Step 2: 运行定向回归**
 
 ```powershell
 npx vitest --run --no-file-parallelism test/ansteel-team.test.ts test/ansteel-team-observability.test.ts test/ansteel-team-extension.test.ts test/ansteel-team-cli.test.ts
@@ -620,7 +627,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team.test.ts test/ansteel-te
 
 Expected: 全部 PASS。
 
-- [ ] **Step 3: 运行构建和依赖检查**
+- [x] **Step 3: 运行构建和依赖检查**
 
 ```powershell
 npm run build
@@ -637,20 +644,31 @@ npm run check:install-lock:coding-agent
 
 Expected: 全部退出 `0`。
 
-- [ ] **Step 4: 做状态重放和篡改审计**
+- [x] **Step 4: 做状态重放和篡改审计**
 
 在测试中创建完整纠错闭环，重启加载后 `board` 必须相同；修改任一检查点、问题、解决或复核事件内容后，
 账本哈希校验必须拒绝，且 `doctor/board` 不得输出健康状态。
 
-- [ ] **Step 5: 更新计划证据并提交**
+- [x] **Step 5: 更新计划证据并提交**
+
+本次执行已更新计划证据；实现任务明确禁止提交和推送，最终控制器须在审阅后另行完成提交与上传。
 
 ```powershell
-git add -- packages/coding-agent/docs/ansteel.md docs/superpowers/plans/2026-07-29-ansteel-team-public-collaboration-board.md
+git add -- `
+  docs/superpowers/plans/2026-07-29-ansteel-team-public-collaboration-board.md `
+  pi-agent/packages/coding-agent/docs/ansteel.md `
+  pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts `
+  pi-agent/packages/coding-agent/src/extensions/ansteel-team/index.ts `
+  pi-agent/packages/coding-agent/test/ansteel-team.test.ts `
+  pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts `
+  pi-agent/packages/coding-agent/test/ansteel-team-extension.test.ts `
+  pi-agent/packages/coding-agent/test/ansteel-team-cli.test.ts
+git add -f -- .superpowers/sdd/2026-07-29-ansteel-team-public-collaboration-board/task-6-report.md
 git commit -m "docs(鞍钢协作): 完成公开纠错与共享工作板验收"
 git push origin main
 ```
 
-- [ ] **Step 6: 阶段完成审计**
+- [x] **Step 6: 阶段完成审计**
 
 只有以下条件全部有当前磁盘和测试证据时才勾选完成：
 
@@ -663,3 +681,39 @@ git push origin main
 - 旧任务、里程碑、可观测性测试无回归。
 
 完成本阶段后继续实施风险门禁；不得把“问题可记录”描述为“黄色/红色动作已被阻断”。
+
+### 2026-07-30 阶段证据 (Task 6)
+
+- RED: 在生产代码改动前执行 `node node_modules/vitest/vitest.mjs --run --no-file-parallelism test/ansteel-team-extension.test.ts -t "rejects a previously healthy doctor run"`，得到 `1 failed | 26 skipped`；断言实际报错为 `promise resolved "undefined" instead of rejecting`，证明 doctor 会错误信任被篡改账本之前的健康运行。
+- GREEN: 同一命令在 doctor 持久化完整性预检加入后得到 `1 passed | 26 skipped`。
+- 空运行与中断运行 RED: 在可观测性生产代码改动前，从 `pi-agent` 根目录执行
+  `node packages/coding-agent/node_modules/vitest/vitest.mjs --run --no-file-parallelism packages/coding-agent/test/ansteel-team-observability.test.ts packages/coding-agent/test/ansteel-team-cli.test.ts -t "returns artifact-missing|returns process-orphaned|returns RPC failure when doctor diagnoses"`，
+  得到 `3 failed | 13 skipped`；旧实现把无日志运行和没有根 span 终态的运行判为健康，真实 RPC doctor 也返回成功。
+- 空运行与中断运行 GREEN: 同一命令得到 `3 passed | 13 skipped`；两文件完整串行回归得到 `16 passed`。
+- 恢复门禁与多 span RED: 独立规范审查用只读探针证明第一根已结束、第二根未结束时仍会返回健康，并证明
+  恢复路径只看 `team.json`。新增多根、无根兼容和真实新宿主恢复测试后，定向命令得到
+  `3 failed | 35 skipped`；终态早于起点的对抗用例另得到 `1 failed | 10 skipped`。
+- 恢复门禁与多 span GREEN: 诊断改为逐一匹配起点之后、同 `spanId` 和同 `eventName` 的合法终态；
+  首次重启会在原 run/trace/team 哈希链上追加 `abandoned/process-orphaned` 并阻断，第二次显式启动才继续。
+  四条定向回归得到 `4 passed | 35 skipped`，两文件完整回归得到 `39 passed`。
+- 子 span RED/GREEN: 第二轮复审证明已结束根 span 会掩盖未结束 `provider.request`；单元和新宿主恢复回归
+  先得到 `2 failed | 38 skipped`，推广到所有 `started` span 并保留父子与 provider/tool/process/lease
+  关联字段后，同一命令得到 `2 passed | 38 skipped`。
+- 多宿主、因果字段与状态游标 RED/GREEN: 最终规范复审指出活跃旧宿主会被误写 `abandoned`、同一 run
+  可由两个 logger 共享旧链头、恢复覆盖原 `causeEventId`，且有效事件链配合损坏 `ledgerHeadHash` 或
+  `nextEventSequence` 会误报 `event-chain-invalid`。新增 6 条回归后先得到 `6 failed | 40 skipped`；
+  使用既有 `proper-lockfile` 建立单写者租约、持锁重读链头、保留原因果字段并分阶段校验 doctor 后，
+  同一命令得到 `6 passed | 40 skipped`。
+- 重启回放和四类事件篡改: `node node_modules/vitest/vitest.mjs --run --no-file-parallelism test/ansteel-team.test.ts -t "replays a complete public correction loop|rejects a hash-preserving-state tamper"` 得到 `2 passed | 55 skipped`。
+- 规范审查修复: 哈希链损坏的 `doctor` 原因码精确锁定为 `event-chain-invalid`；另以合法事件链和被改写
+  `team.json` 构造投影不一致，精确锁定 `state-projection-mismatch`；真实 RPC 篡改账本后执行
+  `doctor <healthyRunId>` 与 `board` 均返回 `success: false`，且不输出健康诊断或工作板内容。
+- 受控变异证明: 临时移除 `doctor` 持久化预检后，新补的 3 条扩展/RPC 回归全部失败；恢复预检后同一命令
+  得到 `2 passed` 文件、`3 passed | 32 skipped`。临时变异未保留在最终差异中。
+- 定向完整回归: `node node_modules/vitest/vitest.mjs --run --no-file-parallelism test/ansteel-team.test.ts test/ansteel-team-observability.test.ts test/ansteel-team-extension.test.ts test/ansteel-team-cli.test.ts` 得到 `4 passed` 文件和 `111 passed` 测试。
+- 构建和代码格式: `npm run build` 成功；首次将可观测性文件纳入 Biome 后安全修复了 3 个文件的格式和
+  import 顺序，随后 `npx biome check src/core/ansteel-team-observability.ts src/extensions/ansteel-team/index.ts test/ansteel-team.test.ts test/ansteel-team-observability.test.ts test/ansteel-team-extension.test.ts test/ansteel-team-cli.test.ts`
+  报告 `Checked 6 files` 且未应用修复。
+- 根目录验证: `.\node_modules\.bin\tsgo.cmd --noEmit`、`npm run check:pinned-deps`、`npm run check:ts-imports`、`npm run check:shrinkwrap`、`npm run check:install-lock:coding-agent` 均以退出码 `0` 完成；后两项分别确认 shrinkwrap 和 install-lock 为最新。
+- 工作区检查: `git diff --check` 以退出码 `0` 结束（仅报告既有行尾转换提示）；当前声明边界包含 8 个受跟踪修改文件，以及强制加入的 Task 6 报告；未触碰既有 `.workbuddy/`、`github-work-profile.md`、`input-output-flow.md`、`overview.md`。
+- 本阶段仍不完成完整的持续协作协议：黄色/红色风险只会被记录，不会单独触发动作阻断；提交和推送未执行，等待控制器审阅。

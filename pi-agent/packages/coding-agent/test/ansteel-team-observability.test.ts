@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ANSTEEL_RUNTIME_REASON_CODES,
-	createAnsteelTeamIncidentBundle,
-	createAnsteelRuntimeLogger,
+	abandonOrphanedAnsteelTeamRun,
 	createAnsteelRunContext,
+	createAnsteelRuntimeLogger,
+	createAnsteelTeamIncidentBundle,
 	diagnoseAnsteelTeamRun,
 	formatAnsteelTeamDiagnosis,
 	getAnsteelRuntimeLogDirectory,
@@ -110,6 +111,171 @@ describe("Ansteel team observability", () => {
 			eventName: "tool.call.completed",
 		});
 		expect(diagnosis.issues).toContainEqual(expect.objectContaining({ reasonCode: "artifact-missing" }));
+	});
+
+	it("returns artifact-missing instead of healthy for a run without persisted logs", () => {
+		const cwd = createTemporaryProject();
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, "RUN-00000000-0000-4000-8000-000000000000");
+
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.entryCount).toBe(0);
+		expect(diagnosis.issues.map((issue) => issue.reasonCode)).toEqual(["artifact-missing"]);
+	});
+
+	it("returns process-orphaned for a root run span without a terminal record", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.startSpan("run.started", { role: "coordinator" });
+		await logger.forceFlush();
+		logger.close();
+
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.entryCount).toBe(1);
+		expect(diagnosis.issues.map((issue) => issue.reasonCode)).toEqual(["process-orphaned"]);
+	});
+
+	it("returns process-orphaned when any root run span lacks a terminal record", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const completedRoot = logger.startSpan("run.started", { role: "coordinator" });
+		completedRoot.end({ outcome: "succeeded", message: "first command completed" });
+		logger.startSpan("run.started", { role: "coordinator" });
+		await logger.forceFlush();
+		logger.close();
+
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.issues.map((issue) => issue.reasonCode)).toEqual(["process-orphaned"]);
+	});
+
+	it("does not accept a root terminal record that precedes its matching start", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const spanId = "0000000000000001";
+		logger.write({
+			level: "info",
+			eventName: "run.started",
+			outcome: "succeeded",
+			spanId,
+			role: "coordinator",
+			message: "forged early terminal",
+			data: {},
+		});
+		logger.write({
+			level: "info",
+			eventName: "run.started",
+			outcome: "started",
+			spanId,
+			role: "coordinator",
+			message: "late start",
+			data: {},
+		});
+		logger.close();
+
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.issues.map((issue) => issue.reasonCode)).toEqual(["process-orphaned"]);
+	});
+
+	it("returns process-orphaned when a child span lacks a terminal record", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const root = logger.startSpan("run.started", { role: "coordinator" });
+		logger.startSpan("provider.request", {
+			parent: root,
+			role: "staff-engineer",
+			providerRequestId: "PROVIDER-ORPHAN-1",
+		});
+		root.end({ outcome: "succeeded", message: "root command completed" });
+		await logger.forceFlush();
+		logger.close();
+
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.issues).toContainEqual(
+			expect.objectContaining({
+				reasonCode: "process-orphaned",
+				entrySequence: 2,
+			}),
+		);
+	});
+
+	it("does not abandon an orphaned span while its original logger still owns the run", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.startSpan("run.started", { role: "coordinator" });
+		await logger.forceFlush();
+
+		await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).rejects.toMatchObject({
+			reasonCode: "lease-owner-mismatch",
+		});
+		expect(readAnsteelRuntimeLogs(cwd, context.runId).map((entry) => entry.outcome)).toEqual(["started"]);
+
+		logger.close();
+	});
+
+	it("rejects a second concurrent writer for the same runtime run", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const first = createAnsteelRuntimeLogger(cwd, context);
+
+		expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
+			expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
+		);
+
+		first.close();
+	});
+
+	it("preserves an orphaned span cause while recording its recovered start hash", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.startSpan("provider.request", {
+			role: "staff-engineer",
+			providerRequestId: "PROVIDER-ORPHAN-CAUSE-1",
+			causeEventId: "EV-ORIGINAL-CAUSE",
+		});
+		await logger.forceFlush();
+		logger.close();
+		const start = readAnsteelRuntimeLogs(cwd, context.runId)[0]!;
+
+		await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).resolves.toBe(1);
+
+		const abandoned = readAnsteelRuntimeLogs(cwd, context.runId).at(-1);
+		expect(abandoned).toMatchObject({
+			outcome: "abandoned",
+			reasonCode: "process-orphaned",
+			causeEventId: "EV-ORIGINAL-CAUSE",
+			data: {
+				recoveredFromSequence: start.sequence,
+				recoveredFromEventHash: start.hash,
+			},
+		});
+	});
+
+	it("keeps a successful low-level runtime log without a root command span healthy", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "tool" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			role: "staff-engineer",
+			message: "tool completed",
+			data: { exitCode: 0 },
+		});
+		logger.close();
+
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(true);
+		expect(diagnosis.issues).toEqual([]);
 	});
 
 	it("indexes runs and traces entries by governed identifiers", () => {

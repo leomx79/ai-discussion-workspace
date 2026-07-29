@@ -59,6 +59,7 @@ import {
 	type AnsteelRuntimeLogger,
 	type AnsteelRuntimeReasonCode,
 	type AnsteelRuntimeSpan,
+	abandonOrphanedAnsteelTeamRun,
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
 	createAnsteelTeamIncidentBundle,
@@ -194,6 +195,34 @@ function classifyAnsteelRuntimeError(error: unknown): AnsteelRuntimeReasonCode {
 		return "provider-authentication-failed";
 	}
 	return "unclassified-runtime-error";
+}
+
+function verifyPersistedAnsteelTeamIntegrity(cwd: string): AnsteelTeamState {
+	let events: ReturnType<typeof listAnsteelTeamEvents>;
+	try {
+		events = listAnsteelTeamEvents(cwd);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel persisted team integrity verification failed: ${detail}`,
+		);
+	}
+	try {
+		const persistedState = loadAnsteelTeamState(cwd);
+		if (!persistedState) {
+			throw new Error("No persisted Ansteel team state exists for doctor integrity verification");
+		}
+		// The active in-memory team is intentionally not consulted as integrity evidence.
+		getAnsteelTeamSharedBoard(persistedState, events);
+		return persistedState;
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new AnsteelObservabilityError(
+			"state-projection-mismatch",
+			`Ansteel persisted team integrity verification failed: ${detail}`,
+		);
+	}
 }
 
 function formatAnsteelRuntimeTrace(entries: ReturnType<typeof traceAnsteelTeamRuntime>): string {
@@ -1899,7 +1928,25 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			if (!hasSameTaskOwnerPolicy(state.taskOwners, configuredTaskOwners)) {
 				throw new Error("Persisted Ansteel team task-owner policy differs from the current configuration");
 			}
-			await runObservedCommand(ctx.cwd, state.id, `start ${topic}`, async () => {
+			await runObservedCommand(ctx.cwd, state.id, `start ${topic}`, async (logger) => {
+				const orphanedRuns = listAnsteelRuntimeRuns(ctx.cwd).filter(
+					(run) =>
+						run.runId !== logger.context.runId &&
+						run.teamId === state.id &&
+						diagnoseAnsteelTeamRun(ctx.cwd, run.runId).issues.some(
+							(issue) => issue.reasonCode === "process-orphaned",
+						),
+				);
+				if (orphanedRuns.length > 0) {
+					let abandonedSpanCount = 0;
+					for (const run of orphanedRuns) {
+						abandonedSpanCount += await abandonOrphanedAnsteelTeamRun(ctx.cwd, run.runId);
+					}
+					throw new AnsteelObservabilityError(
+						"process-orphaned",
+						`Ansteel team recovery found ${orphanedRuns.length} orphaned runtime run(s) and finalized ${abandonedSpanCount} span(s) as abandoned; retry start after reviewing the recorded failure`,
+					);
+				}
 				const recoveredRoles = ANSTEEL_ROLES.filter((role) => state.roles[role].status === "working");
 				for (const role of recoveredRoles) state.roles[role].status = "failed";
 				state.status = "active";
@@ -2084,12 +2131,12 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						return;
 					}
 					if (command === "doctor") {
-						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
 						await runObservedCommand(
 							ctx.cwd,
-							state?.id ?? "ansteel-team-uninitialized",
+							"ansteel-team-persistence-check",
 							`doctor${argument ? ` ${argument}` : ""}`,
 							async (logger) => {
+								verifyPersistedAnsteelTeamIntegrity(ctx.cwd);
 								const runId =
 									argument ||
 									listAnsteelRuntimeRuns(ctx.cwd)

@@ -1,22 +1,17 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import {
-	closeSync,
-	existsSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	readdirSync,
-	writeSync,
-} from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, writeSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { ROOT_CONTEXT, SpanStatusCode, trace, type Span as OpenTelemetrySpan } from "@opentelemetry/api";
+import { type Span as OpenTelemetrySpan, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
 	BasicTracerProvider,
-	SimpleSpanProcessor,
 	type ReadableSpan,
+	SimpleSpanProcessor,
 	type SpanExporter,
 } from "@opentelemetry/sdk-trace-base";
+import lockfile from "proper-lockfile";
+
+const ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS = 300_000;
+const ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS = 10_000;
 
 export const ANSTEEL_RUNTIME_REASON_CODES = [
 	"provider-timeout",
@@ -186,7 +181,10 @@ export function createAnsteelRunContext(input: {
 
 function getAnsteelTeamRuntimeDirectory(cwd: string): string {
 	if (cwd.trim().length === 0) {
-		throw new AnsteelObservabilityError("unclassified-runtime-error", "Ansteel observability requires a project directory");
+		throw new AnsteelObservabilityError(
+			"unclassified-runtime-error",
+			"Ansteel observability requires a project directory",
+		);
 	}
 	return resolve(cwd, ".pi", "ansteel-team");
 }
@@ -216,10 +214,7 @@ function redactString(value: string): string {
 	return value
 		.replace(/\bBearer\s+[^\s"',;]+/gi, "Bearer [REDACTED]")
 		.replace(/\bsk-[A-Za-z0-9._-]+\b/g, "sk-[REDACTED]")
-		.replace(
-			/\b(API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD|PRIVATE_KEY|SECRET|TOKEN)=([^\s]+)/gi,
-			"$1=[REDACTED]",
-		);
+		.replace(/\b(API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD|PRIVATE_KEY|SECRET|TOKEN)=([^\s]+)/gi, "$1=[REDACTED]");
 }
 
 function redactValue(value: unknown, seen = new WeakSet<object>()): unknown {
@@ -263,7 +258,10 @@ function storeArtifact(cwd: string, artifact: { kind: string; content: string })
 	if (!existsSync(storageId)) {
 		writeNewDurableFile(storageId, content);
 	} else if (createHash("sha256").update(readFileSync(storageId)).digest("hex") !== sha256) {
-		throw new AnsteelObservabilityError("artifact-missing", "Ansteel runtime artifact content does not match its hash");
+		throw new AnsteelObservabilityError(
+			"artifact-missing",
+			"Ansteel runtime artifact content does not match its hash",
+		);
 	}
 	return { kind: artifact.kind, sha256, storageId };
 }
@@ -289,7 +287,10 @@ function parseRuntimeLogEntry(value: unknown): AnsteelRuntimeLogEntry {
 		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has invalid identifiers");
 	}
 	if (entry.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(entry.reasonCode)) {
-		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid reason code");
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime log entry has an invalid reason code",
+		);
 	}
 	return entry;
 }
@@ -432,6 +433,80 @@ export function traceAnsteelTeamRuntime(cwd: string, selector: string): AnsteelR
 	);
 }
 
+function getOrphanedRuntimeSpans(entries: readonly AnsteelRuntimeLogEntry[]): AnsteelRuntimeLogEntry[] {
+	const openSpans = new Map<string, AnsteelRuntimeLogEntry[]>();
+	for (const entry of entries) {
+		const key = `${entry.spanId}\0${entry.eventName}`;
+		if (entry.outcome === "started") {
+			const starts = openSpans.get(key);
+			if (starts === undefined) openSpans.set(key, [entry]);
+			else starts.push(entry);
+			continue;
+		}
+		if (
+			entry.outcome === "succeeded" ||
+			entry.outcome === "failed" ||
+			entry.outcome === "cancelled" ||
+			entry.outcome === "abandoned"
+		) {
+			openSpans.delete(key);
+		}
+	}
+	return [...openSpans.values()].flat();
+}
+
+export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string): Promise<number> {
+	const observedEntries = readAnsteelRuntimeLogs(cwd, runId);
+	if (getOrphanedRuntimeSpans(observedEntries).length === 0) return 0;
+	const first = observedEntries[0]!;
+	const logger = createAnsteelRuntimeLogger(cwd, {
+		runId,
+		traceId: first.traceId,
+		teamId: first.teamId,
+		command: typeof first.data.command === "string" ? first.data.command : "recovered interrupted command",
+		startedAt: first.timestampUtc,
+	});
+	let abandonedSpanCount = 0;
+	try {
+		// The run lock is now held. Re-read the chain so recovery never appends
+		// from a stale sequence/hash snapshot.
+		const orphanedSpans = getOrphanedRuntimeSpans(readAnsteelRuntimeLogs(cwd, runId));
+		if (orphanedSpans.length === 0) return 0;
+		abandonedSpanCount = orphanedSpans.length;
+		for (const start of orphanedSpans) {
+			logger.write({
+				level: "error",
+				eventName: start.eventName,
+				outcome: "abandoned",
+				reasonCode: "process-orphaned",
+				spanId: start.spanId,
+				...(start.parentSpanId === undefined ? {} : { parentSpanId: start.parentSpanId }),
+				...(start.role === undefined ? {} : { role: start.role }),
+				...(start.sessionId === undefined ? {} : { sessionId: start.sessionId }),
+				...(start.taskId === undefined ? {} : { taskId: start.taskId }),
+				...(start.checkpointId === undefined ? {} : { checkpointId: start.checkpointId }),
+				...(start.issueId === undefined ? {} : { issueId: start.issueId }),
+				...(start.toolCallId === undefined ? {} : { toolCallId: start.toolCallId }),
+				...(start.providerRequestId === undefined ? {} : { providerRequestId: start.providerRequestId }),
+				...(start.processId === undefined ? {} : { processId: start.processId }),
+				...(start.leaseId === undefined ? {} : { leaseId: start.leaseId }),
+				...(start.revision === undefined ? {} : { revision: start.revision }),
+				...(start.diffHash === undefined ? {} : { diffHash: start.diffHash }),
+				causeEventId: start.causeEventId ?? start.hash,
+				message: "Ansteel runtime span was abandoned during coordinator recovery",
+				data: {
+					recoveredFromSequence: start.sequence,
+					recoveredFromEventHash: start.hash,
+				},
+			});
+		}
+		await logger.forceFlush();
+	} finally {
+		logger.close();
+	}
+	return abandonedSpanCount;
+}
+
 export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRuntimeDiagnosis {
 	let entries: AnsteelRuntimeLogEntry[];
 	try {
@@ -444,6 +519,19 @@ export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRunti
 				{
 					reasonCode: error instanceof AnsteelObservabilityError ? error.reasonCode : "event-chain-invalid",
 					message: error instanceof Error ? error.message : String(error),
+				},
+			],
+			entryCount: 0,
+		};
+	}
+	if (entries.length === 0) {
+		return {
+			runId,
+			healthy: false,
+			issues: [
+				{
+					reasonCode: "artifact-missing",
+					message: `Ansteel runtime run ${runId} has no persisted logs`,
 				},
 			],
 			entryCount: 0,
@@ -464,6 +552,14 @@ export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRunti
 				});
 			}
 		}
+	}
+	const orphanedSpans = getOrphanedRuntimeSpans(entries);
+	if (orphanedSpans.length > 0) {
+		issues.push({
+			reasonCode: "process-orphaned",
+			message: `Ansteel runtime run ${runId} has ${orphanedSpans.length} span(s) without a valid terminal record`,
+			entrySequence: orphanedSpans[0]!.sequence,
+		});
 	}
 	const rootCause = entries.find(
 		(entry) => entry.outcome === "failed" || entry.outcome === "abandoned" || entry.outcome === "cancelled",
@@ -581,11 +677,38 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 	}
 	const directory = getAnsteelRuntimeLogDirectory(cwd);
 	mkdirSync(directory, { recursive: true });
-	const existing = readAnsteelRuntimeLogs(cwd, context.runId);
+	const path = getAnsteelRuntimeLogPath(cwd, context.runId);
+	let releaseRunLock: (() => void) | undefined;
+	try {
+		releaseRunLock = lockfile.lockSync(path, {
+			realpath: false,
+			stale: ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS,
+			update: ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS,
+		});
+	} catch (error) {
+		const code =
+			typeof error === "object" && error !== null && "code" in error
+				? String((error as { code?: unknown }).code)
+				: undefined;
+		throw new AnsteelObservabilityError(
+			code === "ELOCKED" ? "lease-owner-mismatch" : "event-fsync-failed",
+			code === "ELOCKED"
+				? `Ansteel runtime run ${context.runId} is still owned by another writer`
+				: `Ansteel runtime run ${context.runId} lock could not be acquired`,
+			{ cause: error },
+		);
+	}
+	let existing: AnsteelRuntimeLogEntry[];
+	let fd: number;
+	try {
+		existing = readAnsteelRuntimeLogs(cwd, context.runId);
+		fd = openSync(path, "a");
+	} catch (error) {
+		releaseRunLock();
+		throw error;
+	}
 	let sequence = existing.length + 1;
 	let previousHash = existing.at(-1)?.hash ?? null;
-	const path = getAnsteelRuntimeLogPath(cwd, context.runId);
-	const fd = openSync(path, "a");
 	const startedAt = process.hrtime.bigint();
 	let closed = false;
 
@@ -646,7 +769,9 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 			| (AnsteelRuntimeSpan & { readonly openTelemetrySpan?: OpenTelemetrySpan })
 			| undefined;
 		const parentContext =
-			parentSpan?.openTelemetrySpan === undefined ? ROOT_CONTEXT : trace.setSpan(ROOT_CONTEXT, parentSpan.openTelemetrySpan);
+			parentSpan?.openTelemetrySpan === undefined
+				? ROOT_CONTEXT
+				: trace.setSpan(ROOT_CONTEXT, parentSpan.openTelemetrySpan);
 		const openTelemetrySpan = tracer.startSpan(eventName, undefined, parentContext);
 		const spanContext = openTelemetrySpan.spanContext();
 		const parentSpanId = options.parent?.spanId;
@@ -669,7 +794,10 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 			openTelemetrySpan,
 			end(input) {
 				if (ended) {
-					throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime span ${eventName} already ended`);
+					throw new AnsteelObservabilityError(
+						"event-chain-invalid",
+						`Ansteel runtime span ${eventName} already ended`,
+					);
 				}
 				ended = true;
 				pendingEnds.set(spanContext.spanId, { eventName, fields, parentSpanId, input });
@@ -693,8 +821,12 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 			try {
 				fsyncSync(fd);
 			} finally {
-				closeSync(fd);
-				closed = true;
+				try {
+					closeSync(fd);
+				} finally {
+					closed = true;
+					releaseRunLock();
+				}
 			}
 		},
 	};

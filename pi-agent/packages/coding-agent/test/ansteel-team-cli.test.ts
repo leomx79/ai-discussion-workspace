@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
+import { listAnsteelRuntimeRuns } from "../src/core/ansteel-team-observability.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const ansteelTeamExtensionPath = resolve(__dirname, "../src/extensions/ansteel-team/index.ts");
@@ -982,6 +983,106 @@ describe("Ansteel team CLI", () => {
 				command: "prompt",
 				error: expect.stringContaining("ansteel_review_process_resolution"),
 			});
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("returns RPC failure for board and doctor after the public ledger is tampered", async () => {
+		const { agentDir, projectDir } = createTemporaryProject(DETERMINISTIC_CORRECTION_LOOP_PROVIDER_EXTENSION);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+
+			const start = await rpc.send({
+				id: "start",
+				type: "prompt",
+				message: `/${teamCommand} start Exercise corrupted-ledger RPC propagation`,
+			});
+			expect(start).toMatchObject({ success: true, command: "prompt" });
+
+			const healthyBoard = await rpc.send({
+				id: "healthy-board",
+				type: "prompt",
+				message: `/${teamCommand} board`,
+			});
+			expect(healthyBoard).toMatchObject({ success: true, command: "prompt" });
+			const healthyRun = listAnsteelRuntimeRuns(projectDir).at(-1);
+			expect(healthyRun).toBeDefined();
+
+			const eventsPath = join(projectDir, ".pi", "ansteel-team", "events.jsonl");
+			const events = readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			events[0].content = `${String(events[0].content)} tampered`;
+			writeFileSync(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+			const postTamperRecordIndex = rpc.records().length;
+
+			const doctor = await rpc.send({
+				id: "tampered-doctor",
+				type: "prompt",
+				message: `/${teamCommand} doctor ${healthyRun!.runId}`,
+			});
+			expect(doctor).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("persisted team integrity verification failed"),
+			});
+
+			const board = await rpc.send({
+				id: "tampered-board",
+				type: "prompt",
+				message: `/${teamCommand} board`,
+			});
+			expect(board).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("hash mismatch"),
+			});
+			const postTamperRecords = JSON.stringify(rpc.records().slice(postTamperRecordIndex));
+			expect(postTamperRecords).not.toContain("Health: healthy");
+			expect(postTamperRecords).not.toContain("Active checkpoints:");
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("returns RPC failure when doctor diagnoses a run without persisted logs", async () => {
+		const { agentDir, projectDir } = createTemporaryProject();
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+
+			const start = await rpc.send({
+				id: "start",
+				type: "prompt",
+				message: `/${teamCommand} start Exercise missing runtime diagnosis`,
+			});
+			expect(start).toMatchObject({ success: true, command: "prompt" });
+			const preDoctorRecordIndex = rpc.records().length;
+
+			const doctor = await rpc.send({
+				id: "missing-run-doctor",
+				type: "prompt",
+				message: `/${teamCommand} doctor RUN-00000000-0000-4000-8000-000000000000`,
+			});
+			expect(doctor).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("unhealthy"),
+			});
+			const doctorRecords = JSON.stringify(rpc.records().slice(preDoctorRecordIndex));
+			expect(doctorRecords).toContain("artifact-missing");
+			expect(doctorRecords).not.toContain("Health: healthy");
 		} finally {
 			await rpc.stop();
 		}

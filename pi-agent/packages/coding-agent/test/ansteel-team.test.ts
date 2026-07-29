@@ -59,6 +59,54 @@ function createTeam(cwd: string) {
 	});
 }
 
+function createCompletePublicCorrectionLoop(cwd: string) {
+	const state = createTeam(cwd);
+	const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+		id: "CP-REPLAY-0001",
+		goal: "Keep persisted collaboration state replayable",
+		currentUnderstanding: "The public event ledger is the durable collaboration record",
+		assumptions: [],
+		evidenceRefs: ["event:public-ledger"],
+		uncertainties: [],
+		nextAction: { kind: "read", target: "events.jsonl", expectedResult: "Hash chain verifies" },
+		risk: "yellow",
+		confidence: "L2",
+	});
+	const issue = raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+		id: "PI-REPLAY-0001",
+		targetCheckpointId: checkpoint.id,
+		severity: "blocking",
+		claim: "The first checkpoint lacks a persisted replay check",
+		evidenceRefs: ["event:public-ledger"],
+		suggestedCorrection: "Publish a replacement checkpoint with replay evidence",
+	});
+	const replacement = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+		id: "CP-REPLAY-0002",
+		goal: checkpoint.goal,
+		currentUnderstanding: "The public state must replay exactly after a restart",
+		assumptions: checkpoint.assumptions,
+		evidenceRefs: ["test:restart-replay"],
+		uncertainties: [],
+		nextAction: { kind: "test", target: "test/ansteel-team.test.ts", expectedResult: "Board matches" },
+		risk: "green",
+		confidence: "L1",
+		supersedesCheckpointId: checkpoint.id,
+	});
+	const resolution = resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+		id: "PR-REPLAY-0001",
+		issueId: issue.id,
+		outcome: "ACCEPTED",
+		summary: "Replay the durable ledger before exposing the shared board",
+		evidenceRefs: ["test:restart-replay"],
+		replacementCheckpointId: replacement.id,
+	});
+	reviewAnsteelProcessResolution(cwd, state, "qa-engineer", issue.id, {
+		verdict: "accept",
+		reason: "The replacement checkpoint includes the required replay evidence",
+	});
+	return { checkpoint, issue, replacement, resolution, state };
+}
+
 function createValidPublicCollaborationState(cwd: string): Record<string, unknown> {
 	const state = createTeam(cwd);
 	Object.assign(state, {
@@ -351,6 +399,59 @@ describe("public collaboration state", () => {
 			reason: "The replacement checkpoint includes the overflow test",
 		});
 		expect(state.processIssues[0].status).toBe("closed");
+	});
+
+	it("replays a complete public correction loop into the same shared board after restart", () => {
+		const cwd = createTemporaryProject();
+		const { state } = createCompletePublicCorrectionLoop(cwd);
+		const eventTypes = listAnsteelTeamEvents(cwd).map((event) => event.type);
+		expect(eventTypes).toEqual(
+			expect.arrayContaining([
+				"work-checkpoint",
+				"process-issue",
+				"process-resolution",
+				"process-resolution-review",
+			]),
+		);
+
+		const boardBeforeRestart = getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd));
+		// Reload both persisted records to model a process restart instead of reusing the original state object.
+		const restartedState = loadAnsteelTeamState(cwd);
+		expect(restartedState).toBeDefined();
+		const boardAfterRestart = getAnsteelTeamSharedBoard(restartedState!, listAnsteelTeamEvents(cwd));
+
+		expect(boardAfterRestart).toEqual(boardBeforeRestart);
+		expect(boardAfterRestart.counts).toEqual({
+			activeCheckpoints: 1,
+			openProcessIssues: 0,
+			blockingProcessIssues: 0,
+			escalatedProcessIssues: 0,
+		});
+	});
+
+	it("rejects a hash-preserving-state tamper in every public collaboration event family", () => {
+		for (const eventType of [
+			"work-checkpoint",
+			"process-issue",
+			"process-resolution",
+			"process-resolution-review",
+		] as const) {
+			const cwd = createTemporaryProject();
+			createCompletePublicCorrectionLoop(cwd);
+			const eventPath = getAnsteelTeamEventPath(cwd);
+			const events = readFileSync(eventPath, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			const event = events.find((candidate) => candidate.type === eventType);
+			if (!event) throw new Error(`Missing ${eventType} event from correction loop`);
+			// Change a persisted public event without recomputing its hash; each family must independently fail closed.
+			event.content = `${String(event.content)} tampered`;
+			writeFileSync(eventPath, `${events.map((candidate) => JSON.stringify(candidate)).join("\n")}\n`, "utf8");
+
+			expect(() => listAnsteelTeamEvents(cwd)).toThrow("hash mismatch");
+			expect(() => loadAnsteelTeamState(cwd)).toThrow("hash mismatch");
+		}
 	});
 
 	it("keeps state and ledger unchanged when a role challenges its own checkpoint", () => {

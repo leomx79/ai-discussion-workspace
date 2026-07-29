@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnsteelConfig } from "../src/core/ansteel-discussion.ts";
 import { listAnsteelTeamEvents, loadAnsteelTeamState } from "../src/core/ansteel-team.ts";
 import {
+	createAnsteelRunContext,
+	createAnsteelRuntimeLogger,
 	diagnoseAnsteelTeamRun,
 	listAnsteelRuntimeRuns,
 	readAnsteelRuntimeLogs,
@@ -62,7 +64,11 @@ function initializeGitProject(cwd: string): void {
 	execFileSync("git", ["commit", "-m", "baseline"], { cwd, stdio: "ignore" });
 }
 
-function setup(config = createConfig(), rolePrompt?: (role: string, prompt: string) => Promise<string>) {
+function setup(
+	config = createConfig(),
+	rolePrompt?: (role: string, prompt: string) => Promise<string>,
+	cwd = createTemporaryProject(),
+) {
 	const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
 	const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
 	const prompts: string[] = [];
@@ -123,7 +129,7 @@ function setup(config = createConfig(), rolePrompt?: (role: string, prompt: stri
 	extension(api);
 
 	const ctx = {
-		cwd: createTemporaryProject(),
+		cwd,
 		hasUI: false,
 		mode: "tui",
 		ui: { notify: vi.fn() },
@@ -383,6 +389,150 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
+	it("rejects a previously healthy doctor run when the persisted public ledger is tampered", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		const qa = harness.roleSessionOptions.find((entry) => entry.role === "qa-engineer");
+		if (!staff || !qa) throw new Error("Missing collaboration role operations");
+		const checkpoint = await staff.taskOperations.publishCheckpoint({
+			id: "CP-DOCTOR-TAMPER-0001",
+			goal: "Keep doctor bound to the persisted collaboration ledger",
+			currentUnderstanding: "A runtime diagnosis alone cannot prove public state integrity",
+			assumptions: [],
+			evidenceRefs: ["event:public-ledger"],
+			uncertainties: [],
+			nextAction: {
+				kind: "read",
+				target: ".pi/ansteel-team/events.jsonl",
+				expectedResult: "The complete event chain verifies before diagnosis",
+			},
+			risk: "green",
+			confidence: "L1",
+		});
+		await qa.taskOperations.raiseProcessIssue({
+			id: "PI-DOCTOR-TAMPER-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "Doctor can otherwise trust a healthy runtime after public history changes",
+			evidenceRefs: ["event:public-ledger"],
+			suggestedCorrection: "Replay persisted collaboration state before runtime diagnosis",
+		});
+
+		// Establish a healthy observed command after the public state exists, then preserve its exact run ID.
+		await command("board", harness.ctx);
+		const healthyRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(healthyRun).toBeDefined();
+		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, healthyRun!.runId).healthy).toBe(true);
+
+		const eventPath = join(harness.ctx.cwd, ".pi", "ansteel-team", "events.jsonl");
+		const events = readFileSync(eventPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		// Change durable public content without recalculating the event hash so the persisted chain is invalid.
+		events[0].content = `${String(events[0].content)} tampered`;
+		writeFileSync(eventPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+		harness.sendMessage.mockClear();
+
+		await expect(command(`doctor ${healthyRun!.runId}`, harness.ctx)).rejects.toThrow();
+		const doctorRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(doctorRun).toBeDefined();
+		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, doctorRun!.runId).rootCause).toMatchObject({
+			reasonCode: "event-chain-invalid",
+		});
+
+		await expect(command("board", harness.ctx)).rejects.toThrow();
+		const postTamperMessages = harness.sendMessage.mock.calls
+			.map(([message]) => ("content" in message ? message.content : ""))
+			.join("\n");
+		expect(postTamperMessages).toContain("Ansteel team command failed");
+		expect(postTamperMessages).not.toContain("Active checkpoints:");
+		expect(postTamperMessages).not.toContain("Health: healthy");
+	});
+
+	it("rejects doctor with a projection mismatch when persisted state diverges from the valid ledger", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		if (!staff) throw new Error("Missing staff collaboration operations");
+		await staff.taskOperations.publishCheckpoint({
+			id: "CP-DOCTOR-PROJECTION-0001",
+			goal: "Keep doctor bound to replayed collaboration state",
+			currentUnderstanding: "The persisted state currently matches the public event ledger",
+			assumptions: [],
+			evidenceRefs: ["event:public-ledger"],
+			uncertainties: [],
+			nextAction: {
+				kind: "read",
+				target: ".pi/ansteel-team/team.json",
+				expectedResult: "Replayed public state matches the persisted projection",
+			},
+			risk: "green",
+			confidence: "L1",
+		});
+
+		await command("board", harness.ctx);
+		const healthyRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(healthyRun).toBeDefined();
+		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, healthyRun!.runId).healthy).toBe(true);
+
+		const statePath = join(harness.ctx.cwd, ".pi", "ansteel-team", "team.json");
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+			workCheckpoints: Array<{ currentUnderstanding: string }>;
+		};
+		state.workCheckpoints[0].currentUnderstanding = "Persisted state was changed without a public event";
+		writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+		harness.sendMessage.mockClear();
+
+		await expect(command(`doctor ${healthyRun!.runId}`, harness.ctx)).rejects.toThrow();
+		const doctorRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(doctorRun).toBeDefined();
+		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, doctorRun!.runId).rootCause).toMatchObject({
+			reasonCode: "state-projection-mismatch",
+		});
+		const postMismatchMessages = harness.sendMessage.mock.calls
+			.map(([message]) => ("content" in message ? message.content : ""))
+			.join("\n");
+		expect(postMismatchMessages).toContain("Ansteel team command failed");
+		expect(postMismatchMessages).not.toContain("Health: healthy");
+	});
+
+	it.each([
+		["ledger head", (state: Record<string, unknown>) => Object.assign(state, { ledgerHeadHash: "0".repeat(64) })],
+		[
+			"next event sequence",
+			(state: Record<string, unknown>) =>
+				Object.assign(state, { nextEventSequence: Number(state.nextEventSequence) + 1 }),
+		],
+	])("classifies a valid ledger with a damaged %s cursor as a projection mismatch", async (_name, mutateState) => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		await command("board", harness.ctx);
+		const healthyRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(healthyRun).toBeDefined();
+
+		const statePath = join(harness.ctx.cwd, ".pi", "ansteel-team", "team.json");
+		const state = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+		mutateState(state);
+		writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+		await expect(command(`doctor ${healthyRun!.runId}`, harness.ctx)).rejects.toThrow();
+		const doctorRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(doctorRun).toBeDefined();
+		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, doctorRun!.runId).rootCause).toMatchObject({
+			reasonCode: "state-projection-mismatch",
+		});
+	});
+
 	it("rejects an active-team board when the persisted team state is damaged", async () => {
 		const harness = setup();
 		const command = harness.commands.get("ansteel-team");
@@ -542,25 +692,90 @@ describe("Ansteel team extension", () => {
 		]);
 	});
 
-	it("records a stale working role before recovering an interrupted persisted team", async () => {
-		const { commands, ctx, sendMessage } = setup();
-		const command = commands.get("ansteel-team");
-		if (!command) throw new Error("Missing ansteel-team command");
+	it("finalizes and blocks an orphaned run before recovering an interrupted persisted team", async () => {
+		const firstHost = setup();
+		const firstCommand = firstHost.commands.get("ansteel-team");
+		if (!firstCommand) throw new Error("Missing first-host ansteel-team command");
 
-		await command("start Review the parser", ctx);
-		await command("stop", ctx);
-		const statePath = join(ctx.cwd, ".pi", "ansteel-team", "team.json");
+		await firstCommand("start Review the parser", firstHost.ctx);
+		const persistedBeforeRecovery = loadAnsteelTeamState(firstHost.ctx.cwd);
+		expect(persistedBeforeRecovery).toBeDefined();
+		const orphanContext = createAnsteelRunContext({
+			teamId: persistedBeforeRecovery!.id,
+			command: "ask interrupted work",
+		});
+		const orphanLogger = createAnsteelRuntimeLogger(firstHost.ctx.cwd, orphanContext);
+		const completedRoot = orphanLogger.startSpan("run.started", {
+			role: "coordinator",
+			message: "interrupted command started",
+			data: { command: "ask interrupted work" },
+		});
+		orphanLogger.startSpan("provider.request", {
+			parent: completedRoot,
+			role: "staff-engineer",
+			providerRequestId: "PROVIDER-RECOVERY-ORPHAN-1",
+			message: "provider request interrupted",
+		});
+		completedRoot.end({ outcome: "succeeded", message: "root command returned before child cleanup" });
+		await orphanLogger.forceFlush();
+		orphanLogger.close();
+		const statePath = join(firstHost.ctx.cwd, ".pi", "ansteel-team", "team.json");
 		const state = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, any>;
 		state.status = "active";
 		state.roles["staff-engineer"].status = "working";
 		writeFileSync(statePath, `${JSON.stringify(state)}\n`, "utf8");
 
-		await command("start Review the parser", ctx);
+		const restartedHost = setup(createConfig(), undefined, firstHost.ctx.cwd);
+		const restartedCommand = restartedHost.commands.get("ansteel-team");
+		if (!restartedCommand) throw new Error("Missing restarted-host ansteel-team command");
+		await expect(restartedCommand("start Review the parser", restartedHost.ctx)).rejects.toThrow("orphaned runtime");
+		expect(diagnoseAnsteelTeamRun(restartedHost.ctx.cwd, orphanContext.runId)).toMatchObject({
+			healthy: false,
+			rootCause: {
+				eventName: "provider.request",
+				outcome: "abandoned",
+				reasonCode: "process-orphaned",
+				providerRequestId: "PROVIDER-RECOVERY-ORPHAN-1",
+			},
+		});
 
-		expect(sendMessage).toHaveBeenCalledWith(
+		await restartedCommand("start Review the parser", restartedHost.ctx);
+
+		expect(restartedHost.sendMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ content: expect.stringContaining("recovered from an interrupted host") }),
 			{ triggerTurn: false },
 		);
+	});
+
+	it("does not recover a runtime run while its original host still owns the logger", async () => {
+		const firstHost = setup();
+		const firstCommand = firstHost.commands.get("ansteel-team");
+		if (!firstCommand) throw new Error("Missing first-host ansteel-team command");
+		await firstCommand("start Review the parser", firstHost.ctx);
+		const persisted = loadAnsteelTeamState(firstHost.ctx.cwd);
+		expect(persisted).toBeDefined();
+
+		const activeContext = createAnsteelRunContext({
+			teamId: persisted!.id,
+			command: "ask active work",
+		});
+		const activeLogger = createAnsteelRuntimeLogger(firstHost.ctx.cwd, activeContext);
+		activeLogger.startSpan("run.started", {
+			role: "coordinator",
+			message: "active command started",
+			data: { command: "ask active work" },
+		});
+		await activeLogger.forceFlush();
+
+		const restartedHost = setup(createConfig(), undefined, firstHost.ctx.cwd);
+		const restartedCommand = restartedHost.commands.get("ansteel-team");
+		if (!restartedCommand) throw new Error("Missing restarted-host ansteel-team command");
+		await expect(restartedCommand("start Review the parser", restartedHost.ctx)).rejects.toThrow();
+		expect(readAnsteelRuntimeLogs(firstHost.ctx.cwd, activeContext.runId).map((entry) => entry.outcome)).toEqual([
+			"started",
+		]);
+
+		activeLogger.close();
 	});
 
 	it("resumes a stopped team when its persisted task-owner policy still matches configuration", async () => {
