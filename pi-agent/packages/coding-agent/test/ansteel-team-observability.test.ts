@@ -1,11 +1,14 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ANSTEEL_RUNTIME_REASON_CODES,
+	createAnsteelRuntimeLogger,
 	createAnsteelRunContext,
+	getAnsteelRuntimeLogDirectory,
 	isAnsteelRuntimeReasonCode,
+	readAnsteelRuntimeLogs,
 } from "../src/core/ansteel-team-observability.ts";
 
 const temporaryProjects: string[] = [];
@@ -36,5 +39,28 @@ describe("Ansteel team observability", () => {
 		expect(isAnsteelRuntimeReasonCode("provider-timeout")).toBe(true);
 		expect(isAnsteelRuntimeReasonCode("made-up-reason")).toBe(false);
 		expect(ANSTEEL_RUNTIME_REASON_CODES).toContain("unclassified-runtime-error");
+	});
+
+	it("redacts secrets, stores large output by hash, and writes structured JSONL", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "task TASK-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+
+		const entry = logger.write({
+			level: "error",
+			eventName: "tool.call.completed",
+			outcome: "failed",
+			reasonCode: "tool-exit-nonzero",
+			message: "command failed",
+			data: { authorization: "Bearer top-secret", exitCode: 1 },
+			artifacts: [{ kind: "stderr", content: "API_KEY=top-secret\nfailure" }],
+		});
+		logger.close();
+
+		expect(entry.data.authorization).toBe("[REDACTED]");
+		expect(entry.artifactRefs[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(readFileSync(entry.artifactRefs[0]!.storageId, "utf8")).not.toContain("top-secret");
+		expect(readAnsteelRuntimeLogs(cwd, context.runId)).toHaveLength(1);
+		expect(existsSync(getAnsteelRuntimeLogDirectory(cwd))).toBe(true);
 	});
 });
