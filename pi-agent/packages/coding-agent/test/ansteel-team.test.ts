@@ -8,6 +8,7 @@ import {
 	type AnsteelWorkCheckpointInput,
 	appendAnsteelTeamEvent,
 	claimAnsteelTeamTask,
+	classifyAnsteelTeamActionRisk,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
 	getAnsteelTeamEventPath,
@@ -125,6 +126,13 @@ function createValidPublicCollaborationState(cwd: string): Record<string, unknow
 					expectedResult: "Empty input is rejected",
 				},
 				risk: "yellow",
+				governedAction: {
+					kind: "test",
+					target: "test/parser.test.ts",
+					version: "unscoped;checkpoint:CP-PARSER-0001",
+					computedRisk: "yellow",
+					effectiveRisk: "yellow",
+				},
 				confidence: "L2",
 				status: "active",
 				createdAt: "2026-07-24T00:01:00.000Z",
@@ -187,6 +195,95 @@ afterEach(() => {
 });
 
 describe("public collaboration state", () => {
+	it("migrates v7 teams without inventing action reviews or reusable action approval", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-MIGRATE-RISK-0001",
+			goal: "Migrate an existing public checkpoint",
+			currentUnderstanding: "Version 7 did not bind peer approval to an exact action version",
+			assumptions: [],
+			evidenceRefs: ["state:v7"],
+			uncertainties: ["Whether the old checkpoint is still actionable"],
+			nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const statePath = getAnsteelTeamStatePath(cwd);
+		const legacy = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+		legacy.version = 7;
+		delete legacy.actionReviews;
+		const checkpoints = legacy.workCheckpoints as Array<Record<string, unknown>>;
+		delete checkpoints[0].governedAction;
+		writePersistedTeamState(cwd, legacy);
+
+		const migrated = loadAnsteelTeamState(cwd);
+
+		expect(migrated).toMatchObject({
+			version: 8,
+			actionReviews: [],
+			workCheckpoints: [{ id: checkpoint.id, status: "superseded", governedAction: null }],
+		});
+	});
+
+	it.each([
+		["read", { path: "src/parser.ts" }, "green"],
+		["grep", { pattern: "parser", path: "src" }, "green"],
+		["edit", { path: "src/parser.ts", edits: [] }, "yellow"],
+		["write", { path: "src/new.ts", content: "export {};\n" }, "yellow"],
+		["write", { path: "src/parser.ts", content: "export {};\n" }, "red"],
+		["bash", { command: "git commit -m governed" }, "red"],
+		["bash", { command: "git push origin main" }, "red"],
+	])("mechanically classifies %s as %s", (toolName, args, expectedRisk) => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+
+		expect(classifyAnsteelTeamActionRisk(cwd, { toolName, args })).toBe(expectedRisk);
+	});
+
+	it("raises sensitive targets to red and never accepts a model risk downgrade", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+
+		expect(
+			classifyAnsteelTeamActionRisk(cwd, {
+				toolName: "edit",
+				args: { path: ".github/workflows/delivery.yml", edits: [] },
+			}),
+		).toBe("red");
+		expect(
+			classifyAnsteelTeamActionRisk(cwd, {
+				toolName: "edit",
+				args: { path: "migrations/001.sql", edits: [] },
+			}),
+		).toBe("red");
+
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RISK-DOWNGRADE-0001",
+			goal: "Change the delivery workflow",
+			currentUnderstanding: "The workflow controls repository delivery",
+			assumptions: [],
+			evidenceRefs: ["file:.github/workflows/delivery.yml"],
+			uncertainties: [],
+			nextAction: {
+				kind: "edit",
+				target: ".github/workflows/delivery.yml",
+				expectedResult: "The delivery workflow changes",
+			},
+			risk: "green",
+			confidence: "L2",
+		});
+
+		expect(checkpoint.risk).toBe("red");
+		expect(checkpoint.governedAction).toMatchObject({
+			kind: "edit",
+			target: ".github/workflows/delivery.yml",
+			computedRisk: "red",
+			effectiveRisk: "red",
+		});
+	});
+
 	it("derives the shared board without trusting role-written counts", () => {
 		const cwd = createTemporaryProject();
 		const state = createTeam(cwd);
@@ -743,15 +840,17 @@ describe("public collaboration state", () => {
 		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
 
 		expect(migrated).toMatchObject({
-			version: 7,
+			version: 8,
 			workCheckpoints: [],
 			processIssues: [],
+			actionReviews: [],
 			...preserved,
 		});
 		expect(persisted).toMatchObject({
-			version: 7,
+			version: 8,
 			workCheckpoints: [],
 			processIssues: [],
+			actionReviews: [],
 			...preserved,
 		});
 	});
@@ -761,9 +860,10 @@ describe("public collaboration state", () => {
 		writePersistedTeamState(cwd, createValidPublicCollaborationState(cwd));
 
 		expect(loadAnsteelTeamState(cwd)).toMatchObject({
-			version: 7,
+			version: 8,
 			workCheckpoints: [{ id: "CP-PARSER-0001" }],
 			processIssues: [{ id: "PI-PARSER-0001" }],
+			actionReviews: [],
 		});
 	});
 
@@ -994,11 +1094,12 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 7,
+			version: 8,
 			tasks: [],
 			milestones: [],
 			workCheckpoints: [],
 			processIssues: [],
+			actionReviews: [],
 			ledgerHeadHash: null,
 		});
 		expect(migrated?.roles).toEqual(team.roles);
@@ -1035,8 +1136,8 @@ describe("Ansteel team state", () => {
 			previousHash: null,
 			hash: expect.stringMatching(/^[a-f0-9]{64}$/),
 		});
-		expect(migrated).toMatchObject({ version: 7, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
-		expect(persistedState).toMatchObject({ version: 7, ledgerHeadHash: events[0]?.hash });
+		expect(migrated).toMatchObject({ version: 8, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
+		expect(persistedState).toMatchObject({ version: 8, ledgerHeadHash: events[0]?.hash });
 		expect(persistedEvent).toMatchObject({ previousHash: null, hash: events[0]?.hash });
 	});
 
@@ -1051,9 +1152,9 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		const persistedState = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
 
-		expect(migrated).toMatchObject({ version: 7, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
+		expect(migrated).toMatchObject({ version: 8, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
 		expect(persistedState).toMatchObject({
-			version: 7,
+			version: 8,
 			taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"],
 		});
 	});
