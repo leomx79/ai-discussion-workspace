@@ -60,7 +60,9 @@ owner 完成修改
 7. 工具结果自动进入公共事实流，所有角色依据相同事实更新认识。
 8. 运行数小时、角色超时、进程退出或主机重启后，可以从最后一个有效协作检查点恢复。
 9. 所有公开协作事件只追加、可查询、可重放，历史修改可以被哈希链检测。
-10. 最终完成状态仍需独立验证，不允许用协作共识代替交付正确性。
+10. 每次运行、状态转换、provider 请求、工具调用和故障都能通过统一关联 ID 还原精确因果，不能依靠
+    人或模型猜测失败原因。
+11. 最终完成状态仍需独立验证，不允许用协作共识代替交付正确性。
 
 ## 四、非目标
 
@@ -605,7 +607,291 @@ not-started | verifying | passed | failed
 默认视图展示当前目标、正在工作的角色、开放问题和最近工具事实。历史细节按问题线程展开，避免长任务
 把界面淹没。最终摘要只引用事件，不允许模型重新生成没有出处的“完整过程”。
 
-## 十七、失败关闭规则
+## 十七、日志与全链路可观测性
+
+协作事件账本只能回答“团队公开做了什么决定”，不能独立回答“运行时究竟在哪里失败”。系统必须增加
+独立的结构化日志和追踪层，把用户命令、角色会话、provider 请求、工具进程、状态机、文件租约、问题
+线程和最终结果连接成一条可查询的因果链。
+
+核心不变量是：
+
+> 任何 `failed`、`blocked`、`stalled`、`revision-required` 或异常退出状态，都必须包含
+> `reasonCode`、`causeEventId` 和 `traceId`。系统不得只记录“执行失败”“模型超时”或模型生成的原因
+> 摘要。
+
+运行追踪采用 OpenTelemetry 的 trace/span 语义和成熟 Node.js SDK，不自行发明不兼容的分布式追踪模型。
+本地结构化 JSONL exporter 是强制出口，保证没有远程平台时仍可诊断；OTLP exporter 只作为可选集成。
+协作审计账本继续独立实现，因为普通遥测系统不保证治理事件的逐条签名、强制落盘和哈希链完整性。
+
+### 17.1 四类持久记录
+
+| 层 | 建议位置 | 用途 | 完整性要求 |
+|---|---|---|---|
+| 协作审计账本 | `.pi/ansteel-team/events.jsonl` | 判断、质疑、纠正、决定和治理事件 | 逐事件哈希链、签名、强制落盘 |
+| 结构化运行日志 | `.pi/ansteel-team/logs/run-<runId>-<segment>.jsonl` | provider、工具、进程、租约、队列和状态机诊断 | 分段哈希、轮转、关键记录强制刷新 |
+| 内容寻址产物 | `.pi/ansteel-team/artifacts/<sha256>` | 完整 stdout、stderr、diff、测试输出和脱敏异常栈 | SHA-256 校验、不可原地覆盖 |
+| 状态快照与事故包 | `.pi/ansteel-team/snapshots/`、`.pi/ansteel-team/incidents/` | 快速恢复和一次故障的完整诊断清单 | 必须能回指账本序号和日志区间 |
+
+协作审计账本是长期可信事实，不因日志轮转删除。运行日志是高体量技术遥测，可以按策略轮转，但被审计
+事件、失败事故包或最终交付引用的日志段和产物在引用解除前不得清理。
+
+### 17.2 可观测性数据流
+
+```mermaid
+flowchart LR
+    CMD["用户命令<br/>runId + traceId"] --> CO["协调器"]
+    CO --> ROLE["角色会话 span"]
+    ROLE --> PROVIDER["provider 请求 span"]
+    ROLE --> TOOL["工具调用 span"]
+    TOOL --> PROCESS["子进程 span"]
+
+    CO --> TRANSITION["状态转换记录"]
+    PROVIDER --> RUNTIME["结构化运行日志"]
+    PROCESS --> RUNTIME
+    TRANSITION --> RUNTIME
+
+    ROLE --> AUDIT["协作审计账本"]
+    TOOL --> ARTIFACT["内容寻址产物"]
+    RUNTIME --> DIAG["trace 查询与事故诊断包"]
+    AUDIT --> DIAG
+    ARTIFACT --> DIAG
+
+    DIAG --> ANSWER["确定回答<br/>失败位置、原因、证据、影响和恢复点"]
+```
+
+### 17.3 统一关联标识
+
+所有日志、审计事件、产物和派生状态必须复用以下关联字段：
+
+| 字段 | 含义 |
+|---|---|
+| `runId` | 一次 `/ansteel-team` 命令或恢复执行 |
+| `traceId` | 一条从用户请求到终态的完整因果链 |
+| `spanId`、`parentSpanId` | provider、工具、子进程和状态转换的父子关系 |
+| `teamId` | 持久团队 |
+| `role`、`sessionId` | 角色身份及具体会话 |
+| `taskId`、`checkpointId`、`issueId` | 协作对象 |
+| `toolCallId`、`providerRequestId`、`processId` | 外部执行对象 |
+| `leaseId` | 角色执行或文件写入租约 |
+| `revision`、`diffHash` | 被验证的精确代码状态 |
+| `causeEventId` | 直接导致当前状态或错误的审计/运行事件 |
+
+同一次恢复执行生成新的 `runId`，但沿用原任务的 `traceId`，并通过 `resumedFromRunId` 和
+`resumedFromSequence` 指向恢复点。这样既能区分进程生命周期，也能查询跨重启的完整任务历史。
+
+每次 `run.started` 还必须记录产品版本、Git commit、扩展版本、配置文件内容哈希、功能开关、Node.js
+版本、操作系统、架构和项目根目录的稳定标识。配置中的密钥值不参与可见指纹；使用脱敏后的规范配置计算
+`configHash`。事故分析必须能回答“哪一版代码、哪一版配置、哪个运行实例发生了问题”。
+
+### 17.4 结构化日志格式
+
+运行日志采用单行规范 JSON，不以自由文本作为唯一诊断信息：
+
+```ts
+interface AnsteelRuntimeLog {
+  schemaVersion: 1;
+  timestampUtc: string;
+  monotonicElapsedNs: string;
+  sequence: number;
+  level: "debug" | "info" | "warn" | "error" | "audit";
+  eventName: string;
+  outcome: "started" | "progress" | "succeeded" | "failed" | "cancelled" | "abandoned";
+  reasonCode?: string;
+  runId: string;
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  teamId: string;
+  role?: "tech-lead" | "staff-engineer" | "qa-engineer" | "coordinator";
+  sessionId?: string;
+  taskId?: string;
+  checkpointId?: string;
+  issueId?: string;
+  toolCallId?: string;
+  providerRequestId?: string;
+  processId?: string;
+  leaseId?: string;
+  revision?: number;
+  diffHash?: string;
+  causeEventId?: string;
+  message: string;
+  data: Record<string, unknown>;
+  artifactRefs: Array<{ kind: string; sha256: string; storageId: string }>;
+}
+```
+
+`message` 只用于人类快速阅读；程序判断必须使用 `eventName`、`outcome`、`reasonCode` 和结构化 `data`。
+日志 schema 必须版本化，未知字段向前兼容，缺失必填字段拒绝写入关键日志。
+
+### 17.5 必须记录的运行事件
+
+至少覆盖以下事件族：
+
+- `run.started`、`run.resumed`、`run.completed`、`run.failed`；
+- `role.session.started`、`role.session.output`、`role.session.truncated`、`role.session.ended`；
+- `provider.request.started`、`provider.request.retry`、`provider.request.completed`；
+- `tool.call.started`、`tool.call.progress`、`tool.call.completed`；
+- `process.spawned`、`process.heartbeat`、`process.exited`、`process.orphan-detected`；
+- `state.transition.attempted`、`state.transition.applied`、`state.transition.rejected`；
+- `lease.acquired`、`lease.renewed`、`lease.expired`、`lease.released`；
+- `event.appended`、`event.fsync.completed`、`event.chain.invalid`；
+- `artifact.stored`、`artifact.verified`、`artifact.missing`；
+- `budget.reserved`、`budget.consumed`、`budget.exhausted`；
+- `security.access-denied`、`security.redaction-applied`、`security.secret-detected`。
+
+provider 事件必须记录配置身份、模型名、请求轮次、重试次数、超时阶段、HTTP 状态或 SDK 错误类别、首
+token 延迟、总时长、输入输出 token 计数和公开输出是否为空。不得记录 API Key、认证头或未经脱敏的
+完整请求体。
+
+工具和子进程事件必须记录规范化参数摘要、工作目录、允许策略、PID、退出码、信号、超时、stdout/stderr
+产物哈希、执行前后文件哈希和最后一次进展时间。驱动进程的退出码必须反映最终 outcome，不能只打印布尔
+结果后退出零。
+
+### 17.6 状态转换日志
+
+每次状态转换无论成功或拒绝都必须记录：
+
+```json
+{
+  "eventName": "state.transition.applied",
+  "from": "active",
+  "to": "disputed",
+  "guard": "no-open-blocking-issue",
+  "guardResult": false,
+  "triggerEventId": "EV-...",
+  "reasonCode": "blocking-process-issue-open",
+  "causeEventId": "EV-PROCESS-ISSUE-0003",
+  "issueId": "PI-TASK-LEASE-0003"
+}
+```
+
+状态对象同时保存最后一次转换的 `transitionLogId`。`status`、报告和用户界面只能展示有对应转换日志的
+状态。若派生状态与重放结果不一致，进入 `state-projection-mismatch`，禁止继续执行。
+
+### 17.7 稳定原因码
+
+原因码必须来自版本化枚举，至少包括：
+
+```text
+provider-timeout
+provider-empty-public-output
+provider-rate-limited
+provider-authentication-failed
+tool-exit-nonzero
+tool-timeout
+tool-policy-denied
+process-orphaned
+lease-expired
+lease-owner-mismatch
+revision-drift
+diff-hash-mismatch
+blocking-process-issue-open
+event-chain-invalid
+event-fsync-failed
+artifact-missing
+state-projection-mismatch
+budget-exhausted
+no-governed-progress
+coordinator-restarted
+unclassified-runtime-error
+```
+
+只有无法归类的异常可以使用 `unclassified-runtime-error`，并且必须保存脱敏后的异常类型、调用栈产物、
+发生组件和父 span，不能用该原因码吞掉细节。
+
+### 17.8 时间与崩溃一致性
+
+- `timestampUtc` 用于跨系统排序和用户阅读；
+- `monotonicElapsedNs` 用于计算本进程内持续时间，不受系统时钟回拨影响；
+- 全局 `sequence` 用于同一日志段内的确定顺序；
+- 关键状态转换、问题、租约、工具终态和失败记录写入后必须刷新到磁盘；
+- 高频进度日志可以批量刷新，但不能作为唯一完成证据；
+- 恢复时，所有只有 `started` 而没有合法终态的 span 必须追加 `abandoned`；
+- 如果对应子进程仍存在，必须验证 PID、启动时间、命令哈希和工作目录后才能重新接管；
+- 无法确认的进程不得猜测为成功、失败或可安全重试。
+
+### 17.9 查询与诊断接口
+
+产品必须提供以下只读能力：
+
+```text
+/ansteel-team trace <runId|traceId|taskId|issueId|toolCallId>
+/ansteel-team doctor [runId]
+/ansteel-team incident <runId> --redacted
+/ansteel-team status --explain
+```
+
+`status --explain` 必须直接显示：
+
+- 当前三轴状态；
+- 触发该状态的事件和原因码；
+- 最后一次受治理进展；
+- 当前开放 span、问题和租约；
+- 最近失败的 provider、工具或状态 guard；
+- 可恢复检查点；
+- 下一项机械允许动作。
+
+`doctor` 从磁盘重新校验事件链、日志段、产物哈希、状态投影、文件租约和遗留子进程，不信任内存中的
+成功标志。命令发现异常时返回非零退出码。
+
+### 17.10 事故诊断包
+
+运行失败或用户主动请求时，协调器生成内容寻址的事故清单，包含：
+
+- 运行、trace、任务和 revision 身份；
+- 首个根因事件、后续传播事件和最终状态；
+- 相关审计事件区间；
+- 相关运行日志 span 树；
+- stdout、stderr、diff、测试和异常栈产物引用；
+- provider 与工具配置的脱敏摘要；
+- 事件链、日志段和产物完整性校验结果；
+- 最后合法检查点、当前工作区哈希和推荐恢复入口。
+
+事故包只聚合既有结构化事实，不调用模型猜测根因。模型可以在事实包上提出分析，但分析必须和事实字段
+分开显示，并标注置信度。
+
+### 17.11 脱敏、权限与保留
+
+- 日志写入前进行结构化字段脱敏和内容扫描，不能先落盘秘密再清理；
+- API Key、认证头、Cookie、环境变量值和私有密钥只记录是否存在及稳定类别，不记录原值或可逆哈希；
+- 不记录供应商私有隐藏思维链；
+- 用户输入、公开工作推理和文件内容按项目数据处理策略保存；
+- 三个角色只能通过受控查询读取公共审计事件和授权运行日志，不能直接读取协调器日志目录；
+- 默认保留完整审计账本和所有失败事故包；
+- 成功运行的普通运行日志按大小和时间轮转，默认至少保留 30 天或最近 100 次运行；
+- 被事件、事故包、提交或交付引用的日志段和产物禁止垃圾回收；
+- 删除到期运行日志时追加 `retention.deleted` 审计记录，包含范围和被删除内容哈希。
+- 审计、错误、状态转换、provider 终态和工具终态禁止采样；只有高频 debug 与 progress 日志允许按明确
+  配置采样，并记录采样策略和丢弃数量。
+
+### 17.12 日志系统自身失败
+
+日志系统不能成为静默单点故障：
+
+- 审计事件、状态转换、工具终态或失败原因无法落盘时，流程必须 fail-closed；
+- 非关键 debug 日志写入失败时，升级为可见告警并切换到受限模式；
+- 磁盘不足时停止启动新任务，保留正在运行任务的终态和最小事故信息预算；
+- 日志段截断时保留合法前缀、记录损坏偏移并生成新段，不覆盖原始损坏文件；
+- 任何自动修复都通过新日志和审计事件记录，不原地伪造完整历史。
+
+### 17.13 指标与主动告警
+
+日志用于事后还原，指标用于运行中提前发现异常。至少维护：
+
+- 活跃角色、运行、任务、开放问题和等待门禁数量；
+- provider 请求成功率、空输出率、重试率、首 token 延迟和总时长；
+- 工具成功率、超时率、非零退出率和运行时长；
+- 当前执行 lease、文件租约和即将过期数量；
+- 连续无进展 epoch、队列深度和剩余预算；
+- 事件账本序号、最后成功 `fsync` 时间和日志积压；
+- 日志、产物和事故包占用磁盘空间；
+- 遗留子进程和状态投影不一致数量。
+
+出现事件链损坏、关键日志落盘失败、磁盘预算不足、遗留进程、状态投影不一致或三角色配置失效时，必须
+立即在统一时间线和 `status --explain` 中显示告警。告警必须引用对应 trace 和原因码，不能只显示红色
+状态灯。
+
+## 十八、失败关闭规则
 
 以下情况必须阻断受影响动作：
 
@@ -624,28 +910,32 @@ not-started | verifying | passed | failed
 
 失败关闭不能删除已有文件 diff、问题、工具输出或会话。系统必须保留可诊断和可恢复状态。
 
-## 十八、与现有实现的迁移关系
+## 十九、与现有实现的迁移关系
 
 迁移按以下顺序进行，保持现有能力可回退：
 
-1. 扩展当前 `events.jsonl` 为版本化公共协作事件协议，并增加严格重放验证。
-2. 引入共享工作板投影和公开工作检查点，不改变现有最终交付门禁。
-3. 给三个持久角色增加检查点、质疑、解决、决定和租约转交工具。
-4. 把角色工具调用结果自动连接到公共事件和关联检查点。
-5. 引入绿色、黄色、红色风险分类和对应阻断规则。
-6. 允许 TL、Staff、QA 分别拥有不同类型任务和不重叠文件。
-7. 把现有双评审改为持续协作后的最终独立验证，而不是主要协作机制。
-8. 接入 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 三轴状态。
-9. 最后启用角色签名和里程碑 Merkle Root 外部锚定。
+1. 先定义统一关联 ID、稳定原因码、结构化日志 writer、内容寻址产物和只读 `trace/doctor` 查询。
+2. 扩展当前 `events.jsonl` 为版本化公共协作事件协议，并增加严格重放验证。
+3. 引入共享工作板投影和公开工作检查点，不改变现有最终交付门禁。
+4. 给三个持久角色增加检查点、质疑、解决、决定和租约转交工具。
+5. 把角色工具调用结果自动连接到公共事件、运行 span 和关联检查点。
+6. 引入绿色、黄色、红色风险分类和对应阻断规则。
+7. 允许 TL、Staff、QA 分别拥有不同类型任务和不重叠文件。
+8. 把现有双评审改为持续协作后的最终独立验证，而不是主要协作机制。
+9. 接入 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 三轴状态。
+10. 最后启用角色签名、日志段完整性校验和里程碑 Merkle Root 外部锚定。
 
 旧状态必须显式迁移。不能从旧 `approved` 推导新 `collaboration-complete` 或 `deliveryStatus: passed`；
 缺少公开过程事件的旧任务最多标记为 `legacy-governance-approved`，依赖是否可用仍按旧版本隔离处理。
 
-## 十九、测试策略
+## 二十、测试策略
 
-### 19.1 单元测试
+### 20.1 单元测试
 
 - 事件 schema、规范化、哈希、签名和重放；
+- 运行日志 schema、关联 ID、父子 span 和稳定原因码；
+- OpenTelemetry span 与本地 JSONL 日志的一致关联；
+- 日志脱敏、分段哈希、轮转、引用保留和截断恢复；
 - `__proto__`、Unicode、深层对象和边界数字不丢失；
 - 时间与租约派生计算在写事件前拒绝溢出；
 - 风险分类不能被模型降级；
@@ -654,7 +944,7 @@ not-started | verifying | passed | failed
 - 文件租约转交和漂移检测；
 - 工具失败不能生成成功观察。
 
-### 19.2 确定性集成测试
+### 20.2 确定性集成测试
 
 - 三个确定性 provider 并行完成定向并形成共享工作框架；
 - Staff 提出有漏洞的实现假设，QA 在编辑前通过 `PROCESS_ISSUE` 阻断；
@@ -663,10 +953,12 @@ not-started | verifying | passed | failed
 - QA 的测试方案同样可以被 TL 和 Staff 质疑；
 - 三个角色分别修改不重叠文件并安全整合；
 - 角色中断和进程重启后从事件链恢复；
+- provider 超时、工具非零退出和状态 guard 拒绝均能通过同一 trace 精确定位；
+- `status --explain`、`trace`、`doctor` 和脱敏事故包返回一致原因；
 - CLI、RPC、报告和退出码准确反映失败状态；
 - 任何角色都不能读取协调器私有目录、隐藏 Oracle 或其他角色私有会话。
 
-### 19.3 对抗测试
+### 20.3 对抗测试
 
 - 角色互相附和但没有工具证据；
 - 角色重复同一错误并形成假共识；
@@ -677,9 +969,11 @@ not-started | verifying | passed | failed
 - 工具退出非零但驱动进程错误退出零；
 - 配置未纳入基线导致扩展未加载；
 - 长时间工具运行、provider 空输出、截断和无进展循环；
+- 日志注入、伪造关联 ID、截断日志段、删除产物和系统时钟回拨；
+- API Key、认证头和环境变量不得出现在日志、事故包或用户界面；
 - 公开测试全部通过但新增变形、属性和故障注入测试失败。
 
-### 19.4 真实提供商探针
+### 20.4 真实提供商探针
 
 继续使用耐久租约队列任务，但验收重点从“最后得到双批准”改为：
 
@@ -690,9 +984,11 @@ not-started | verifying | passed | failed
 5. 错误在最终提交前触发问题、修正和复验；
 6. 公共时间线能完整重放这次认知变化；
 7. 最终独立验收通过后才解锁依赖；
-8. 没有访问 Oracle、协调器私有状态或遗留子进程。
+8. 人为制造一次 provider 或工具失败后，诊断命令能在不阅读源码的情况下给出精确失败 span、原因码、
+   原始证据和恢复点；
+9. 没有访问 Oracle、协调器私有状态或遗留子进程。
 
-## 二十、验收标准
+## 二十一、验收标准
 
 本设计的实现只有满足以下条件才可称为完成：
 
@@ -710,15 +1006,21 @@ not-started | verifying | passed | failed
 12. 协作完成、治理批准和最终交付是三个独立状态。
 13. 最终报告由事件自动汇总，不是角色重新撰写的主要审查对象。
 14. 确定性 CLI/RPC 回归、对抗测试和至少一次真实提供商探针全部通过。
-15. Git 只包含声明范围内的改动，详细中文提交直接进入单一 `main` 主线。
+15. 任意失败、阻断、停滞或异常退出都能从状态追到原因码、根因事件、运行 span 和原始产物。
+16. `status --explain`、`trace`、`doctor` 和事故包对同一故障给出一致的机械事实。
+17. 每个 trace 都能定位产品版本、Git commit、扩展版本、脱敏配置指纹和运行环境。
+18. 日志轮转、截断恢复和磁盘不足不会伪造成功或破坏审计账本。
+19. API Key、认证头、环境变量、私钥和隐藏思维链不会进入日志或诊断包。
+20. Git 只包含声明范围内的改动，详细中文提交直接进入单一 `main` 主线。
 
-## 二十一、最终设计结论
+## 二十二、最终设计结论
 
 Ansteel Team 的目标不是模拟三个 AI 轮流写报告，也不是把工程协作变成层层审批。它要形成一支没有
 面子竞争和职位防御、但能够对共同错误保持警惕的三 AI 工程团队。
 
 鞍钢宪法提供共同协议，持续协作总线提供即时交流，公开工作推理提供可审查对象，风险分级提供效率边界，
-哈希链事件账本提供可追溯历史，独立验证与最终交付状态提供末端安全网。
+哈希链事件账本提供可追溯历史，结构化日志和全链路追踪提供确定的运行因果，独立验证与最终交付状态提供
+末端安全网。
 
 第一阶段不引入区块链。采用中心化实时排序、追加式 SHA-256 哈希链、独立角色签名和周期性外部锚定，
 既符合当前单一协调器的信任边界，也为未来跨主机、跨组织的透明度日志或许可链保留升级路径。
