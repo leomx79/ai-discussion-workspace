@@ -35,7 +35,11 @@ export type AnsteelTeamEventType =
 	| "task-review"
 	| "milestone-planned"
 	| "milestone-submitted"
-	| "milestone-review";
+	| "milestone-review"
+	| "work-checkpoint"
+	| "process-issue"
+	| "process-resolution"
+	| "process-resolution-review";
 
 export type AnsteelTeamEventActor = AnsteelRole | "coordinator";
 
@@ -109,6 +113,31 @@ export interface AnsteelProcessIssue {
 	resolutions: AnsteelProcessResolution[];
 	createdAt: string;
 }
+
+export type AnsteelWorkCheckpointInput = Omit<AnsteelWorkCheckpoint, "actor" | "status" | "createdAt">;
+export type AnsteelProcessIssueInput = Omit<
+	AnsteelProcessIssue,
+	"author" | "targetRole" | "status" | "resolutions" | "createdAt"
+>;
+export type AnsteelProcessResolutionInput = Omit<
+	AnsteelProcessResolution,
+	"issueId" | "actor" | "createdAt" | "review"
+> & { issueId: string };
+export type AnsteelProcessResolutionReviewInput = Pick<
+	NonNullable<AnsteelProcessResolution["review"]>,
+	"verdict" | "reason"
+>;
+
+export type AnsteelTeamPublicEventPayload =
+	| { kind: "work-checkpoint"; checkpoint: AnsteelWorkCheckpoint }
+	| { kind: "process-issue"; issue: AnsteelProcessIssue }
+	| { kind: "process-resolution"; issueId: string; resolution: AnsteelProcessResolution }
+	| {
+			kind: "process-resolution-review";
+			issueId: string;
+			resolutionId: string;
+			review: NonNullable<AnsteelProcessResolution["review"]>;
+	  };
 
 export interface AnsteelTeamTask {
 	id: string;
@@ -233,6 +262,11 @@ export interface AnsteelTeamEventInput {
 	role: AnsteelTeamEventActor;
 	targetRole?: AnsteelRole;
 	challengeId?: string;
+	schemaVersion?: 1 | 2;
+	checkpointId?: string;
+	issueId?: string;
+	resolutionId?: string;
+	payload?: AnsteelTeamPublicEventPayload;
 	content: string;
 }
 
@@ -1728,6 +1762,77 @@ export function loadAnsteelTeamState(
 	}
 }
 
+function isAnsteelPublicCollaborationEventType(type: AnsteelTeamEventType): boolean {
+	return (
+		type === "work-checkpoint" ||
+		type === "process-issue" ||
+		type === "process-resolution" ||
+		type === "process-resolution-review"
+	);
+}
+
+function assertAnsteelTeamPublicEventEnvelope(event: AnsteelTeamEvent): void {
+	if (event.schemaVersion !== 2) {
+		throw new AnsteelTeamStateError("Ansteel team public collaboration events require schema version 2");
+	}
+	if (event.role === "coordinator") {
+		throw new AnsteelTeamStateError("Ansteel team public collaboration events require a role actor");
+	}
+	if (!isRecord(event.payload)) {
+		throw new AnsteelTeamStateError("Ansteel team public collaboration events require a structured payload");
+	}
+	if (event.type === "work-checkpoint") {
+		assertCheckpointId(event.checkpointId);
+		if (event.payload.kind !== "work-checkpoint" || !isRecord(event.payload.checkpoint)) {
+			throw new AnsteelTeamStateError("Ansteel team work-checkpoint event has an invalid payload");
+		}
+		if (event.payload.checkpoint.id !== event.checkpointId || event.payload.checkpoint.actor !== event.role) {
+			throw new AnsteelTeamStateError("Ansteel team work-checkpoint event identity does not match its payload");
+		}
+		return;
+	}
+	assertProcessIssueId(event.issueId);
+	if (event.type === "process-issue") {
+		if (event.payload.kind !== "process-issue" || !isRecord(event.payload.issue)) {
+			throw new AnsteelTeamStateError("Ansteel team process-issue event has an invalid payload");
+		}
+		if (
+			event.payload.issue.id !== event.issueId ||
+			event.payload.issue.author !== event.role ||
+			event.payload.issue.targetRole !== event.targetRole
+		) {
+			throw new AnsteelTeamStateError("Ansteel team process-issue event identity does not match its payload");
+		}
+		return;
+	}
+	assertProcessResolutionId(event.resolutionId);
+	if (event.type === "process-resolution") {
+		if (event.payload.kind !== "process-resolution" || !isRecord(event.payload.resolution)) {
+			throw new AnsteelTeamStateError("Ansteel team process-resolution event has an invalid payload");
+		}
+		if (
+			event.payload.issueId !== event.issueId ||
+			event.payload.resolution.id !== event.resolutionId ||
+			event.payload.resolution.issueId !== event.issueId ||
+			event.payload.resolution.actor !== event.role
+		) {
+			throw new AnsteelTeamStateError("Ansteel team process-resolution event identity does not match its payload");
+		}
+		return;
+	}
+	if (
+		event.payload.kind !== "process-resolution-review" ||
+		!isRecord(event.payload.review) ||
+		event.payload.issueId !== event.issueId ||
+		event.payload.resolutionId !== event.resolutionId ||
+		event.payload.review.reviewer !== event.role
+	) {
+		throw new AnsteelTeamStateError(
+			"Ansteel team process-resolution-review event identity does not match its payload",
+		);
+	}
+}
+
 function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "previousHash" | "hash"> {
 	if (!isRecord(value)) throw new AnsteelTeamStateError("Ansteel team event must be a JSON object");
 	const event = value as unknown as AnsteelTeamEvent;
@@ -1745,10 +1850,18 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "task-review" &&
 		event.type !== "milestone-planned" &&
 		event.type !== "milestone-submitted" &&
-		event.type !== "milestone-review"
+		event.type !== "milestone-review" &&
+		event.type !== "work-checkpoint" &&
+		event.type !== "process-issue" &&
+		event.type !== "process-resolution" &&
+		event.type !== "process-resolution-review"
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
 	}
+	if (event.schemaVersion !== undefined && event.schemaVersion !== 1 && event.schemaVersion !== 2) {
+		throw new AnsteelTeamStateError("Ansteel team event has an invalid schema version");
+	}
+	const isPublicCollaborationEvent = isAnsteelPublicCollaborationEventType(event.type);
 	if (event.role === "coordinator") {
 		if (event.type !== "task-assigned") {
 			throw new AnsteelTeamStateError("Ansteel team coordinator can only record task-assigned events");
@@ -1773,12 +1886,28 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		}
 		assertRole(event.targetRole, "assigned task owner");
 	}
+	if (isPublicCollaborationEvent) {
+		assertAnsteelTeamPublicEventEnvelope(event);
+	} else if (
+		event.schemaVersion === 2 ||
+		event.checkpointId !== undefined ||
+		event.issueId !== undefined ||
+		event.resolutionId !== undefined ||
+		event.payload !== undefined
+	) {
+		throw new AnsteelTeamStateError("Ansteel team schema version 2 is reserved for public collaboration events");
+	}
 	return {
 		sequence: event.sequence,
 		type: event.type,
 		role: event.role,
 		...(event.targetRole === undefined ? {} : { targetRole: event.targetRole }),
 		...(event.challengeId === undefined ? {} : { challengeId: event.challengeId }),
+		...(event.schemaVersion === undefined ? {} : { schemaVersion: event.schemaVersion }),
+		...(event.checkpointId === undefined ? {} : { checkpointId: event.checkpointId }),
+		...(event.issueId === undefined ? {} : { issueId: event.issueId }),
+		...(event.resolutionId === undefined ? {} : { resolutionId: event.resolutionId }),
+		...(event.payload === undefined ? {} : { payload: structuredClone(event.payload) }),
 		content: event.content,
 		createdAt: event.createdAt,
 	};
@@ -1795,6 +1924,28 @@ function parseAnsteelTeamEvent(value: unknown): AnsteelTeamEvent {
 }
 
 function hashAnsteelTeamEvent(event: Omit<AnsteelTeamEvent, "hash">): string {
+	if (event.schemaVersion === 2) {
+		return createHash("sha256")
+			.update(
+				JSON.stringify({
+					schemaVersion: event.schemaVersion,
+					sequence: event.sequence,
+					type: event.type,
+					role: event.role,
+					targetRole: event.targetRole ?? null,
+					challengeId: event.challengeId ?? null,
+					checkpointId: event.checkpointId ?? null,
+					issueId: event.issueId ?? null,
+					resolutionId: event.resolutionId ?? null,
+					payload: event.payload ?? null,
+					content: event.content,
+					createdAt: event.createdAt,
+					previousHash: event.previousHash,
+				}),
+				"utf8",
+			)
+			.digest("hex");
+	}
 	return createHash("sha256")
 		.update(
 			JSON.stringify({
@@ -1881,6 +2032,49 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 		}
 		challenge.status = "resolved";
 	}
+	if (event.schemaVersion !== 2 || event.payload === undefined) return;
+	const payload = event.payload;
+	if (payload.kind === "work-checkpoint") {
+		const checkpoint = structuredClone(payload.checkpoint);
+		if (checkpoint.supersedesCheckpointId !== undefined) {
+			const superseded = state.workCheckpoints.find((item) => item.id === checkpoint.supersedesCheckpointId);
+			if (!superseded) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team checkpoint ${checkpoint.id} supersedes unknown checkpoint ${checkpoint.supersedesCheckpointId}`,
+				);
+			}
+			superseded.status = "superseded";
+		}
+		state.workCheckpoints.push(checkpoint);
+		return;
+	}
+	if (payload.kind === "process-issue") {
+		state.processIssues.push(structuredClone(payload.issue));
+		return;
+	}
+	const issue = state.processIssues.find((item) => item.id === payload.issueId);
+	if (!issue) {
+		throw new AnsteelTeamStateError(`Ansteel team has no process issue ${payload.issueId}`);
+	}
+	if (payload.kind === "process-resolution") {
+		issue.resolutions.push(structuredClone(payload.resolution));
+		issue.status = payload.resolution.outcome === "SCOPE_ESCALATION" ? "escalated" : "resolution-proposed";
+		return;
+	}
+	const resolution = issue.resolutions.find((item) => item.id === payload.resolutionId);
+	if (!resolution) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team process issue ${issue.id} has no resolution ${payload.resolutionId}`,
+		);
+	}
+	resolution.review = structuredClone(payload.review);
+	if (resolution.review.verdict === "reject") {
+		issue.status = "open";
+	} else if (resolution.outcome === "SCOPE_ESCALATION") {
+		issue.status = "escalated";
+	} else {
+		issue.status = "closed";
+	}
 }
 
 export function appendAnsteelTeamEvent(
@@ -1902,6 +2096,9 @@ export function appendAnsteelTeamEvent(
 		...unsignedEvent,
 		hash: hashAnsteelTeamEvent(unsignedEvent),
 	});
+	const previewState = structuredClone(state);
+	applyAnsteelTeamEvent(previewState, event);
+	assertState(previewState);
 	applyAnsteelTeamEvent(state, event);
 	state.nextEventSequence = event.sequence + 1;
 	state.ledgerHeadHash = event.hash;
@@ -1930,4 +2127,233 @@ export function appendAnsteelTeamEvent(
 	saveAnsteelTeamState(cwd, state, persistence);
 	unlinkSync(getAnsteelTeamTransactionPath(cwd));
 	return event;
+}
+
+export function publishAnsteelWorkCheckpoint(
+	cwd: string,
+	state: AnsteelTeamState,
+	actor: AnsteelRole,
+	input: AnsteelWorkCheckpointInput,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelWorkCheckpoint {
+	assertRole(actor, "checkpoint actor");
+	if (state.workCheckpoints.some((checkpoint) => checkpoint.id === input.id)) {
+		throw new AnsteelTeamStateError(`Ansteel team checkpoint ${input.id} already exists`);
+	}
+	if (input.supersedesCheckpointId !== undefined) {
+		const superseded = state.workCheckpoints.find((checkpoint) => checkpoint.id === input.supersedesCheckpointId);
+		if (!superseded) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team checkpoint ${input.id} supersedes unknown checkpoint ${input.supersedesCheckpointId}`,
+			);
+		}
+		if (superseded.status !== "active") {
+			throw new AnsteelTeamStateError(`Ansteel team checkpoint ${input.id} must supersede an active checkpoint`);
+		}
+	}
+	const checkpoint: AnsteelWorkCheckpoint = {
+		...structuredClone(input),
+		actor,
+		status: "active",
+		createdAt: new Date().toISOString(),
+	};
+	appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: "work-checkpoint",
+			role: actor,
+			checkpointId: checkpoint.id,
+			content: `Published work checkpoint ${checkpoint.id}`,
+			payload: { kind: "work-checkpoint", checkpoint },
+		},
+		persistence,
+	);
+	return state.workCheckpoints.find((item) => item.id === checkpoint.id)!;
+}
+
+export function raiseAnsteelProcessIssue(
+	cwd: string,
+	state: AnsteelTeamState,
+	author: AnsteelRole,
+	input: AnsteelProcessIssueInput,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelProcessIssue {
+	assertRole(author, "process issue author");
+	if (state.processIssues.some((issue) => issue.id === input.id)) {
+		throw new AnsteelTeamStateError(`Ansteel team process issue ${input.id} already exists`);
+	}
+	const checkpoint = state.workCheckpoints.find((item) => item.id === input.targetCheckpointId);
+	if (!checkpoint) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team process issue ${input.id} references unknown checkpoint ${input.targetCheckpointId}`,
+		);
+	}
+	if (checkpoint.actor === author) {
+		throw new AnsteelTeamStateError("Ansteel team process issue author cannot challenge its own checkpoint");
+	}
+	const issue: AnsteelProcessIssue = {
+		...structuredClone(input),
+		author,
+		targetRole: checkpoint.actor,
+		status: "open",
+		resolutions: [],
+		createdAt: new Date().toISOString(),
+	};
+	appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: "process-issue",
+			role: author,
+			targetRole: checkpoint.actor,
+			checkpointId: checkpoint.id,
+			issueId: issue.id,
+			content: `Raised process issue ${issue.id} against ${checkpoint.id}`,
+			payload: { kind: "process-issue", issue },
+		},
+		persistence,
+	);
+	return state.processIssues.find((item) => item.id === issue.id)!;
+}
+
+export function resolveAnsteelProcessIssue(
+	cwd: string,
+	state: AnsteelTeamState,
+	actor: AnsteelRole,
+	input: AnsteelProcessResolutionInput,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelProcessResolution {
+	assertRole(actor, "process resolution actor");
+	const issue = state.processIssues.find((item) => item.id === input.issueId);
+	if (!issue) throw new AnsteelTeamStateError(`Ansteel team has no process issue ${input.issueId}`);
+	if (issue.targetRole !== actor) {
+		throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} must be resolved by ${issue.targetRole}`);
+	}
+	if (issue.status !== "open") {
+		throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} is not open for a new resolution`);
+	}
+	if (state.processIssues.some((item) => item.resolutions.some((resolution) => resolution.id === input.id))) {
+		throw new AnsteelTeamStateError(`Ansteel team process resolution ${input.id} already exists`);
+	}
+	const targetCheckpoint = state.workCheckpoints.find((item) => item.id === issue.targetCheckpointId)!;
+	if (input.outcome === "ACCEPTED") {
+		if (input.replacementCheckpointId === undefined) {
+			throw new AnsteelTeamStateError("Ansteel team ACCEPTED resolution requires a replacement checkpoint");
+		}
+		const replacement = state.workCheckpoints.find((item) => item.id === input.replacementCheckpointId);
+		if (!replacement) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team ACCEPTED resolution references unknown replacement checkpoint ${input.replacementCheckpointId}`,
+			);
+		}
+		if (
+			replacement.actor !== actor ||
+			replacement.supersedesCheckpointId !== targetCheckpoint.id ||
+			replacement.taskId !== targetCheckpoint.taskId
+		) {
+			throw new AnsteelTeamStateError(
+				"Ansteel team ACCEPTED resolution must use a same-role checkpoint that directly supersedes the target and keeps its task",
+			);
+		}
+	}
+	if (input.outcome === "REFUTED") {
+		const existingEvidence = new Set([
+			...targetCheckpoint.evidenceRefs,
+			...issue.evidenceRefs,
+			...issue.resolutions.flatMap((resolution) => resolution.evidenceRefs),
+		]);
+		if (input.evidenceRefs.length === 0 || input.evidenceRefs.every((reference) => existingEvidence.has(reference))) {
+			throw new AnsteelTeamStateError("Ansteel team REFUTED resolution requires new evidence");
+		}
+	}
+	if (
+		input.outcome === "EXPERIMENT_REQUIRED" &&
+		(typeof input.experiment !== "string" || input.experiment.trim().length === 0)
+	) {
+		throw new AnsteelTeamStateError("Ansteel team EXPERIMENT_REQUIRED resolution requires a minimal experiment");
+	}
+	const resolution: AnsteelProcessResolution = {
+		...structuredClone(input),
+		actor,
+		createdAt: new Date().toISOString(),
+	};
+	appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: "process-resolution",
+			role: actor,
+			checkpointId: targetCheckpoint.id,
+			issueId: issue.id,
+			resolutionId: resolution.id,
+			content: `Proposed ${resolution.outcome} resolution ${resolution.id} for ${issue.id}`,
+			payload: { kind: "process-resolution", issueId: issue.id, resolution },
+		},
+		persistence,
+	);
+	return state.processIssues
+		.find((item) => item.id === issue.id)!
+		.resolutions.find((item) => item.id === resolution.id)!;
+}
+
+export function reviewAnsteelProcessResolution(
+	cwd: string,
+	state: AnsteelTeamState,
+	reviewer: AnsteelRole,
+	issueId: string,
+	input: AnsteelProcessResolutionReviewInput,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelProcessIssue {
+	assertRole(reviewer, "process resolution reviewer");
+	const issue = state.processIssues.find((item) => item.id === issueId);
+	if (!issue) throw new AnsteelTeamStateError(`Ansteel team has no process issue ${issueId}`);
+	if (issue.author !== reviewer) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team process issue ${issue.id} can only be reviewed by its issue author`,
+		);
+	}
+	if (issue.status !== "resolution-proposed") {
+		throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} has no proposed resolution to review`);
+	}
+	const resolution = [...issue.resolutions].reverse().find((item) => item.review === undefined);
+	if (!resolution) {
+		throw new AnsteelTeamStateError(`Ansteel team process issue ${issue.id} has no unreviewed resolution`);
+	}
+	if (resolution.review !== undefined) {
+		throw new AnsteelTeamStateError(`Ansteel team process resolution ${resolution.id} has already been reviewed`);
+	}
+	if (typeof input.reason !== "string" || input.reason.trim().length === 0) {
+		throw new AnsteelTeamStateError("Ansteel team process resolution review requires a reason");
+	}
+	const review: NonNullable<AnsteelProcessResolution["review"]> = {
+		reviewer,
+		verdict: input.verdict,
+		reason: input.reason.trim(),
+		reviewedAt: new Date().toISOString(),
+	};
+	appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: "process-resolution-review",
+			role: reviewer,
+			checkpointId: issue.targetCheckpointId,
+			issueId: issue.id,
+			resolutionId: resolution.id,
+			content: `Reviewed process resolution ${resolution.id}: ${review.verdict}`,
+			payload: {
+				kind: "process-resolution-review",
+				issueId: issue.id,
+				resolutionId: resolution.id,
+				review,
+			},
+		},
+		persistence,
+	);
+	return state.processIssues.find((item) => item.id === issue.id)!;
 }

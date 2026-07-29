@@ -15,7 +15,11 @@ import {
 	getAnsteelTeamWriteBlockReason,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
+	publishAnsteelWorkCheckpoint,
+	raiseAnsteelProcessIssue,
 	recordAnsteelTeamTaskTestResult,
+	resolveAnsteelProcessIssue,
+	reviewAnsteelProcessResolution,
 	reviewAnsteelTeamMilestone,
 	reviewAnsteelTeamTask,
 	runAnsteelTeamMilestoneTest,
@@ -131,6 +135,320 @@ afterEach(() => {
 });
 
 describe("public collaboration state", () => {
+	it("requires the issue author to verify a checkpoint correction", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpointInput = {
+			id: "CP-LEASE-0001",
+			goal: "Prevent lease timestamp overflow",
+			currentUnderstanding: "The sum must remain a safe integer",
+			assumptions: ["clock and leaseMs are non-negative safe integers"],
+			evidenceRefs: ["file:src/lease.ts:10"],
+			uncertainties: ["Callers near MAX_SAFE_INTEGER"],
+			nextAction: { kind: "edit", target: "src/lease.ts", expectedResult: "Overflow is rejected" },
+			risk: "yellow",
+			confidence: "L2",
+		} as const;
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", checkpointInput);
+		raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-LEASE-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "Valid inputs can still produce an unsafe sum",
+			evidenceRefs: ["test:lease-overflow"],
+			suggestedCorrection: "Validate the calculated expiry",
+		});
+		publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			...checkpointInput,
+			id: "CP-LEASE-0002",
+			currentUnderstanding: "The calculated expiry must also be a safe integer",
+			evidenceRefs: ["test:lease-overflow"],
+			supersedesCheckpointId: "CP-LEASE-0001",
+		});
+		resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+			id: "PR-LEASE-0001",
+			issueId: "PI-LEASE-0001",
+			outcome: "ACCEPTED",
+			summary: "Validate expiry before persistence",
+			evidenceRefs: ["diff:sha256:abc"],
+			replacementCheckpointId: "CP-LEASE-0002",
+		});
+
+		expect(() =>
+			reviewAnsteelProcessResolution(cwd, state, "tech-lead", "PI-LEASE-0001", {
+				verdict: "accept",
+				reason: "Looks good",
+			}),
+		).toThrow("issue author");
+
+		reviewAnsteelProcessResolution(cwd, state, "qa-engineer", "PI-LEASE-0001", {
+			verdict: "accept",
+			reason: "The replacement checkpoint includes the overflow test",
+		});
+		expect(state.processIssues[0].status).toBe("closed");
+	});
+
+	it("keeps state and ledger unchanged when a role challenges its own checkpoint", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-SELF-0001",
+			goal: "Inspect the parser boundary",
+			currentUnderstanding: "The boundary needs a regression",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts:10"],
+			uncertainties: [],
+			nextAction: { kind: "test", target: "test/parser.test.ts", expectedResult: "Boundary is covered" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const before = structuredClone(state);
+		const eventCount = listAnsteelTeamEvents(cwd).length;
+
+		expect(() =>
+			raiseAnsteelProcessIssue(cwd, state, "staff-engineer", {
+				id: "PI-SELF-0001",
+				targetCheckpointId: checkpoint.id,
+				severity: "blocking",
+				claim: "The checkpoint is incomplete",
+				evidenceRefs: ["test:self-review"],
+				suggestedCorrection: "Ask a peer to review it",
+			}),
+		).toThrow("own checkpoint");
+		expect(state).toEqual(before);
+		expect(listAnsteelTeamEvents(cwd)).toHaveLength(eventCount);
+	});
+
+	it("rejects invalid resolution actors and outcomes without partial mutation", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-INVALID-0001",
+			goal: "Validate lease expiry",
+			currentUnderstanding: "Calculated expiry needs validation",
+			assumptions: [],
+			evidenceRefs: ["file:src/lease.ts:10"],
+			uncertainties: [],
+			nextAction: { kind: "test", target: "test/lease.test.ts", expectedResult: "Overflow is rejected" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const issue = raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-INVALID-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "The overflow case is missing",
+			evidenceRefs: ["test:lease-overflow"],
+			suggestedCorrection: "Add the overflow regression",
+		});
+
+		for (const attempt of [
+			() =>
+				resolveAnsteelProcessIssue(cwd, state, "tech-lead", {
+					id: "PR-INVALID-ROLE",
+					issueId: issue.id,
+					outcome: "EXPERIMENT_REQUIRED",
+					summary: "Run the overflow test",
+					evidenceRefs: [],
+					experiment: "Execute the boundary regression",
+				}),
+			() =>
+				resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+					id: "PR-INVALID-ACCEPT",
+					issueId: issue.id,
+					outcome: "ACCEPTED",
+					summary: "Accept without a replacement",
+					evidenceRefs: ["diff:sha256:missing"],
+				}),
+			() =>
+				resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+					id: "PR-INVALID-REFUTE",
+					issueId: issue.id,
+					outcome: "REFUTED",
+					summary: "Repeat the existing evidence",
+					evidenceRefs: ["test:lease-overflow"],
+				}),
+		]) {
+			const before = structuredClone(state);
+			const eventCount = listAnsteelTeamEvents(cwd).length;
+			expect(attempt).toThrow();
+			expect(state).toEqual(before);
+			expect(listAnsteelTeamEvents(cwd)).toHaveLength(eventCount);
+		}
+	});
+
+	it("rejects duplicate issue and resolution IDs", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-DUPLICATE-0001",
+			goal: "Validate duplicate handling",
+			currentUnderstanding: "Public IDs must be globally unique",
+			assumptions: [],
+			evidenceRefs: [],
+			uncertainties: [],
+			nextAction: { kind: "test", target: "test/ids.test.ts", expectedResult: "Duplicates are rejected" },
+			risk: "green",
+			confidence: "L1",
+		});
+		const issue = raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-DUPLICATE-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "advisory",
+			claim: "Duplicate IDs need a regression",
+			evidenceRefs: ["test:duplicate-ids"],
+			suggestedCorrection: "Add the regression",
+		});
+
+		expect(() =>
+			raiseAnsteelProcessIssue(cwd, state, "tech-lead", {
+				id: issue.id,
+				targetCheckpointId: checkpoint.id,
+				severity: "advisory",
+				claim: "Reuse the issue ID",
+				evidenceRefs: ["test:duplicate-issue"],
+				suggestedCorrection: "Reject it",
+			}),
+		).toThrow("already exists");
+
+		resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+			id: "PR-DUPLICATE-0001",
+			issueId: issue.id,
+			outcome: "EXPERIMENT_REQUIRED",
+			summary: "Run a duplicate-ID test",
+			evidenceRefs: [],
+			experiment: "Run the public ID regression",
+		});
+		reviewAnsteelProcessResolution(cwd, state, "qa-engineer", issue.id, {
+			verdict: "reject",
+			reason: "The test output is still missing",
+		});
+		expect(() =>
+			resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+				id: "PR-DUPLICATE-0001",
+				issueId: issue.id,
+				outcome: "REFUTED",
+				summary: "Try to reuse the resolution ID",
+				evidenceRefs: ["test:duplicate-result"],
+			}),
+		).toThrow("already exists");
+	});
+
+	it("records a rejected correction followed by a new accepted resolution as v2 events", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RETRY-0001",
+			goal: "Prevent unsafe lease expiry",
+			currentUnderstanding: "The calculated expiry is not validated",
+			assumptions: [],
+			evidenceRefs: ["file:src/lease.ts:10"],
+			uncertainties: ["The exact boundary"],
+			nextAction: { kind: "experiment", target: "test/lease.test.ts", expectedResult: "Boundary is known" },
+			risk: "yellow",
+			confidence: "L3",
+		});
+		const issue = raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-RETRY-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "No executable boundary evidence is present",
+			evidenceRefs: ["test:lease-boundary"],
+			suggestedCorrection: "Run and record the boundary regression",
+		});
+		resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+			id: "PR-RETRY-0001",
+			issueId: issue.id,
+			outcome: "EXPERIMENT_REQUIRED",
+			summary: "Run the boundary regression",
+			evidenceRefs: [],
+			experiment: "Execute test/lease.test.ts at MAX_SAFE_INTEGER",
+		});
+		reviewAnsteelProcessResolution(cwd, state, "qa-engineer", issue.id, {
+			verdict: "reject",
+			reason: "The executable test result is still missing",
+		});
+		expect(state.processIssues[0].status).toBe("open");
+
+		const replacement = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RETRY-0002",
+			goal: checkpoint.goal,
+			currentUnderstanding: "The calculated expiry must remain a safe integer",
+			assumptions: [],
+			evidenceRefs: ["test:lease-boundary:passed"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/lease.ts", expectedResult: "Unsafe expiry is rejected" },
+			risk: "yellow",
+			confidence: "L1",
+			supersedesCheckpointId: checkpoint.id,
+		});
+		resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+			id: "PR-RETRY-0002",
+			issueId: issue.id,
+			outcome: "ACCEPTED",
+			summary: "Validate calculated expiry before persistence",
+			evidenceRefs: ["test:lease-boundary:passed"],
+			replacementCheckpointId: replacement.id,
+		});
+		reviewAnsteelProcessResolution(cwd, state, "qa-engineer", issue.id, {
+			verdict: "accept",
+			reason: "The replacement checkpoint carries the passing boundary evidence",
+		});
+
+		expect(state.processIssues[0].status).toBe("closed");
+		const events = listAnsteelTeamEvents(cwd);
+		expect(events.map((event) => event.type)).toEqual([
+			"work-checkpoint",
+			"process-issue",
+			"process-resolution",
+			"process-resolution-review",
+			"work-checkpoint",
+			"process-resolution",
+			"process-resolution-review",
+		]);
+		expect(events.every((event) => event.schemaVersion === 2 && event.payload !== undefined)).toBe(true);
+	});
+
+	it("enters escalation directly and rejects a modified v2 event history", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-ESCALATE-0001",
+			goal: "Decide whether the public API may change",
+			currentUnderstanding: "The fix requires a scope decision",
+			assumptions: [],
+			evidenceRefs: ["file:src/api.ts:10"],
+			uncertainties: ["Compatibility policy"],
+			nextAction: { kind: "decision", target: "API scope", expectedResult: "Scope owner decides" },
+			risk: "red",
+			confidence: "L2",
+		});
+		const issue = raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-ESCALATE-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "critical",
+			claim: "The proposed edit changes the public API",
+			evidenceRefs: ["diff:public-api"],
+			suggestedCorrection: "Escalate the scope decision",
+		});
+		resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+			id: "PR-ESCALATE-0001",
+			issueId: issue.id,
+			outcome: "SCOPE_ESCALATION",
+			summary: "The API owner must decide the compatibility policy",
+			evidenceRefs: ["diff:public-api"],
+		});
+		expect(state.processIssues[0].status).toBe("escalated");
+
+		const path = getAnsteelTeamEventPath(cwd);
+		const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+		const first = JSON.parse(lines[0]) as Record<string, unknown>;
+		first.content = "Modified historical checkpoint";
+		lines[0] = JSON.stringify(first);
+		writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
+		expect(() => listAnsteelTeamEvents(cwd)).toThrow("hash mismatch");
+	});
+
 	it("migrates v6 teams to empty public collaboration state without changing existing state", () => {
 		const cwd = createTemporaryProject();
 		const state = createTeam(cwd);
