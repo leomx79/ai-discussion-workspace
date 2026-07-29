@@ -1287,7 +1287,7 @@ export class AgentSession {
 				event: "command",
 				error: err instanceof Error ? err.message : String(err),
 			});
-			return true;
+			throw err;
 		}
 	}
 

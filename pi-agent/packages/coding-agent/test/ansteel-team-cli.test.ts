@@ -336,6 +336,17 @@ describe("Ansteel team CLI", () => {
 			)?.name;
 			expect(teamCommand).toBeDefined();
 
+			const invalidDiagnosis = await rpc.send({
+				id: "invalid-diagnosis",
+				type: "prompt",
+				message: `/${teamCommand} status --unsupported`,
+			});
+			expect(invalidDiagnosis).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("Usage: /ansteel-team status [--explain]"),
+			});
+
 			const start = await rpc.send({
 				id: "start",
 				type: "prompt",

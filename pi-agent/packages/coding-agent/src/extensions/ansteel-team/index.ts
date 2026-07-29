@@ -9,8 +9,8 @@ import {
 	type AnsteelConfig,
 	type AnsteelRole,
 	type AnsteelRoleConfig,
-	createAnsteelReviewToolPolicy,
 	createAnsteelRawTurnSession,
+	createAnsteelReviewToolPolicy,
 	DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
 	loadAnsteelConfig,
 } from "../../core/ansteel-discussion.ts";
@@ -19,6 +19,7 @@ import {
 	type AnsteelTeamMilestone,
 	type AnsteelTeamMilestoneReview,
 	type AnsteelTeamMilestoneSubmission,
+	type AnsteelTeamPersistenceContext,
 	type AnsteelTeamState,
 	type AnsteelTeamTask,
 	type AnsteelTeamTaskReview,
@@ -40,6 +41,19 @@ import {
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
 } from "../../core/ansteel-team.ts";
+import {
+	AnsteelObservabilityError,
+	type AnsteelRuntimeLogger,
+	type AnsteelRuntimeReasonCode,
+	type AnsteelRuntimeSpan,
+	createAnsteelRunContext,
+	createAnsteelRuntimeLogger,
+	createAnsteelTeamIncidentBundle,
+	diagnoseAnsteelTeamRun,
+	formatAnsteelTeamDiagnosis,
+	listAnsteelRuntimeRuns,
+	traceAnsteelTeamRuntime,
+} from "../../core/ansteel-team-observability.ts";
 import {
 	defineTool,
 	type ExtensionAPI,
@@ -129,6 +143,37 @@ interface CoordinatorTaskInput {
 	description: string;
 	acceptanceCriteria: string;
 	dependsOn: string[];
+}
+
+interface ActiveAnsteelObservation {
+	logger: AnsteelRuntimeLogger;
+	root: AnsteelRuntimeSpan;
+}
+
+function classifyAnsteelRuntimeError(error: unknown): AnsteelRuntimeReasonCode {
+	if (error instanceof AnsteelObservabilityError) return error.reasonCode;
+	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+	if (message.includes("timeout") || message.includes("timed out")) return "provider-timeout";
+	if (message.includes("empty-public-update") || message.includes("empty public")) {
+		return "provider-empty-public-output";
+	}
+	if (message.includes("rate limit") || message.includes("too many requests")) return "provider-rate-limited";
+	if (message.includes("authentication") || message.includes("unauthorized") || message.includes("api key")) {
+		return "provider-authentication-failed";
+	}
+	return "unclassified-runtime-error";
+}
+
+function formatAnsteelRuntimeTrace(entries: ReturnType<typeof traceAnsteelTeamRuntime>): string {
+	if (entries.length === 0) return "No Ansteel runtime trace entries matched the selector.";
+	return entries
+		.map(
+			(entry) =>
+				`[${entry.sequence}] ${entry.timestampUtc} ${entry.eventName} ${entry.outcome}${
+					entry.reasonCode === undefined ? "" : ` (${entry.reasonCode})`
+				}`,
+		)
+		.join("\n");
 }
 
 async function promptAnsteelTeamRole(
@@ -707,6 +752,153 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 	const resolveRoleModel = dependencies.resolveRoleModel ?? resolveConfiguredRole;
 	const createRoleSession = dependencies.createRoleSession;
 	const activeTeams = new Map<string, ActiveAnsteelTeam>();
+	const activeObservations = new Map<string, ActiveAnsteelObservation>();
+
+	const getPersistenceContext = (cwd: string): AnsteelTeamPersistenceContext | undefined => {
+		const observation = activeObservations.get(cwd);
+		return observation === undefined ? undefined : { logger: observation.logger };
+	};
+
+	const runObservedCommand = async <T>(
+		cwd: string,
+		teamId: string,
+		command: string,
+		action: (logger: AnsteelRuntimeLogger, root: AnsteelRuntimeSpan) => Promise<T>,
+	): Promise<T> => {
+		if (activeObservations.has(cwd)) {
+			throw new Error("Ansteel team already has an observed command running for this project");
+		}
+		const context = createAnsteelRunContext({ teamId, command });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const root = logger.startSpan("run.started", {
+			role: "coordinator",
+			message: `Ansteel team command started: ${command}`,
+			data: { command },
+		});
+		const observation = { logger, root };
+		activeObservations.set(cwd, observation);
+		try {
+			const result = await action(logger, root);
+			root.end({
+				outcome: "succeeded",
+				message: `Ansteel team command completed: ${command}`,
+				data: { command },
+			});
+			return result;
+		} catch (error) {
+			const reasonCode = classifyAnsteelRuntimeError(error);
+			root.end({
+				outcome: "failed",
+				reasonCode,
+				message: error instanceof Error ? error.message : String(error),
+				data: { command },
+				artifacts:
+					error instanceof Error && error.stack ? [{ kind: "exception-stack", content: error.stack }] : undefined,
+			});
+			throw error;
+		} finally {
+			try {
+				await logger.forceFlush();
+			} finally {
+				logger.close();
+				if (activeObservations.get(cwd) === observation) activeObservations.delete(cwd);
+			}
+		}
+	};
+
+	const promptObservedRole = async (
+		cwd: string,
+		role: AnsteelRole,
+		session: AnsteelTeamRoleSession,
+		prompt: string,
+		stageTimeoutMs: number,
+		fields: { taskId?: string; checkpointId?: string } = {},
+	): Promise<string> => {
+		const observation = activeObservations.get(cwd);
+		if (!observation) return await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+		const roleSpan = observation.logger.startSpan("role.session", {
+			role,
+			parent: observation.root,
+			...fields,
+			message: `${role} session stage started`,
+		});
+		const providerSpan = observation.logger.startSpan("provider.request", {
+			role,
+			parent: roleSpan,
+			...fields,
+			message: `${role} provider request started`,
+		});
+		try {
+			const response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+			if (response.trim().length === 0) {
+				throw new AnsteelObservabilityError(
+					"provider-empty-public-output",
+					"Ansteel role stage failed: empty-public-update",
+				);
+			}
+			providerSpan.end({
+				outcome: "succeeded",
+				message: `${role} provider request completed`,
+				data: { outputLength: response.length },
+			});
+			roleSpan.end({
+				outcome: "succeeded",
+				message: `${role} session stage completed`,
+				data: { outputLength: response.length },
+			});
+			return response;
+		} catch (error) {
+			const reasonCode = classifyAnsteelRuntimeError(error);
+			const message = error instanceof Error ? error.message : String(error);
+			const artifacts =
+				error instanceof Error && error.stack ? [{ kind: "exception-stack", content: error.stack }] : undefined;
+			providerSpan.end({ outcome: "failed", reasonCode, message, data: {}, artifacts });
+			roleSpan.end({ outcome: "failed", reasonCode, message, data: {} });
+			throw error;
+		}
+	};
+
+	const runObservedOperation = async <T>(
+		cwd: string,
+		eventName: string,
+		fields: {
+			role?: AnsteelRole | "coordinator";
+			taskId?: string;
+			checkpointId?: string;
+			toolCallId?: string;
+			parent?: AnsteelRuntimeSpan;
+			data?: Record<string, unknown>;
+		},
+		action: () => T | Promise<T>,
+	): Promise<T> => {
+		const observation = activeObservations.get(cwd);
+		if (!observation) return await action();
+		const span = observation.logger.startSpan(eventName, {
+			role: fields.role ?? "coordinator",
+			parent: fields.parent ?? observation.root,
+			...(fields.taskId === undefined ? {} : { taskId: fields.taskId }),
+			...(fields.checkpointId === undefined ? {} : { checkpointId: fields.checkpointId }),
+			...(fields.toolCallId === undefined ? {} : { toolCallId: fields.toolCallId }),
+			message: `${eventName} started`,
+			data: fields.data ?? {},
+		});
+		try {
+			const result = await action();
+			span.end({ outcome: "succeeded", message: `${eventName} completed`, data: fields.data ?? {} });
+			return result;
+		} catch (error) {
+			const reasonCode = classifyAnsteelRuntimeError(error);
+			span.end({
+				outcome: "failed",
+				reasonCode,
+				message: error instanceof Error ? error.message : String(error),
+				data: fields.data ?? {},
+				artifacts:
+					error instanceof Error && error.stack ? [{ kind: "exception-stack", content: error.stack }] : undefined,
+			});
+			throw error;
+		}
+	};
 
 	return (pi: ExtensionAPI) => {
 		pi.on("tool_call", (event, ctx) => {
@@ -766,12 +958,17 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			content: string,
 			targetRole?: AnsteelRole,
 		): void => {
-			const event = appendAnsteelTeamEvent(ctx.cwd, state, {
-				type,
-				role,
-				content,
-				...(targetRole === undefined ? {} : { targetRole }),
-			});
+			const event = appendAnsteelTeamEvent(
+				ctx.cwd,
+				state,
+				{
+					type,
+					role,
+					content,
+					...(targetRole === undefined ? {} : { targetRole }),
+				},
+				getPersistenceContext(ctx.cwd),
+			);
 			emitTimelineMessage(pi, `## ${type} [${event.sequence}]\n\n${content}`);
 		};
 
@@ -791,30 +988,43 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
 					activeTeam.state.roles[reviewer].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 					try {
-						const response = await promptAnsteelTeamRole(
+						const response = await promptObservedRole(
+							ctx.cwd,
+							reviewer,
 							session,
 							buildTaskReviewPrompt(reviewer, task, submission),
 							activeTeam.stageTimeoutMs,
+							{ taskId: task.id },
 						);
 						activeTeam.state.roles[reviewer].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state);
-						const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-							type: "role-report",
-							role: reviewer,
-							content: response.trim() || "The reviewer returned no public update.",
-						});
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{
+								type: "role-report",
+								role: reviewer,
+								content: response.trim(),
+							},
+							getPersistenceContext(ctx.cwd),
+						);
 						emitTimelineMessage(pi, `## ${reviewer} task review [${event.sequence}]\n\n${event.content}`);
 					} catch (error) {
 						activeTeam.state.roles[reviewer].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 						const content = error instanceof Error ? error.message : String(error);
-						const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-							type: "role-failure",
-							role: reviewer,
-							content,
-						});
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{
+								type: "role-failure",
+								role: reviewer,
+								content,
+							},
+							getPersistenceContext(ctx.cwd),
+						);
 						emitTimelineMessage(pi, `## ${reviewer} task review failure [${event.sequence}]\n\n${content}`);
 					}
 				}),
@@ -833,30 +1043,43 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
 					activeTeam.state.roles[reviewer].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 					try {
-						const response = await promptAnsteelTeamRole(
+						const response = await promptObservedRole(
+							ctx.cwd,
+							reviewer,
 							session,
 							buildMilestoneReviewPrompt(reviewer, milestone, submission),
 							activeTeam.stageTimeoutMs,
+							{ checkpointId: milestone.id },
 						);
 						activeTeam.state.roles[reviewer].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state);
-						const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-							type: "role-report",
-							role: reviewer,
-							content: response.trim() || "The integration reviewer returned no public update.",
-						});
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{
+								type: "role-report",
+								role: reviewer,
+								content: response.trim(),
+							},
+							getPersistenceContext(ctx.cwd),
+						);
 						emitTimelineMessage(pi, `## ${reviewer} integration review [${event.sequence}]\n\n${event.content}`);
 					} catch (error) {
 						activeTeam.state.roles[reviewer].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 						const content = error instanceof Error ? error.message : String(error);
-						const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-							type: "role-failure",
-							role: reviewer,
-							content,
-						});
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{
+								type: "role-failure",
+								role: reviewer,
+								content,
+							},
+							getPersistenceContext(ctx.cwd),
+						);
 						emitTimelineMessage(
 							pi,
 							`## ${reviewer} integration review failure [${event.sequence}]\n\n${content}`,
@@ -874,90 +1097,182 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		): AnsteelTeamTaskOperations => ({
 			state: activeTeam.state,
 			claimTask: async (input) => {
-				const task = claimAnsteelTeamTask(ctx.cwd, activeTeam.state, { ...input, owner: role }, allowedTaskOwners);
-				publishTaskEvent(
-					ctx,
-					activeTeam.state,
-					"task-claimed",
-					role,
-					`${task.id} claimed by ${role}\n\nStatus: ${task.status}\n\nDependencies: ${
-						task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
-					}\n\nFiles: ${task.files.join(", ")}\n\nAcceptance: ${task.acceptanceCriteria}`,
-				);
-				return task;
+				return await runObservedOperation(ctx.cwd, "task.claim", { role, taskId: input.id }, async () => {
+					const task = claimAnsteelTeamTask(
+						ctx.cwd,
+						activeTeam.state,
+						{ ...input, owner: role },
+						allowedTaskOwners,
+					);
+					publishTaskEvent(
+						ctx,
+						activeTeam.state,
+						"task-claimed",
+						role,
+						`${task.id} claimed by ${role}\n\nStatus: ${task.status}\n\nDependencies: ${
+							task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
+						}\n\nFiles: ${task.files.join(", ")}\n\nAcceptance: ${task.acceptanceCriteria}`,
+					);
+					return task;
+				});
 			},
 			submitTask: async (taskId, testCommand) => {
-				const test = runAnsteelTeamTaskTest(ctx.cwd, activeTeam.state, role, taskId, testCommand);
-				if (test.isError) {
-					throw new Error(`Ansteel team task ${taskId} test command failed: ${testCommand}`);
-				}
-				const submission = submitAnsteelTeamTask(ctx.cwd, activeTeam.state, role, taskId, test.command);
-				const task = activeTeam.state.tasks.find((item) => item.id === taskId);
-				if (!task) throw new Error(`Ansteel team task ${taskId} disappeared after submission`);
-				publishTaskEvent(
-					ctx,
-					activeTeam.state,
-					"task-submitted",
-					role,
-					`${task.id} revision ${submission.revision} submitted by ${role}\n\nTest: ${submission.test.command}\n\nDiff bytes: ${submission.diff.length}`,
-				);
-				await requestPeerReviews(activeTeam, ctx, task, submission);
-				return submission;
+				return await runObservedOperation(ctx.cwd, "task.submit", { role, taskId }, async () => {
+					const test = await runObservedOperation(
+						ctx.cwd,
+						"tool.call",
+						{
+							role,
+							taskId,
+							toolCallId: `task-test:${taskId}:${Date.now()}`,
+							data: { command: testCommand },
+						},
+						() => {
+							const evidence = runAnsteelTeamTaskTest(ctx.cwd, activeTeam.state, role, taskId, testCommand);
+							if (evidence.isError) {
+								const reasonCode = /timed?\s*out|timeout/i.test(evidence.output)
+									? "tool-timeout"
+									: "tool-exit-nonzero";
+								throw new AnsteelObservabilityError(
+									reasonCode,
+									`Ansteel team task ${taskId} test command failed: ${testCommand}`,
+								);
+							}
+							return evidence;
+						},
+					);
+					const submission = submitAnsteelTeamTask(ctx.cwd, activeTeam.state, role, taskId, test.command);
+					const task = activeTeam.state.tasks.find((item) => item.id === taskId);
+					if (!task) throw new Error(`Ansteel team task ${taskId} disappeared after submission`);
+					publishTaskEvent(
+						ctx,
+						activeTeam.state,
+						"task-submitted",
+						role,
+						`${task.id} revision ${submission.revision} submitted by ${role}\n\nTest: ${submission.test.command}\n\nDiff bytes: ${submission.diff.length}`,
+					);
+					await requestPeerReviews(activeTeam, ctx, task, submission);
+					return submission;
+				});
 			},
 			reviewTask: async (taskId, input) => {
-				const review = reviewAnsteelTeamTask(ctx.cwd, activeTeam.state, role, taskId, input);
-				publishTaskEvent(
-					ctx,
-					activeTeam.state,
-					"task-review",
-					role,
-					`${taskId} revision ${review.revision}: ${review.verdict.toUpperCase()}${
-						review.issue === undefined ? "" : `\n\nISSUE: ${review.issue}`
-					}`,
+				return await runObservedOperation(
+					ctx.cwd,
+					"task.review",
+					{ role, taskId, data: { verdict: input.verdict } },
+					async () => {
+						const review = reviewAnsteelTeamTask(ctx.cwd, activeTeam.state, role, taskId, input);
+						publishTaskEvent(
+							ctx,
+							activeTeam.state,
+							"task-review",
+							role,
+							`${taskId} revision ${review.revision}: ${review.verdict.toUpperCase()}${
+								review.issue === undefined ? "" : `\n\nISSUE: ${review.issue}`
+							}`,
+						);
+						return review;
+					},
 				);
-				return review;
 			},
 			createMilestone: async (input) => {
-				if (role !== "tech-lead") throw new Error("Only Ansteel team tech-lead can plan an integration milestone");
-				const milestone = createAnsteelTeamMilestone(ctx.cwd, activeTeam.state, input);
-				publishTaskEvent(
-					ctx,
-					activeTeam.state,
-					"milestone-planned",
-					role,
-					`${milestone.id} planned\n\nStatus: ${milestone.status}\n\nTasks: ${milestone.taskIds.join(", ")}`,
+				return await runObservedOperation(
+					ctx.cwd,
+					"milestone.create",
+					{ role, checkpointId: input.id },
+					async () => {
+						if (role !== "tech-lead") {
+							throw new Error("Only Ansteel team tech-lead can plan an integration milestone");
+						}
+						const milestone = createAnsteelTeamMilestone(ctx.cwd, activeTeam.state, input);
+						publishTaskEvent(
+							ctx,
+							activeTeam.state,
+							"milestone-planned",
+							role,
+							`${milestone.id} planned\n\nStatus: ${milestone.status}\n\nTasks: ${milestone.taskIds.join(", ")}`,
+						);
+						return milestone;
+					},
 				);
-				return milestone;
 			},
 			submitMilestone: async (milestoneId, testCommand) => {
-				const test = runAnsteelTeamMilestoneTest(ctx.cwd, activeTeam.state, role, milestoneId, testCommand);
-				if (test.isError)
-					throw new Error(`Ansteel team milestone ${milestoneId} integration command failed: ${testCommand}`);
-				const submission = submitAnsteelTeamMilestone(ctx.cwd, activeTeam.state, role, milestoneId, test.command);
-				const milestone = activeTeam.state.milestones.find((item) => item.id === milestoneId);
-				if (!milestone) throw new Error(`Ansteel team milestone ${milestoneId} disappeared after submission`);
-				publishTaskEvent(
-					ctx,
-					activeTeam.state,
-					"milestone-submitted",
-					role,
-					`${milestone.id} integration revision ${submission.revision} submitted\n\nTest: ${submission.test.command}`,
+				return await runObservedOperation(
+					ctx.cwd,
+					"milestone.submit",
+					{ role, checkpointId: milestoneId },
+					async () => {
+						const test = await runObservedOperation(
+							ctx.cwd,
+							"tool.call",
+							{
+								role,
+								checkpointId: milestoneId,
+								toolCallId: `milestone-test:${milestoneId}:${Date.now()}`,
+								data: { command: testCommand },
+							},
+							() => {
+								const evidence = runAnsteelTeamMilestoneTest(
+									ctx.cwd,
+									activeTeam.state,
+									role,
+									milestoneId,
+									testCommand,
+								);
+								if (evidence.isError) {
+									const reasonCode = /timed?\s*out|timeout/i.test(evidence.output)
+										? "tool-timeout"
+										: "tool-exit-nonzero";
+									throw new AnsteelObservabilityError(
+										reasonCode,
+										`Ansteel team milestone ${milestoneId} integration command failed: ${testCommand}`,
+									);
+								}
+								return evidence;
+							},
+						);
+						const submission = submitAnsteelTeamMilestone(
+							ctx.cwd,
+							activeTeam.state,
+							role,
+							milestoneId,
+							test.command,
+						);
+						const milestone = activeTeam.state.milestones.find((item) => item.id === milestoneId);
+						if (!milestone) {
+							throw new Error(`Ansteel team milestone ${milestoneId} disappeared after submission`);
+						}
+						publishTaskEvent(
+							ctx,
+							activeTeam.state,
+							"milestone-submitted",
+							role,
+							`${milestone.id} integration revision ${submission.revision} submitted\n\nTest: ${submission.test.command}`,
+						);
+						await requestMilestoneReviews(activeTeam, ctx, milestone, submission);
+						return submission;
+					},
 				);
-				await requestMilestoneReviews(activeTeam, ctx, milestone, submission);
-				return submission;
 			},
 			reviewMilestone: async (milestoneId, input) => {
-				const review = reviewAnsteelTeamMilestone(ctx.cwd, activeTeam.state, role, milestoneId, input);
-				publishTaskEvent(
-					ctx,
-					activeTeam.state,
-					"milestone-review",
-					role,
-					`${milestoneId} integration revision ${review.revision}: ${review.verdict.toUpperCase()}${
-						review.issue === undefined ? "" : `\n\nISSUE: ${review.issue}`
-					}`,
+				return await runObservedOperation(
+					ctx.cwd,
+					"milestone.review",
+					{ role, checkpointId: milestoneId, data: { verdict: input.verdict } },
+					async () => {
+						const review = reviewAnsteelTeamMilestone(ctx.cwd, activeTeam.state, role, milestoneId, input);
+						publishTaskEvent(
+							ctx,
+							activeTeam.state,
+							"milestone-review",
+							role,
+							`${milestoneId} integration revision ${review.revision}: ${review.verdict.toUpperCase()}${
+								review.issue === undefined ? "" : `\n\nISSUE: ${review.issue}`
+							}`,
+						);
+						return review;
+					},
 				);
-				return review;
 			},
 		});
 
@@ -998,33 +1313,43 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				if (!session) throw new Error(`Ansteel team ${task.owner} session is not active`);
 				const before = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
 				activeTeam.state.roles[task.owner].status = "working";
-				saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+				saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 				try {
-					const response = await promptAnsteelTeamRole(
+					const response = await promptObservedRole(
+						ctx.cwd,
+						task.owner,
 						session,
 						buildTaskOwnerPrompt(task, epoch, activeTeam.maxToolCallsPerStage),
 						activeTeam.stageTimeoutMs,
+						{ taskId: task.id },
 					);
-					if (response.trim().length === 0) {
-						throw new Error("Ansteel role stage failed: empty-public-update");
-					}
 					activeTeam.state.roles[task.owner].status = "idle";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
-					const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-						type: "role-report",
-						role: task.owner,
-						content: response.trim(),
-					});
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{
+							type: "role-report",
+							role: task.owner,
+							content: response.trim(),
+						},
+						getPersistenceContext(ctx.cwd),
+					);
 					emitTimelineMessage(pi, `## ${task.owner} task epoch ${epoch} [${event.sequence}]\n\n${event.content}`);
 				} catch (error) {
 					activeTeam.state.roles[task.owner].status = "failed";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 					const content = error instanceof Error ? error.message : String(error);
-					const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-						type: "role-failure",
-						role: task.owner,
-						content,
-					});
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{
+							type: "role-failure",
+							role: task.owner,
+							content,
+						},
+						getPersistenceContext(ctx.cwd),
+					);
 					emitTimelineMessage(
 						pi,
 						`## ${task.owner} task epoch ${epoch} failure [${event.sequence}]\n\n${content}`,
@@ -1041,12 +1366,17 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				}
 				if (noProgressEpochs >= activeTeam.taskMaxNoProgressEpochs) {
 					activeTeam.state.roles[task.owner].status = "failed";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
-					const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-						type: "role-failure",
-						role: task.owner,
-						content: `Ansteel team task ${task.id} stopped: owner-no-progress after ${noProgressEpochs} consecutive epochs`,
-					});
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{
+							type: "role-failure",
+							role: task.owner,
+							content: `Ansteel team task ${task.id} stopped: owner-no-progress after ${noProgressEpochs} consecutive epochs`,
+						},
+						getPersistenceContext(ctx.cwd),
+					);
 					emitTimelineMessage(pi, `## ${task.owner} task stopped [${event.sequence}]\n\n${event.content}`);
 					return;
 				}
@@ -1055,12 +1385,17 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			const task = activeTeam.state.tasks.find((item) => item.id === taskId);
 			if (!task || task.status === "approved") return;
 			activeTeam.state.roles[task.owner].status = "failed";
-			saveAnsteelTeamState(ctx.cwd, activeTeam.state);
-			const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-				type: "role-failure",
-				role: task.owner,
-				content: `Ansteel team task ${task.id} stopped: task-epoch-limit ${activeTeam.taskMaxEpochs}`,
-			});
+			saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+			const event = appendAnsteelTeamEvent(
+				ctx.cwd,
+				activeTeam.state,
+				{
+					type: "role-failure",
+					role: task.owner,
+					content: `Ansteel team task ${task.id} stopped: task-epoch-limit ${activeTeam.taskMaxEpochs}`,
+				},
+				getPersistenceContext(ctx.cwd),
+			);
 			emitTimelineMessage(pi, `## ${task.owner} task stopped [${event.sequence}]\n\n${event.content}`);
 		};
 
@@ -1071,37 +1406,56 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			phase: "investigation" | "cross-examination" | "collaboration",
 		): Promise<void> => {
 			const ledger = phase === "investigation" ? undefined : formatPublicLedger(ctx.cwd);
+			let firstFailure: unknown;
+			let hasFailure = false;
 			for (const role of ANSTEEL_ROLES) {
 				const session = activeTeam.sessions.get(role);
 				if (!session) throw new Error(`Ansteel team ${role} session is not active`);
 				activeTeam.state.roles[role].status = "working";
-				saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+				saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 				try {
-					const response = await promptAnsteelTeamRole(
+					const response = await promptObservedRole(
+						ctx.cwd,
+						role,
 						session,
 						buildRolePrompt(role, work, ledger, phase),
 						activeTeam.stageTimeoutMs,
 					);
 					activeTeam.state.roles[role].status = "idle";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
-					const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-						type: "role-report",
-						role,
-						content: response.trim() || "The role returned no public update.",
-					});
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{
+							type: "role-report",
+							role,
+							content: response.trim(),
+						},
+						getPersistenceContext(ctx.cwd),
+					);
 					emitTimelineMessage(pi, `## ${role} public update [${event.sequence}]\n\n${event.content}`);
 				} catch (error) {
+					if (!hasFailure) {
+						firstFailure = error;
+						hasFailure = true;
+					}
 					activeTeam.state.roles[role].status = "failed";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state);
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 					const content = error instanceof Error ? error.message : String(error);
-					const event = appendAnsteelTeamEvent(ctx.cwd, activeTeam.state, {
-						type: "role-failure",
-						role,
-						content,
-					});
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{
+							type: "role-failure",
+							role,
+							content,
+						},
+						getPersistenceContext(ctx.cwd),
+					);
 					emitTimelineMessage(pi, `## ${role} failure [${event.sequence}]\n\n${content}`);
 				}
 			}
+			if (hasFailure) throw firstFailure;
 		};
 
 		const startTeam = async (topic: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -1113,7 +1467,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						"Ansteel team is already active for another topic. Stop it before starting a new topic.",
 					);
 				}
-				emitTimelineMessage(pi, formatStatus(existingActive.state));
+				await runObservedCommand(ctx.cwd, existingActive.state.id, `start ${topic}`, async () => {
+					emitTimelineMessage(pi, formatStatus(existingActive.state));
+				});
 				return;
 			}
 			const config = loadConfig(ctx.cwd);
@@ -1151,63 +1507,70 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			if (!hasSameTaskOwnerPolicy(state.taskOwners, configuredTaskOwners)) {
 				throw new Error("Persisted Ansteel team task-owner policy differs from the current configuration");
 			}
-			const recoveredRoles = ANSTEEL_ROLES.filter((role) => state.roles[role].status === "working");
-			for (const role of recoveredRoles) state.roles[role].status = "failed";
-			state.status = "active";
-			saveAnsteelTeamState(ctx.cwd, state);
-			for (const role of recoveredRoles) {
-				const event = appendAnsteelTeamEvent(ctx.cwd, state, {
-					type: "role-failure",
-					role,
-					content:
-						"Ansteel team role was recovered from an interrupted host while its prior stage was still working.",
-				});
-				emitTimelineMessage(pi, `## ${role} recovery failure [${event.sequence}]\n\n${event.content}`);
-			}
-			const sessions = new Map<AnsteelRole, AnsteelTeamRoleSession>();
-			const activeTeam: ActiveAnsteelTeam = {
-				state,
-				sessions,
-				stageTimeoutMs,
-				maxToolCallsPerStage,
-				taskMaxEpochs,
-				taskMaxNoProgressEpochs,
-			};
-			try {
-				for (const role of ANSTEEL_ROLES) {
-					sessions.set(
-						role,
-						await (
-							createRoleSession ??
-							((options) => createDefaultRoleSession(options, ctx.modelRegistry.getRuntime()))
-						)({
+			await runObservedCommand(ctx.cwd, state.id, `start ${topic}`, async () => {
+				const recoveredRoles = ANSTEEL_ROLES.filter((role) => state.roles[role].status === "working");
+				for (const role of recoveredRoles) state.roles[role].status = "failed";
+				state.status = "active";
+				saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
+				for (const role of recoveredRoles) {
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						state,
+						{
+							type: "role-failure",
 							role,
-							cwd: ctx.cwd,
-							sessionFile: state.roles[role].sessionFile,
-							resolvedRole: resolvedRoles[role],
-							allowedTaskOwners: state.taskOwners,
-							maxToolCallsPerStage,
-							taskOperations: createTaskOperations(activeTeam, ctx, role, state.taskOwners),
-						}),
+							content:
+								"Ansteel team role was recovered from an interrupted host while its prior stage was still working.",
+						},
+						getPersistenceContext(ctx.cwd),
+					);
+					emitTimelineMessage(pi, `## ${role} recovery failure [${event.sequence}]\n\n${event.content}`);
+				}
+				const sessions = new Map<AnsteelRole, AnsteelTeamRoleSession>();
+				const activeTeam: ActiveAnsteelTeam = {
+					state,
+					sessions,
+					stageTimeoutMs,
+					maxToolCallsPerStage,
+					taskMaxEpochs,
+					taskMaxNoProgressEpochs,
+				};
+				try {
+					for (const role of ANSTEEL_ROLES) {
+						sessions.set(
+							role,
+							await (
+								createRoleSession ??
+								((options) => createDefaultRoleSession(options, ctx.modelRegistry.getRuntime()))
+							)({
+								role,
+								cwd: ctx.cwd,
+								sessionFile: state.roles[role].sessionFile,
+								resolvedRole: resolvedRoles[role],
+								allowedTaskOwners: state.taskOwners,
+								maxToolCallsPerStage,
+								taskOperations: createTaskOperations(activeTeam, ctx, role, state.taskOwners),
+							}),
+						);
+					}
+				} catch (error) {
+					await disposeSessions(sessions);
+					state.status = "stopped";
+					saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
+					throw error;
+				}
+				activeTeams.set(ctx.cwd, activeTeam);
+				emitTimelineMessage(pi, `Ansteel team started.\n\n${formatStatus(state)}`);
+				if (!existing) {
+					await runRound(activeTeam, ctx, topic, "investigation");
+					await runRound(
+						activeTeam,
+						ctx,
+						"Review every peer's public update for this work item.",
+						"cross-examination",
 					);
 				}
-			} catch (error) {
-				await disposeSessions(sessions);
-				state.status = "stopped";
-				saveAnsteelTeamState(ctx.cwd, state);
-				throw error;
-			}
-			activeTeams.set(ctx.cwd, activeTeam);
-			emitTimelineMessage(pi, `Ansteel team started.\n\n${formatStatus(state)}`);
-			if (!existing) {
-				await runRound(activeTeam, ctx, topic, "investigation");
-				await runRound(
-					activeTeam,
-					ctx,
-					"Review every peer's public update for this work item.",
-					"cross-examination",
-				);
-			}
+			});
 		};
 
 		pi.registerCommand("ansteel-team", {
@@ -1224,44 +1587,134 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						if (argument.length === 0) throw new Error("Usage: /ansteel-team ask <message>");
 						const activeTeam = activeTeams.get(ctx.cwd);
 						if (!activeTeam) throw new Error("Ansteel team is not active. Start a team first.");
-						await runRound(activeTeam, ctx, argument, "collaboration");
+						await runObservedCommand(ctx.cwd, activeTeam.state.id, `ask ${argument}`, async () => {
+							await runRound(activeTeam, ctx, argument, "collaboration");
+						});
 						return;
 					}
 					if (command === "task") {
 						if (argument.length === 0) throw new Error("Usage: /ansteel-team task <JSON|TASK-ID>");
 						const activeTeam = activeTeams.get(ctx.cwd);
 						if (!activeTeam) throw new Error("Ansteel team is not active. Start a team first.");
-						const parsed = parseCoordinatorTaskArgument(argument);
-						let task: AnsteelTeamTask;
-						if (parsed.kind === "create") {
-							task = claimAnsteelTeamTask(ctx.cwd, activeTeam.state, parsed.input, activeTeam.state.taskOwners);
-							publishTaskEvent(
-								ctx,
-								activeTeam.state,
-								"task-assigned",
-								"coordinator",
-								`${task.id} assigned to ${task.owner}\n\nStatus: ${task.status}\n\nDependencies: ${
-									task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
-								}\n\nFiles: ${task.files.join(", ")}\n\nAcceptance: ${task.acceptanceCriteria}`,
-								task.owner,
-							);
-						} else {
-							const existingTask = activeTeam.state.tasks.find((item) => item.id === parsed.taskId);
-							if (!existingTask) throw new Error(`Ansteel team task ${parsed.taskId} does not exist`);
-							if (existingTask.status === "approved") {
-								throw new Error(`Ansteel team task ${parsed.taskId} is already approved`);
+						await runObservedCommand(ctx.cwd, activeTeam.state.id, `task ${argument}`, async () => {
+							const parsed = parseCoordinatorTaskArgument(argument);
+							let task: AnsteelTeamTask;
+							if (parsed.kind === "create") {
+								task = await runObservedOperation(
+									ctx.cwd,
+									"task.claim",
+									{ role: "coordinator", taskId: parsed.input.id },
+									() =>
+										claimAnsteelTeamTask(
+											ctx.cwd,
+											activeTeam.state,
+											parsed.input,
+											activeTeam.state.taskOwners,
+										),
+								);
+								publishTaskEvent(
+									ctx,
+									activeTeam.state,
+									"task-assigned",
+									"coordinator",
+									`${task.id} assigned to ${task.owner}\n\nStatus: ${task.status}\n\nDependencies: ${
+										task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
+									}\n\nFiles: ${task.files.join(", ")}\n\nAcceptance: ${task.acceptanceCriteria}`,
+									task.owner,
+								);
+							} else {
+								const existingTask = activeTeam.state.tasks.find((item) => item.id === parsed.taskId);
+								if (!existingTask) throw new Error(`Ansteel team task ${parsed.taskId} does not exist`);
+								if (existingTask.status === "approved") {
+									throw new Error(`Ansteel team task ${parsed.taskId} is already approved`);
+								}
+								task = existingTask;
 							}
-							task = existingTask;
-						}
-						await runTaskEpochs(activeTeam, ctx, task.id);
+							await runTaskEpochs(activeTeam, ctx, task.id);
+						});
 						return;
 					}
 					if (command === "status") {
 						const activeTeam = activeTeams.get(ctx.cwd);
 						const state = activeTeam?.state ?? loadAnsteelTeamState(ctx.cwd);
-						emitTimelineMessage(
-							pi,
-							state ? formatStatus(state) : "No Ansteel team state exists for this project.",
+						const teamId = state?.id ?? "ansteel-team-uninitialized";
+						await runObservedCommand(
+							ctx.cwd,
+							teamId,
+							`status${argument ? ` ${argument}` : ""}`,
+							async (logger) => {
+								const status = state ? formatStatus(state) : "No Ansteel team state exists for this project.";
+								if (argument.length === 0) {
+									emitTimelineMessage(pi, status);
+									return;
+								}
+								if (argument !== "--explain") throw new Error("Usage: /ansteel-team status [--explain]");
+								const latest = listAnsteelRuntimeRuns(ctx.cwd)
+									.filter((run) => run.runId !== logger.context.runId)
+									.at(-1);
+								const explanation =
+									latest === undefined
+										? "No completed Ansteel runtime run exists to explain."
+										: formatAnsteelTeamDiagnosis(diagnoseAnsteelTeamRun(ctx.cwd, latest.runId));
+								emitTimelineMessage(pi, `${status}\n\nRuntime diagnosis:\n${explanation}`);
+							},
+						);
+						return;
+					}
+					if (command === "trace") {
+						if (argument.length === 0) throw new Error("Usage: /ansteel-team trace <selector>");
+						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						await runObservedCommand(
+							ctx.cwd,
+							state?.id ?? "ansteel-team-uninitialized",
+							`trace ${argument}`,
+							async () => {
+								emitTimelineMessage(pi, formatAnsteelRuntimeTrace(traceAnsteelTeamRuntime(ctx.cwd, argument)));
+							},
+						);
+						return;
+					}
+					if (command === "doctor") {
+						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						await runObservedCommand(
+							ctx.cwd,
+							state?.id ?? "ansteel-team-uninitialized",
+							`doctor${argument ? ` ${argument}` : ""}`,
+							async (logger) => {
+								const runId =
+									argument ||
+									listAnsteelRuntimeRuns(ctx.cwd)
+										.filter((run) => run.runId !== logger.context.runId)
+										.at(-1)?.runId;
+								if (!runId) throw new Error("No completed Ansteel runtime run exists to diagnose.");
+								const diagnosis = diagnoseAnsteelTeamRun(ctx.cwd, runId);
+								emitTimelineMessage(pi, formatAnsteelTeamDiagnosis(diagnosis));
+								if (!diagnosis.healthy) {
+									throw new AnsteelObservabilityError(
+										diagnosis.rootCause?.reasonCode ??
+											diagnosis.issues[0]?.reasonCode ??
+											"unclassified-runtime-error",
+										`Ansteel runtime run ${runId} is unhealthy`,
+									);
+								}
+							},
+						);
+						return;
+					}
+					if (command === "incident") {
+						if (argument.length === 0) throw new Error("Usage: /ansteel-team incident <runId>");
+						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						await runObservedCommand(
+							ctx.cwd,
+							state?.id ?? "ansteel-team-uninitialized",
+							`incident ${argument}`,
+							async () => {
+								const bundle = createAnsteelTeamIncidentBundle(ctx.cwd, argument);
+								emitTimelineMessage(
+									pi,
+									`Incident bundle: ${bundle.storageId}\nSHA-256: ${bundle.sha256}\nRun: ${bundle.manifest.runId}`,
+								);
+							},
 						);
 						return;
 					}
@@ -1269,23 +1722,26 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						const activeTeam = activeTeams.get(ctx.cwd);
 						const state = activeTeam?.state ?? loadAnsteelTeamState(ctx.cwd);
 						if (!state) throw new Error("No Ansteel team state exists for this project.");
-						if (activeTeam) {
-							await disposeSessions(activeTeam.sessions);
-							activeTeams.delete(ctx.cwd);
-						}
-						state.status = "stopped";
-						for (const role of ANSTEEL_ROLES) state.roles[role].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, state);
-						emitTimelineMessage(
-							pi,
-							"Ansteel team stopped. Its state and role sessions remain available for resume.",
-						);
+						await runObservedCommand(ctx.cwd, state.id, "stop", async () => {
+							if (activeTeam) {
+								await disposeSessions(activeTeam.sessions);
+								activeTeams.delete(ctx.cwd);
+							}
+							state.status = "stopped";
+							for (const role of ANSTEEL_ROLES) state.roles[role].status = "idle";
+							saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
+							emitTimelineMessage(
+								pi,
+								"Ansteel team stopped. Its state and role sessions remain available for resume.",
+							);
+						});
 						return;
 					}
-					throw new Error("Usage: /ansteel-team <start|ask|task|status|stop> [argument]");
+					throw new Error("Usage: /ansteel-team <start|ask|task|status|trace|doctor|incident|stop> [argument]");
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					emitTimelineMessage(pi, `Ansteel team command failed: ${message}`);
+					throw error;
 				}
 			},
 		});

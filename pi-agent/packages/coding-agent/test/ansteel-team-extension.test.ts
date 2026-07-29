@@ -1,10 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnsteelConfig } from "../src/core/ansteel-discussion.ts";
 import { listAnsteelTeamEvents, loadAnsteelTeamState } from "../src/core/ansteel-team.ts";
+import {
+	diagnoseAnsteelTeamRun,
+	listAnsteelRuntimeRuns,
+	readAnsteelRuntimeLogs,
+} from "../src/core/ansteel-team-observability.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -146,7 +151,9 @@ describe("Ansteel team extension", () => {
 				expect.stringContaining("cannot access coordinator state"),
 			);
 		}
-		expect(getAnsteelTeamEvidenceBlockReason("/workspace/project", "read", { path: "src/parser.ts" })).toBeUndefined();
+		expect(
+			getAnsteelTeamEvidenceBlockReason("/workspace/project", "read", { path: "src/parser.ts" }),
+		).toBeUndefined();
 		expect(
 			getAnsteelTeamEvidenceBlockReason("/workspace/project", "read", { path: ".pi/ansteel.json" }),
 		).toBeUndefined();
@@ -199,7 +206,7 @@ describe("Ansteel team extension", () => {
 		const command = commands.get("ansteel-team");
 		if (!command) throw new Error("Missing ansteel-team command");
 
-		await command("start Review the parser", ctx);
+		await expect(command("start Review the parser", ctx)).rejects.toThrow("exceeded configured timeout of 1ms");
 
 		const staff = roleSessions.find((entry) => entry.role === "staff-engineer");
 		if (!staff) throw new Error("Missing Staff Engineer session");
@@ -208,6 +215,80 @@ describe("Ansteel team extension", () => {
 			expect.objectContaining({ content: expect.stringContaining("exceeded configured timeout of 1ms") }),
 			{ triggerTurn: false },
 		);
+	});
+
+	it("explains a failed role run from persisted trace evidence", async () => {
+		const harness = setup(createConfig(), async (role) => {
+			if (role === "staff-engineer") throw new Error("provider request timeout");
+			return `## Public Update\n\n${role} completed its investigation.`;
+		});
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+
+		await expect(command("start Review the parser", harness.ctx)).rejects.toThrow("provider request timeout");
+		const capturedRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(capturedRun).toBeDefined();
+		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, capturedRun!.runId).rootCause).toMatchObject({
+			reasonCode: "provider-timeout",
+		});
+
+		await command("status --explain", harness.ctx);
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				content: expect.stringMatching(new RegExp(`${capturedRun!.runId}.*provider-timeout`, "s")),
+			}),
+			{ triggerTurn: false },
+		);
+
+		await command(`trace ${capturedRun!.runId}`, harness.ctx);
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("provider.request") }),
+			{ triggerTurn: false },
+		);
+	});
+
+	it("correlates role reports and durable state updates in the command trace", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command("ask Inspect the parser state", harness.ctx);
+
+		const run = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(run).toBeDefined();
+		const entries = readAnsteelRuntimeLogs(harness.ctx.cwd, run!.runId);
+		expect(entries.map((entry) => entry.eventName)).toEqual(
+			expect.arrayContaining(["role.session", "provider.request", "state.persisted", "event.appended"]),
+		);
+		expect(entries.every((entry) => entry.traceId === run!.traceId)).toBe(true);
+	});
+
+	it("diagnoses an unhealthy run and creates a content-addressed incident bundle", async () => {
+		const harness = setup(createConfig(), async (role) => {
+			if (role === "qa-engineer") throw new Error("provider request timeout");
+			return `## Public Update\n\n${role} completed its investigation.`;
+		});
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await expect(command("start Review the parser", harness.ctx)).rejects.toThrow("provider request timeout");
+		const failedRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(failedRun).toBeDefined();
+
+		await expect(command(`doctor ${failedRun!.runId}`, harness.ctx)).rejects.toThrow("is unhealthy");
+		expect(harness.sendMessage).toHaveBeenCalledWith(
+			expect.objectContaining({
+				content: expect.stringMatching(new RegExp(`${failedRun!.runId}.*provider-timeout`, "s")),
+			}),
+			{ triggerTurn: false },
+		);
+
+		await command(`incident ${failedRun!.runId}`, harness.ctx);
+		const incidentDirectory = join(harness.ctx.cwd, ".pi", "ansteel-team", "incidents");
+		expect(existsSync(incidentDirectory)).toBe(true);
+		expect(readdirSync(incidentDirectory)).toEqual([
+			expect.stringMatching(new RegExp(`^incident-${failedRun!.runId}-[0-9a-f]{64}\\.json$`)),
+		]);
 	});
 
 	it("records a stale working role before recovering an interrupted persisted team", async () => {
@@ -260,7 +341,7 @@ describe("Ansteel team extension", () => {
 		await command("start Review the parser", ctx);
 		await command("stop", ctx);
 		config.teamTaskOwners = ["staff-engineer", "tech-lead"];
-		await command("start Review the parser", ctx);
+		await expect(command("start Review the parser", ctx)).rejects.toThrow("task-owner policy differs");
 
 		expect(sendMessage).toHaveBeenLastCalledWith(
 			expect.objectContaining({ content: expect.stringContaining("task-owner policy differs") }),
@@ -449,6 +530,15 @@ describe("Ansteel team extension", () => {
 				expect.objectContaining({ type: "task-review", role: "qa-engineer" }),
 			]),
 		);
+		const taskRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(taskRun).toBeDefined();
+		const operationEntries = readAnsteelRuntimeLogs(harness.ctx.cwd, taskRun!.runId);
+		expect(operationEntries.map((entry) => entry.eventName)).toEqual(
+			expect.arrayContaining(["task.claim", "tool.call", "task.submit", "task.review"]),
+		);
+		expect(
+			operationEntries.find((entry) => entry.eventName === "tool.call" && entry.outcome === "succeeded"),
+		).toMatchObject({ taskId: "TASK-1", outcome: "succeeded" });
 	});
 
 	it("stops a coordinator task after the configured consecutive no-progress epochs", async () => {
@@ -565,12 +655,14 @@ describe("Ansteel team extension", () => {
 		if (!command) throw new Error("Missing ansteel-team command");
 		await command("start Review the parser", harness.ctx);
 
-		await command("task {bad-json", harness.ctx);
-		await command(
-			'task {"id":"TASK-TL","owner":"tech-lead","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
-			harness.ctx,
-		);
-		await command("task TASK-UNKNOWN", harness.ctx);
+		await expect(command("task {bad-json", harness.ctx)).rejects.toThrow("Usage:");
+		await expect(
+			command(
+				'task {"id":"TASK-TL","owner":"tech-lead","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
+				harness.ctx,
+			),
+		).rejects.toThrow("not authorized");
+		await expect(command("task TASK-UNKNOWN", harness.ctx)).rejects.toThrow("does not exist");
 		expect(ownerEpochs).toBe(0);
 		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toHaveLength(0);
 
@@ -579,7 +671,7 @@ describe("Ansteel team extension", () => {
 			harness.ctx,
 		);
 		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ status: "approved" });
-		await command("task TASK-OK", harness.ctx);
+		await expect(command("task TASK-OK", harness.ctx)).rejects.toThrow("already approved");
 
 		expect(ownerEpochs).toBe(1);
 		expect(harness.sendMessage).toHaveBeenLastCalledWith(
