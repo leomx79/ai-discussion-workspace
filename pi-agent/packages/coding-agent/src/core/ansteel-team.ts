@@ -1,9 +1,20 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import { ANSTEEL_ROLES, type AnsteelRole, DEFAULT_ANSTEEL_TEAM_TASK_OWNERS } from "./ansteel-discussion.ts";
+import type { AnsteelRuntimeLogger } from "./ansteel-team-observability.ts";
 
 const ANSTEEL_TEAM_STATE_VERSION = 6;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
@@ -170,6 +181,11 @@ export interface AnsteelTeamEvent extends AnsteelTeamEventInput {
 	createdAt: string;
 	previousHash: string | null;
 	hash: string;
+}
+
+export interface AnsteelTeamPersistenceContext {
+	logger: AnsteelRuntimeLogger;
+	causeEventId?: string;
 }
 
 export class AnsteelTeamStateError extends Error {
@@ -1137,12 +1153,50 @@ export function reviewAnsteelTeamTask(
 	return review;
 }
 
-function writeAnsteelTeamState(path: string, state: AnsteelTeamState): void {
+function writeBuffer(fd: number, content: Buffer): void {
+	let offset = 0;
+	while (offset < content.length) offset += writeSync(fd, content, offset, content.length - offset);
+}
+
+function writeDurableTemporaryFile(path: string, content: string): void {
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	const fd = openSync(temporaryPath, "w");
+	try {
+		writeBuffer(fd, Buffer.from(content, "utf8"));
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(temporaryPath, path);
+}
+
+function appendDurableLine(path: string, line: string): void {
+	const fd = openSync(path, "a");
+	try {
+		writeBuffer(fd, Buffer.from(line, "utf8"));
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function writeAnsteelTeamState(
+	path: string,
+	state: AnsteelTeamState,
+	persistence?: AnsteelTeamPersistenceContext,
+): void {
 	const directory = getAnsteelTeamDirectoryFromStatePath(path);
 	mkdirSync(directory, { recursive: true });
-	const temporaryPath = `${path}.${process.pid}.tmp`;
-	writeFileSync(temporaryPath, `${JSON.stringify(state, null, "\t")}\n`, "utf8");
-	renameSync(temporaryPath, path);
+	writeDurableTemporaryFile(path, `${JSON.stringify(state, null, "\t")}\n`);
+	persistence?.logger.write({
+		level: "audit",
+		eventName: "state.persisted",
+		outcome: "succeeded",
+		role: "coordinator",
+		...(persistence.causeEventId === undefined ? {} : { causeEventId: persistence.causeEventId }),
+		message: "Ansteel team state persisted",
+		data: { status: state.status, version: state.version, nextEventSequence: state.nextEventSequence },
+	});
 }
 
 interface AnsteelTeamPendingTransaction {
@@ -1150,15 +1204,26 @@ interface AnsteelTeamPendingTransaction {
 	event: AnsteelTeamEvent;
 }
 
-function writeAnsteelTeamPendingTransaction(cwd: string, transaction: AnsteelTeamPendingTransaction): void {
+function writeAnsteelTeamPendingTransaction(
+	cwd: string,
+	transaction: AnsteelTeamPendingTransaction,
+	persistence?: AnsteelTeamPersistenceContext,
+): void {
 	const path = getAnsteelTeamTransactionPath(cwd);
 	mkdirSync(getAnsteelTeamDirectory(cwd), { recursive: true });
-	const temporaryPath = `${path}.${process.pid}.tmp`;
-	writeFileSync(temporaryPath, `${JSON.stringify(transaction)}\n`, "utf8");
-	renameSync(temporaryPath, path);
+	writeDurableTemporaryFile(path, `${JSON.stringify(transaction)}\n`);
+	persistence?.logger.write({
+		level: "audit",
+		eventName: "transaction.persisted",
+		outcome: "succeeded",
+		role: "coordinator",
+		...(persistence.causeEventId === undefined ? {} : { causeEventId: persistence.causeEventId }),
+		message: "Ansteel team pending transaction persisted",
+		data: { eventSequence: transaction.event.sequence },
+	});
 }
 
-function recoverAnsteelTeamPendingTransaction(cwd: string): void {
+function recoverAnsteelTeamPendingTransaction(cwd: string, persistence?: AnsteelTeamPersistenceContext): void {
 	const path = getAnsteelTeamTransactionPath(cwd);
 	if (!existsSync(path)) return;
 	let raw: unknown;
@@ -1178,9 +1243,25 @@ function recoverAnsteelTeamPendingTransaction(cwd: string): void {
 		if (event.sequence !== events.length + 1 || event.previousHash !== (last?.hash ?? null)) {
 			throw new AnsteelTeamStateError("Ansteel team transaction does not continue the event ledger");
 		}
-		appendFileSync(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`, "utf8");
+		appendDurableLine(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`);
+		persistence?.logger.write({
+			level: "audit",
+			eventName: "event.appended",
+			outcome: "succeeded",
+			role: "coordinator",
+			message: "Recovered Ansteel team event appended",
+			data: { eventSequence: event.sequence, recovered: true },
+		});
+		persistence?.logger.write({
+			level: "audit",
+			eventName: "event.fsync.completed",
+			outcome: "succeeded",
+			role: "coordinator",
+			message: "Recovered Ansteel team event fsync completed",
+			data: { eventSequence: event.sequence, recovered: true },
+		});
 	}
-	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state);
+	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state, persistence);
 	unlinkSync(path);
 }
 
@@ -1188,11 +1269,15 @@ function getAnsteelTeamDirectoryFromStatePath(path: string): string {
 	return resolvePath(join(path, ".."));
 }
 
-export function saveAnsteelTeamState(cwd: string, state: AnsteelTeamState): void {
+export function saveAnsteelTeamState(
+	cwd: string,
+	state: AnsteelTeamState,
+	persistence?: AnsteelTeamPersistenceContext,
+): void {
 	assertProjectDirectory(cwd);
 	assertState(state);
 	assertAnsteelTeamEventLedger(cwd, state);
-	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state);
+	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state, persistence);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1232,19 +1317,32 @@ function requiresLegacyEventLedgerMigration(value: unknown): boolean {
 	return isRecord(value) && (value.version === 1 || value.version === 2);
 }
 
-function writeAnsteelTeamEventLedger(cwd: string, events: readonly AnsteelTeamEvent[]): void {
+function writeAnsteelTeamEventLedger(
+	cwd: string,
+	events: readonly AnsteelTeamEvent[],
+	persistence?: AnsteelTeamPersistenceContext,
+): void {
 	const path = getAnsteelTeamEventPath(cwd);
 	mkdirSync(getAnsteelTeamDirectory(cwd), { recursive: true });
-	const temporaryPath = `${path}.${process.pid}.tmp`;
-	writeFileSync(
-		temporaryPath,
+	writeDurableTemporaryFile(
+		path,
 		`${events.map((event) => JSON.stringify(event)).join("\n")}${events.length === 0 ? "" : "\n"}`,
-		"utf8",
 	);
-	renameSync(temporaryPath, path);
+	persistence?.logger.write({
+		level: "audit",
+		eventName: "event.ledger.rewritten",
+		outcome: "succeeded",
+		role: "coordinator",
+		message: "Ansteel team event ledger rewritten",
+		data: { eventCount: events.length },
+	});
 }
 
-function migrateLegacyAnsteelTeamEventLedger(cwd: string, state: AnsteelTeamState): void {
+function migrateLegacyAnsteelTeamEventLedger(
+	cwd: string,
+	state: AnsteelTeamState,
+	persistence?: AnsteelTeamPersistenceContext,
+): void {
 	const rawEvents = readAnsteelTeamEventLedger(cwd);
 	const hashFieldPresence = rawEvents.map(
 		(event) => isRecord(event) && (Object.hasOwn(event, "previousHash") || Object.hasOwn(event, "hash")),
@@ -1272,21 +1370,24 @@ function migrateLegacyAnsteelTeamEventLedger(cwd: string, state: AnsteelTeamStat
 		throw new AnsteelTeamStateError("Ansteel team next event sequence does not match the event ledger");
 	}
 	state.ledgerHeadHash = previousHash;
-	writeAnsteelTeamEventLedger(cwd, events);
-	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state);
+	writeAnsteelTeamEventLedger(cwd, events, persistence);
+	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state, persistence);
 }
 
-export function loadAnsteelTeamState(cwd: string): AnsteelTeamState | undefined {
-	recoverAnsteelTeamPendingTransaction(cwd);
+export function loadAnsteelTeamState(
+	cwd: string,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamState | undefined {
+	recoverAnsteelTeamPendingTransaction(cwd, persistence);
 	const path = getAnsteelTeamStatePath(cwd);
 	if (!existsSync(path)) return undefined;
 	try {
 		const rawState = JSON.parse(readFileSync(path, "utf8"));
 		const state = parseAnsteelTeamState(rawState);
 		if (requiresLegacyEventLedgerMigration(rawState)) {
-			migrateLegacyAnsteelTeamEventLedger(cwd, state);
+			migrateLegacyAnsteelTeamEventLedger(cwd, state, persistence);
 		} else if (isRecord(rawState) && rawState.version !== state.version) {
-			writeAnsteelTeamState(path, state);
+			writeAnsteelTeamState(path, state, persistence);
 		}
 		assertAnsteelTeamEventLedger(cwd, state);
 		return state;
@@ -1457,6 +1558,7 @@ export function appendAnsteelTeamEvent(
 	cwd: string,
 	state: AnsteelTeamState,
 	input: AnsteelTeamEventInput,
+	persistence?: AnsteelTeamPersistenceContext,
 ): AnsteelTeamEvent {
 	assertProjectDirectory(cwd);
 	assertState(state);
@@ -1475,10 +1577,28 @@ export function appendAnsteelTeamEvent(
 	state.nextEventSequence = event.sequence + 1;
 	state.ledgerHeadHash = event.hash;
 	state.updatedAt = event.createdAt;
-	writeAnsteelTeamPendingTransaction(cwd, { state, event });
+	writeAnsteelTeamPendingTransaction(cwd, { state, event }, persistence);
 	mkdirSync(getAnsteelTeamDirectory(cwd), { recursive: true });
-	appendFileSync(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`, "utf8");
-	saveAnsteelTeamState(cwd, state);
+	appendDurableLine(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`);
+	persistence?.logger.write({
+		level: "audit",
+		eventName: "event.appended",
+		outcome: "succeeded",
+		role: "coordinator",
+		...(persistence.causeEventId === undefined ? {} : { causeEventId: persistence.causeEventId }),
+		message: "Ansteel team event appended",
+		data: { eventSequence: event.sequence, eventType: event.type, eventHash: event.hash },
+	});
+	persistence?.logger.write({
+		level: "audit",
+		eventName: "event.fsync.completed",
+		outcome: "succeeded",
+		role: "coordinator",
+		...(persistence.causeEventId === undefined ? {} : { causeEventId: persistence.causeEventId }),
+		message: "Ansteel team event fsync completed",
+		data: { eventSequence: event.sequence },
+	});
+	saveAnsteelTeamState(cwd, state, persistence);
 	unlinkSync(getAnsteelTeamTransactionPath(cwd));
 	return event;
 }

@@ -24,6 +24,11 @@ import {
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
 } from "../src/core/ansteel-team.ts";
+import {
+	createAnsteelRuntimeLogger,
+	createAnsteelRunContext,
+	readAnsteelRuntimeLogs,
+} from "../src/core/ansteel-team-observability.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -684,6 +689,27 @@ describe("Ansteel team state", () => {
 		});
 
 		expect(team.openChallenges[0]?.status).toBe("resolved");
+	});
+
+	it("records ledger append, fsync, and state persistence under one trace", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		const context = createAnsteelRunContext({ teamId: team.id, command: "ask" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+
+		appendAnsteelTeamEvent(
+			cwd,
+			team,
+			{ type: "role-report", role: "tech-lead", content: "checkpoint" },
+			{ logger },
+		);
+		logger.close();
+
+		const logs = readAnsteelRuntimeLogs(cwd, context.runId);
+		expect(logs.map((entry) => entry.eventName)).toEqual(
+			expect.arrayContaining(["event.appended", "event.fsync.completed", "state.persisted"]),
+		);
+		expect(logs.every((entry) => entry.traceId === context.traceId)).toBe(true);
 	});
 
 	it("rejects state and event paths that escape the reviewed project", () => {
