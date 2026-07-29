@@ -63,4 +63,22 @@ describe("Ansteel team observability", () => {
 		expect(readAnsteelRuntimeLogs(cwd, context.runId)).toHaveLength(1);
 		expect(existsSync(getAnsteelRuntimeLogDirectory(cwd))).toBe(true);
 	});
+
+	it("exports nested OpenTelemetry spans with the same trace and parent relationship", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "ask" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const root = logger.startSpan("run", { role: "coordinator" });
+		const child = logger.startSpan("provider.request", { role: "tech-lead", parent: root });
+
+		child.end({ outcome: "failed", reasonCode: "provider-timeout", message: "provider timed out" });
+		root.end({ outcome: "failed", reasonCode: "provider-timeout", message: "run failed" });
+		await logger.forceFlush();
+		logger.close();
+
+		const logs = readAnsteelRuntimeLogs(cwd, context.runId);
+		const childEnd = logs.find((entry) => entry.eventName === "provider.request" && entry.outcome === "failed");
+		expect(childEnd?.traceId).toBe(context.traceId);
+		expect(childEnd?.parentSpanId).toBe(root.spanId);
+	});
 });

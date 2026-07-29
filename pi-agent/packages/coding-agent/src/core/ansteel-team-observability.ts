@@ -10,6 +10,13 @@ import {
 	writeSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { ROOT_CONTEXT, SpanStatusCode, trace, type Span as OpenTelemetrySpan } from "@opentelemetry/api";
+import {
+	BasicTracerProvider,
+	SimpleSpanProcessor,
+	type ReadableSpan,
+	type SpanExporter,
+} from "@opentelemetry/sdk-trace-base";
 
 export const ANSTEEL_RUNTIME_REASON_CODES = [
 	"provider-timeout",
@@ -104,9 +111,44 @@ export type AnsteelRuntimeLogInput = Omit<
 	artifacts?: Array<{ kind: string; content: string }>;
 };
 
+export interface AnsteelRuntimeSpanEndInput {
+	outcome: "succeeded" | "failed" | "cancelled" | "abandoned";
+	reasonCode?: AnsteelRuntimeReasonCode;
+	message: string;
+	data?: Record<string, unknown>;
+	artifacts?: Array<{ kind: string; content: string }>;
+}
+
+export interface AnsteelRuntimeSpan {
+	readonly traceId: string;
+	readonly spanId: string;
+	readonly parentSpanId?: string;
+	end(input: AnsteelRuntimeSpanEndInput): void;
+}
+
+export interface AnsteelRuntimeSpanStartOptions {
+	role?: "tech-lead" | "staff-engineer" | "qa-engineer" | "coordinator";
+	sessionId?: string;
+	taskId?: string;
+	checkpointId?: string;
+	issueId?: string;
+	toolCallId?: string;
+	providerRequestId?: string;
+	processId?: string;
+	leaseId?: string;
+	revision?: number;
+	diffHash?: string;
+	causeEventId?: string;
+	parent?: AnsteelRuntimeSpan;
+	message?: string;
+	data?: Record<string, unknown>;
+}
+
 export interface AnsteelRuntimeLogger {
 	readonly context: AnsteelRunContext;
 	write(input: AnsteelRuntimeLogInput): AnsteelRuntimeLogEntry;
+	startSpan(eventName: string, options?: AnsteelRuntimeSpanStartOptions): AnsteelRuntimeSpan;
+	forceFlush(): Promise<void>;
 	close(): void;
 }
 
@@ -291,6 +333,59 @@ export function readAnsteelRuntimeLogs(cwd: string, runId: string): AnsteelRunti
 	return entries;
 }
 
+interface PendingSpanEnd {
+	eventName: string;
+	fields: Omit<AnsteelRuntimeSpanStartOptions, "parent" | "message" | "data">;
+	parentSpanId?: string;
+	input: AnsteelRuntimeSpanEndInput;
+}
+
+class AnsteelRuntimeSpanExporter implements SpanExporter {
+	private readonly pendingEnds: Map<string, PendingSpanEnd>;
+	private readonly writeEntry: (input: AnsteelRuntimeLogInput) => AnsteelRuntimeLogEntry;
+
+	constructor(
+		pendingEnds: Map<string, PendingSpanEnd>,
+		writeEntry: (input: AnsteelRuntimeLogInput) => AnsteelRuntimeLogEntry,
+	) {
+		this.pendingEnds = pendingEnds;
+		this.writeEntry = writeEntry;
+	}
+
+	export(spans: ReadableSpan[], resultCallback: (result: { code: number; error?: Error }) => void): void {
+		try {
+			for (const span of spans) {
+				const spanId = span.spanContext().spanId;
+				const pending = this.pendingEnds.get(spanId);
+				if (!pending) continue;
+				this.writeEntry({
+					level: pending.input.outcome === "failed" ? "error" : "info",
+					eventName: pending.eventName,
+					outcome: pending.input.outcome,
+					...(pending.input.reasonCode === undefined ? {} : { reasonCode: pending.input.reasonCode }),
+					...pending.fields,
+					spanId,
+					...(pending.parentSpanId === undefined ? {} : { parentSpanId: pending.parentSpanId }),
+					message: pending.input.message,
+					data: pending.input.data ?? {},
+					artifacts: pending.input.artifacts,
+				});
+				this.pendingEnds.delete(spanId);
+			}
+			resultCallback({ code: 0 });
+		} catch (error) {
+			resultCallback({
+				code: 1,
+				error: error instanceof Error ? error : new Error(String(error)),
+			});
+		}
+	}
+
+	async shutdown(): Promise<void> {}
+
+	async forceFlush(): Promise<void> {}
+}
+
 export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunContext): AnsteelRuntimeLogger {
 	assertRunId(context.runId);
 	if (!/^[0-9a-f]{32}$/.test(context.traceId)) {
@@ -306,47 +401,105 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 	const startedAt = process.hrtime.bigint();
 	let closed = false;
 
+	const write = (input: AnsteelRuntimeLogInput): AnsteelRuntimeLogEntry => {
+		if (closed) {
+			throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime logger is closed");
+		}
+		if (input.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(input.reasonCode)) {
+			throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime reason code is invalid");
+		}
+		const artifactRefs = (input.artifacts ?? []).map((artifact) => storeArtifact(cwd, artifact));
+		const { artifacts: _artifacts, spanId: inputSpanId, data, ...fields } = input;
+		const unsigned = {
+			schemaVersion: 1 as const,
+			timestampUtc: new Date().toISOString(),
+			monotonicElapsedNs: (process.hrtime.bigint() - startedAt).toString(),
+			sequence,
+			...fields,
+			runId: context.runId,
+			traceId: context.traceId,
+			spanId: inputSpanId ?? randomBytes(8).toString("hex"),
+			teamId: context.teamId,
+			message: redactString(input.message),
+			data: redactRecord(data),
+			artifactRefs,
+			previousHash,
+		};
+		const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+		try {
+			writeBuffer(fd, Buffer.from(`${JSON.stringify(entry)}\n`, "utf8"));
+			fsyncSync(fd);
+		} catch (error) {
+			throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime log could not be durably written", {
+				cause: error,
+			});
+		}
+		sequence++;
+		previousHash = entry.hash;
+		return entry;
+	};
+
+	const pendingEnds = new Map<string, PendingSpanEnd>();
+	const exporter = new AnsteelRuntimeSpanExporter(pendingEnds, write);
+	const provider = new BasicTracerProvider({
+		idGenerator: {
+			generateTraceId: () => context.traceId,
+			generateSpanId: () => randomBytes(8).toString("hex"),
+		},
+		spanProcessors: [new SimpleSpanProcessor(exporter)],
+	});
+	const tracer = provider.getTracer("ansteel-team", "1");
+
+	const startSpan = (eventName: string, options: AnsteelRuntimeSpanStartOptions = {}): AnsteelRuntimeSpan => {
+		if (closed) {
+			throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime logger is closed");
+		}
+		const parentSpan = options.parent as
+			| (AnsteelRuntimeSpan & { readonly openTelemetrySpan?: OpenTelemetrySpan })
+			| undefined;
+		const parentContext =
+			parentSpan?.openTelemetrySpan === undefined ? ROOT_CONTEXT : trace.setSpan(ROOT_CONTEXT, parentSpan.openTelemetrySpan);
+		const openTelemetrySpan = tracer.startSpan(eventName, undefined, parentContext);
+		const spanContext = openTelemetrySpan.spanContext();
+		const parentSpanId = options.parent?.spanId;
+		const { parent: _parent, message, data, ...fields } = options;
+		write({
+			level: "info",
+			eventName,
+			outcome: "started",
+			...fields,
+			spanId: spanContext.spanId,
+			...(parentSpanId === undefined ? {} : { parentSpanId }),
+			message: message ?? `${eventName} started`,
+			data: data ?? {},
+		});
+		let ended = false;
+		const runtimeSpan: AnsteelRuntimeSpan & { readonly openTelemetrySpan: OpenTelemetrySpan } = {
+			traceId: spanContext.traceId,
+			spanId: spanContext.spanId,
+			...(parentSpanId === undefined ? {} : { parentSpanId }),
+			openTelemetrySpan,
+			end(input) {
+				if (ended) {
+					throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime span ${eventName} already ended`);
+				}
+				ended = true;
+				pendingEnds.set(spanContext.spanId, { eventName, fields, parentSpanId, input });
+				openTelemetrySpan.setStatus({
+					code: input.outcome === "failed" ? SpanStatusCode.ERROR : SpanStatusCode.OK,
+					message: input.message,
+				});
+				openTelemetrySpan.end();
+			},
+		};
+		return runtimeSpan;
+	};
+
 	return {
 		context,
-		write(input) {
-			if (closed) {
-				throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime logger is closed");
-			}
-			if (input.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(input.reasonCode)) {
-				throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime reason code is invalid");
-			}
-			const artifactRefs = (input.artifacts ?? []).map((artifact) => storeArtifact(cwd, artifact));
-			const { artifacts: _artifacts, spanId: inputSpanId, data, ...fields } = input;
-			const unsigned = {
-				schemaVersion: 1 as const,
-				timestampUtc: new Date().toISOString(),
-				monotonicElapsedNs: (process.hrtime.bigint() - startedAt).toString(),
-				sequence,
-				...fields,
-				runId: context.runId,
-				traceId: context.traceId,
-				spanId: inputSpanId ?? randomBytes(8).toString("hex"),
-				teamId: context.teamId,
-				message: redactString(input.message),
-				data: redactRecord(data),
-				artifactRefs,
-				previousHash,
-			};
-			const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
-			try {
-				writeBuffer(fd, Buffer.from(`${JSON.stringify(entry)}\n`, "utf8"));
-				fsyncSync(fd);
-			} catch (error) {
-				throw new AnsteelObservabilityError(
-					"event-fsync-failed",
-					"Ansteel runtime log could not be durably written",
-					{ cause: error },
-				);
-			}
-			sequence++;
-			previousHash = entry.hash;
-			return entry;
-		},
+		write,
+		startSpan,
+		forceFlush: () => provider.forceFlush(),
 		close() {
 			if (closed) return;
 			try {
