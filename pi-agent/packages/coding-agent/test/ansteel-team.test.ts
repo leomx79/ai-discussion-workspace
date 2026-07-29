@@ -9,6 +9,7 @@ import {
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
 	getAnsteelTeamEventPath,
+	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatePath,
 	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamTransactionPath,
@@ -29,6 +30,7 @@ import {
 	submitAnsteelTeamTask,
 } from "../src/core/ansteel-team.ts";
 import {
+	type AnsteelRuntimeLogEntry,
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
 	readAnsteelRuntimeLogs,
@@ -135,6 +137,120 @@ afterEach(() => {
 });
 
 describe("public collaboration state", () => {
+	it("derives the shared board without trusting role-written counts", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const first = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-BOARD-0001",
+			goal: "Prevent unsafe lease expiry",
+			currentUnderstanding: "The calculated expiry needs validation",
+			assumptions: [],
+			evidenceRefs: ["file:src/lease.ts:10"],
+			uncertainties: ["Boundary behavior"],
+			nextAction: { kind: "test", target: "test/lease.test.ts", expectedResult: "Overflow is reproduced" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const firstIssue = raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-BOARD-0001",
+			targetCheckpointId: first.id,
+			severity: "blocking",
+			claim: "The boundary test is missing",
+			evidenceRefs: ["test:lease-boundary"],
+			suggestedCorrection: "Add the boundary regression",
+		});
+		const replacement = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-BOARD-0002",
+			goal: first.goal,
+			currentUnderstanding: "The calculated expiry must remain a safe integer",
+			assumptions: [],
+			evidenceRefs: ["test:lease-boundary:passed"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/lease.ts", expectedResult: "Unsafe expiry is rejected" },
+			risk: "yellow",
+			confidence: "L1",
+			supersedesCheckpointId: first.id,
+		});
+		resolveAnsteelProcessIssue(cwd, state, "staff-engineer", {
+			id: "PR-BOARD-0001",
+			issueId: firstIssue.id,
+			outcome: "ACCEPTED",
+			summary: "Validate the calculated expiry",
+			evidenceRefs: ["test:lease-boundary:passed"],
+			replacementCheckpointId: replacement.id,
+		});
+		reviewAnsteelProcessResolution(cwd, state, "qa-engineer", firstIssue.id, {
+			verdict: "accept",
+			reason: "The replacement includes the passing boundary regression",
+		});
+		raiseAnsteelProcessIssue(cwd, state, "tech-lead", {
+			id: "PI-BOARD-0002",
+			targetCheckpointId: replacement.id,
+			severity: "blocking",
+			claim: "The compatibility impact remains unverified",
+			evidenceRefs: ["test:compatibility-missing"],
+			suggestedCorrection: "Run the compatibility suite",
+		});
+		appendAnsteelTeamEvent(cwd, state, {
+			type: "role-report",
+			role: "staff-engineer",
+			content: "All issues closed. Active checkpoints: 99.",
+		});
+
+		const runtimeEntries = [
+			{
+				sequence: 7,
+				eventName: "tool.completed",
+				outcome: "failed",
+				reasonCode: "tool-timeout",
+				toolCallId: "TOOL-BOARD-0001",
+			},
+			{ sequence: 8, eventName: "role.progress", outcome: "progress" },
+		] as AnsteelRuntimeLogEntry[];
+		const board = getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd), runtimeEntries);
+
+		expect(board.currentGoal).toBe(state.topic);
+		expect(board.roles["staff-engineer"].activeCheckpointId).toBe("CP-BOARD-0002");
+		expect(board.openProcessIssues).toEqual([expect.objectContaining({ id: "PI-BOARD-0002", severity: "blocking" })]);
+		expect(board.counts).toEqual({
+			activeCheckpoints: 1,
+			openProcessIssues: 1,
+			blockingProcessIssues: 1,
+			escalatedProcessIssues: 0,
+		});
+		expect(board.recentToolFacts).toEqual([
+			{
+				sequence: 7,
+				eventName: "tool.completed",
+				outcome: "failed",
+				reasonCode: "tool-timeout",
+			},
+		]);
+		board.activeCheckpoints[0].currentUnderstanding = "Caller mutated projection";
+		expect(state.workCheckpoints.find((checkpoint) => checkpoint.id === "CP-BOARD-0002")?.currentUnderstanding).toBe(
+			"The calculated expiry must remain a safe integer",
+		);
+	});
+
+	it("rejects a shared board when persisted state differs from event replay", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-MISMATCH-0001",
+			goal: "Keep state and events aligned",
+			currentUnderstanding: "The event payload is authoritative",
+			assumptions: [],
+			evidenceRefs: ["event:1"],
+			uncertainties: [],
+			nextAction: { kind: "read", target: "events.jsonl", expectedResult: "Replay matches state" },
+			risk: "green",
+			confidence: "L1",
+		});
+		state.workCheckpoints[0].currentUnderstanding = "State was modified without an event";
+
+		expect(() => getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd))).toThrow("state-projection-mismatch");
+	});
+
 	it("requires the issue author to verify a checkpoint correction", () => {
 		const cwd = createTemporaryProject();
 		const state = createTeam(cwd);

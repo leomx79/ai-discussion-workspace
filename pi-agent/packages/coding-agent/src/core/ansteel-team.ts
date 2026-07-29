@@ -12,9 +12,10 @@ import {
 	writeSync,
 } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import { ANSTEEL_ROLES, type AnsteelRole, DEFAULT_ANSTEEL_TEAM_TASK_OWNERS } from "./ansteel-discussion.ts";
-import type { AnsteelRuntimeLogger } from "./ansteel-team-observability.ts";
+import type { AnsteelRuntimeLogEntry, AnsteelRuntimeLogger } from "./ansteel-team-observability.ts";
 
 const ANSTEEL_TEAM_STATE_VERSION = 7;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
@@ -247,6 +248,35 @@ export interface AnsteelTeamState {
 	workCheckpoints: AnsteelWorkCheckpoint[];
 	processIssues: AnsteelProcessIssue[];
 	ledgerHeadHash: string | null;
+}
+
+export interface AnsteelTeamSharedBoard {
+	teamId: string;
+	currentGoal: string;
+	teamStatus: AnsteelTeamStatus;
+	roles: Record<
+		AnsteelRole,
+		{
+			status: AnsteelTeamRoleState["status"];
+			activeCheckpointId?: string;
+			openIssueIds: string[];
+		}
+	>;
+	tasks: Array<{
+		id: string;
+		owner: AnsteelRole;
+		status: AnsteelTeamTask["status"];
+		dependsOn: string[];
+	}>;
+	activeCheckpoints: AnsteelWorkCheckpoint[];
+	openProcessIssues: AnsteelProcessIssue[];
+	recentToolFacts: Array<{ sequence: number; eventName: string; outcome: string; reasonCode?: string }>;
+	counts: {
+		activeCheckpoints: number;
+		openProcessIssues: number;
+		blockingProcessIssues: number;
+		escalatedProcessIssues: number;
+	};
 }
 
 export interface CreateAnsteelTeamStateOptions {
@@ -2356,4 +2386,106 @@ export function reviewAnsteelProcessResolution(
 		persistence,
 	);
 	return state.processIssues.find((item) => item.id === issue.id)!;
+}
+
+function throwAnsteelStateProjectionMismatch(detail: string): never {
+	throw new AnsteelTeamStateError(`state-projection-mismatch: ${detail}`);
+}
+
+export function getAnsteelTeamSharedBoard(
+	state: AnsteelTeamState,
+	events: readonly AnsteelTeamEvent[],
+	runtimeEntries: readonly AnsteelRuntimeLogEntry[] = [],
+): AnsteelTeamSharedBoard {
+	assertState(state);
+	let parsedEvents: AnsteelTeamEvent[];
+	try {
+		parsedEvents = events.map((event) => parseAnsteelTeamEvent(event));
+		let previousHash: string | null = null;
+		for (let index = 0; index < parsedEvents.length; index++) {
+			const event = parsedEvents[index];
+			if (event.sequence !== index + 1) {
+				throw new AnsteelTeamStateError("event sequence is not contiguous");
+			}
+			if (event.previousHash !== previousHash) {
+				throw new AnsteelTeamStateError("event previous hash is invalid");
+			}
+			if (event.hash !== hashAnsteelTeamEvent(event)) {
+				throw new AnsteelTeamStateError("event hash does not match its content");
+			}
+			previousHash = event.hash;
+		}
+		if (state.ledgerHeadHash !== previousHash || state.nextEventSequence !== parsedEvents.length + 1) {
+			throw new AnsteelTeamStateError("state ledger cursor does not match the supplied events");
+		}
+	} catch (error) {
+		throwAnsteelStateProjectionMismatch(error instanceof Error ? error.message : String(error));
+	}
+
+	const replayedState = structuredClone(state);
+	replayedState.workCheckpoints = [];
+	replayedState.processIssues = [];
+	try {
+		for (const event of parsedEvents) {
+			if (event.schemaVersion === 2 && isAnsteelPublicCollaborationEventType(event.type)) {
+				applyAnsteelTeamEvent(replayedState, event);
+			}
+		}
+		assertAnsteelPublicCollaborationState(replayedState);
+	} catch (error) {
+		throwAnsteelStateProjectionMismatch(error instanceof Error ? error.message : String(error));
+	}
+	if (
+		!isDeepStrictEqual(replayedState.workCheckpoints, state.workCheckpoints) ||
+		!isDeepStrictEqual(replayedState.processIssues, state.processIssues)
+	) {
+		throwAnsteelStateProjectionMismatch("persisted collaboration state does not match event replay");
+	}
+
+	const activeCheckpoints = state.workCheckpoints.filter((checkpoint) => checkpoint.status === "active");
+	const openProcessIssues = state.processIssues.filter((issue) => issue.status !== "closed");
+	const roles = Object.fromEntries(
+		ANSTEEL_ROLES.map((role) => {
+			const activeCheckpoint = [...activeCheckpoints].reverse().find((checkpoint) => checkpoint.actor === role);
+			return [
+				role,
+				{
+					status: state.roles[role].status,
+					...(activeCheckpoint === undefined ? {} : { activeCheckpointId: activeCheckpoint.id }),
+					openIssueIds: openProcessIssues.filter((issue) => issue.targetRole === role).map((issue) => issue.id),
+				},
+			];
+		}),
+	) as AnsteelTeamSharedBoard["roles"];
+	const recentToolFacts = runtimeEntries
+		.filter((entry) => entry.toolCallId !== undefined || entry.eventName.startsWith("tool."))
+		.slice(-10)
+		.map((entry) => ({
+			sequence: entry.sequence,
+			eventName: entry.eventName,
+			outcome: entry.outcome,
+			...(entry.reasonCode === undefined ? {} : { reasonCode: entry.reasonCode }),
+		}));
+
+	return {
+		teamId: state.id,
+		currentGoal: state.topic,
+		teamStatus: state.status,
+		roles,
+		tasks: state.tasks.map((task) => ({
+			id: task.id,
+			owner: task.owner,
+			status: task.status,
+			dependsOn: [...task.dependsOn],
+		})),
+		activeCheckpoints: structuredClone(activeCheckpoints),
+		openProcessIssues: structuredClone(openProcessIssues),
+		recentToolFacts,
+		counts: {
+			activeCheckpoints: activeCheckpoints.length,
+			openProcessIssues: openProcessIssues.length,
+			blockingProcessIssues: openProcessIssues.filter((issue) => issue.severity === "blocking").length,
+			escalatedProcessIssues: openProcessIssues.filter((issue) => issue.status === "escalated").length,
+		},
+	};
 }
