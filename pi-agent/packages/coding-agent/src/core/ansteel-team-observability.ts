@@ -333,6 +333,194 @@ export function readAnsteelRuntimeLogs(cwd: string, runId: string): AnsteelRunti
 	return entries;
 }
 
+export interface AnsteelRuntimeDiagnosisIssue {
+	reasonCode: AnsteelRuntimeReasonCode;
+	message: string;
+	entrySequence?: number;
+	artifact?: AnsteelRuntimeArtifactRef;
+}
+
+export interface AnsteelRuntimeDiagnosis {
+	runId: string;
+	traceId?: string;
+	healthy: boolean;
+	rootCause?: AnsteelRuntimeLogEntry;
+	issues: AnsteelRuntimeDiagnosisIssue[];
+	entryCount: number;
+}
+
+export interface AnsteelRuntimeRunSummary {
+	runId: string;
+	traceId?: string;
+	teamId?: string;
+	startedAt?: string;
+	endedAt?: string;
+	entryCount: number;
+	lastOutcome?: AnsteelRuntimeLogEntry["outcome"];
+}
+
+export interface AnsteelIncidentBundle {
+	storageId: string;
+	sha256: string;
+	manifest: {
+		schemaVersion: 1;
+		runId: string;
+		traceId?: string;
+		createdAt: string;
+		healthy: boolean;
+		rootCause?: AnsteelRuntimeLogEntry;
+		issues: AnsteelRuntimeDiagnosisIssue[];
+		logHashes: string[];
+		artifactRefs: AnsteelRuntimeArtifactRef[];
+	};
+}
+
+export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] {
+	const directory = getAnsteelRuntimeLogDirectory(cwd);
+	if (!existsSync(directory)) return [];
+	const runIds = new Set<string>();
+	for (const name of readdirSync(directory)) {
+		const match = /^run-(RUN-[0-9a-f-]{36})-\d{4}\.jsonl$/i.exec(name);
+		if (match?.[1]) runIds.add(match[1]);
+	}
+	return [...runIds]
+		.map((runId) => {
+			const entries = readAnsteelRuntimeLogs(cwd, runId);
+			const first = entries[0];
+			const last = entries.at(-1);
+			return {
+				runId,
+				...(first?.traceId === undefined ? {} : { traceId: first.traceId }),
+				...(first?.teamId === undefined ? {} : { teamId: first.teamId }),
+				...(first?.timestampUtc === undefined ? {} : { startedAt: first.timestampUtc }),
+				...(last?.timestampUtc === undefined ? {} : { endedAt: last.timestampUtc }),
+				entryCount: entries.length,
+				...(last?.outcome === undefined ? {} : { lastOutcome: last.outcome }),
+			};
+		})
+		.sort((left, right) => (left.startedAt ?? "").localeCompare(right.startedAt ?? ""));
+}
+
+export function traceAnsteelTeamRuntime(cwd: string, selector: string): AnsteelRuntimeLogEntry[] {
+	const normalized = selector.trim();
+	if (normalized.length === 0) {
+		throw new AnsteelObservabilityError("unclassified-runtime-error", "Ansteel runtime trace selector is required");
+	}
+	const results: AnsteelRuntimeLogEntry[] = [];
+	for (const run of listAnsteelRuntimeRuns(cwd)) {
+		const entries = readAnsteelRuntimeLogs(cwd, run.runId);
+		if (run.runId === normalized || run.traceId === normalized) {
+			results.push(...entries);
+			continue;
+		}
+		results.push(
+			...entries.filter(
+				(entry) =>
+					entry.taskId === normalized ||
+					entry.checkpointId === normalized ||
+					entry.issueId === normalized ||
+					entry.toolCallId === normalized ||
+					entry.providerRequestId === normalized ||
+					entry.processId === normalized ||
+					entry.leaseId === normalized ||
+					entry.causeEventId === normalized,
+			),
+		);
+	}
+	return results.sort(
+		(left, right) => left.timestampUtc.localeCompare(right.timestampUtc) || left.sequence - right.sequence,
+	);
+}
+
+export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRuntimeDiagnosis {
+	let entries: AnsteelRuntimeLogEntry[];
+	try {
+		entries = readAnsteelRuntimeLogs(cwd, runId);
+	} catch (error) {
+		return {
+			runId,
+			healthy: false,
+			issues: [
+				{
+					reasonCode: error instanceof AnsteelObservabilityError ? error.reasonCode : "event-chain-invalid",
+					message: error instanceof Error ? error.message : String(error),
+				},
+			],
+			entryCount: 0,
+		};
+	}
+	const issues: AnsteelRuntimeDiagnosisIssue[] = [];
+	for (const entry of entries) {
+		for (const artifact of entry.artifactRefs) {
+			const actualHash = existsSync(artifact.storageId)
+				? createHash("sha256").update(readFileSync(artifact.storageId)).digest("hex")
+				: undefined;
+			if (actualHash !== artifact.sha256) {
+				issues.push({
+					reasonCode: "artifact-missing",
+					message: `Ansteel runtime artifact ${artifact.sha256} is missing or does not match`,
+					entrySequence: entry.sequence,
+					artifact,
+				});
+			}
+		}
+	}
+	const rootCause = entries.find(
+		(entry) => entry.outcome === "failed" || entry.outcome === "abandoned" || entry.outcome === "cancelled",
+	);
+	return {
+		runId,
+		...(entries[0]?.traceId === undefined ? {} : { traceId: entries[0].traceId }),
+		healthy: rootCause === undefined && issues.length === 0,
+		...(rootCause === undefined ? {} : { rootCause }),
+		issues,
+		entryCount: entries.length,
+	};
+}
+
+export function formatAnsteelTeamDiagnosis(diagnosis: AnsteelRuntimeDiagnosis): string {
+	const lines = [
+		`Run: ${diagnosis.runId}`,
+		`Health: ${diagnosis.healthy ? "healthy" : "unhealthy"}`,
+		`Entries: ${diagnosis.entryCount}`,
+	];
+	if (diagnosis.traceId) lines.push(`Trace: ${diagnosis.traceId}`);
+	if (diagnosis.rootCause) {
+		lines.push(
+			`Root cause: ${diagnosis.rootCause.reasonCode ?? "unclassified-runtime-error"} at ${diagnosis.rootCause.eventName} sequence ${diagnosis.rootCause.sequence}`,
+		);
+	}
+	for (const issue of diagnosis.issues) lines.push(`Issue: ${issue.reasonCode} - ${issue.message}`);
+	return lines.join("\n");
+}
+
+export function createAnsteelTeamIncidentBundle(cwd: string, runId: string): AnsteelIncidentBundle {
+	const diagnosis = diagnoseAnsteelTeamRun(cwd, runId);
+	const entries = readAnsteelRuntimeLogs(cwd, runId);
+	const artifactRefs = new Map<string, AnsteelRuntimeArtifactRef>();
+	for (const entry of entries) {
+		for (const artifact of entry.artifactRefs) artifactRefs.set(`${artifact.kind}:${artifact.sha256}`, artifact);
+	}
+	const manifest: AnsteelIncidentBundle["manifest"] = {
+		schemaVersion: 1,
+		runId,
+		...(diagnosis.traceId === undefined ? {} : { traceId: diagnosis.traceId }),
+		createdAt: new Date().toISOString(),
+		healthy: diagnosis.healthy,
+		...(diagnosis.rootCause === undefined ? {} : { rootCause: diagnosis.rootCause }),
+		issues: diagnosis.issues,
+		logHashes: entries.map((entry) => entry.hash),
+		artifactRefs: [...artifactRefs.values()],
+	};
+	const content = `${JSON.stringify(manifest, null, "\t")}\n`;
+	const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
+	const directory = join(getAnsteelTeamRuntimeDirectory(cwd), "incidents");
+	mkdirSync(directory, { recursive: true });
+	const storageId = join(directory, `incident-${runId}-${sha256}.json`);
+	if (!existsSync(storageId)) writeNewDurableFile(storageId, content);
+	return { storageId, sha256, manifest };
+}
+
 interface PendingSpanEnd {
 	eventName: string;
 	fields: Omit<AnsteelRuntimeSpanStartOptions, "parent" | "message" | "data">;

@@ -1,14 +1,19 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ANSTEEL_RUNTIME_REASON_CODES,
+	createAnsteelTeamIncidentBundle,
 	createAnsteelRuntimeLogger,
 	createAnsteelRunContext,
+	diagnoseAnsteelTeamRun,
+	formatAnsteelTeamDiagnosis,
 	getAnsteelRuntimeLogDirectory,
 	isAnsteelRuntimeReasonCode,
+	listAnsteelRuntimeRuns,
 	readAnsteelRuntimeLogs,
+	traceAnsteelTeamRuntime,
 } from "../src/core/ansteel-team-observability.ts";
 
 const temporaryProjects: string[] = [];
@@ -80,5 +85,80 @@ describe("Ansteel team observability", () => {
 		const childEnd = logs.find((entry) => entry.eventName === "provider.request" && entry.outcome === "failed");
 		expect(childEnd?.traceId).toBe(context.traceId);
 		expect(childEnd?.parentSpanId).toBe(root.spanId);
+	});
+
+	it("explains the first cause and returns non-healthy for a damaged artifact", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "task TASK-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const failed = logger.write({
+			level: "error",
+			eventName: "tool.call.completed",
+			outcome: "failed",
+			reasonCode: "tool-exit-nonzero",
+			message: "test failed",
+			data: { exitCode: 1 },
+			artifacts: [{ kind: "stderr", content: "assertion failed" }],
+		});
+		logger.close();
+		writeFileSync(failed.artifactRefs[0]!.storageId, "tampered", "utf8");
+
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.rootCause).toMatchObject({
+			reasonCode: "tool-exit-nonzero",
+			eventName: "tool.call.completed",
+		});
+		expect(diagnosis.issues).toContainEqual(expect.objectContaining({ reasonCode: "artifact-missing" }));
+	});
+
+	it("indexes runs and traces entries by governed identifiers", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "task TASK-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-1",
+			toolCallId: "TOOL-1",
+			message: "test passed",
+			data: { exitCode: 0 },
+		});
+		logger.close();
+
+		expect(listAnsteelRuntimeRuns(cwd)).toContainEqual(
+			expect.objectContaining({ runId: context.runId, traceId: context.traceId, entryCount: 1 }),
+		);
+		expect(traceAnsteelTeamRuntime(cwd, "TASK-1")).toHaveLength(1);
+		expect(traceAnsteelTeamRuntime(cwd, "TOOL-1")).toHaveLength(1);
+		expect(traceAnsteelTeamRuntime(cwd, context.traceId)).toHaveLength(1);
+	});
+
+	it("creates a hashed incident bundle from mechanical facts", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "task TASK-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "error",
+			eventName: "provider.request.completed",
+			outcome: "failed",
+			reasonCode: "provider-timeout",
+			message: "provider timed out",
+			data: { attempt: 1 },
+		});
+		logger.close();
+
+		const bundle = createAnsteelTeamIncidentBundle(cwd, context.runId);
+		const persisted = JSON.parse(readFileSync(bundle.storageId, "utf8")) as Record<string, unknown>;
+
+		expect(bundle.sha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(persisted).toMatchObject({
+			runId: context.runId,
+			traceId: context.traceId,
+			rootCause: { reasonCode: "provider-timeout" },
+		});
+		expect(persisted).not.toHaveProperty("modelAnalysis");
+		expect(formatAnsteelTeamDiagnosis(diagnoseAnsteelTeamRun(cwd, context.runId))).toContain("provider-timeout");
 	});
 });
