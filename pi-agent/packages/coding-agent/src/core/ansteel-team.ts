@@ -2397,9 +2397,9 @@ export function getAnsteelTeamSharedBoard(
 	events: readonly AnsteelTeamEvent[],
 	runtimeEntries: readonly AnsteelRuntimeLogEntry[] = [],
 ): AnsteelTeamSharedBoard {
-	assertState(state);
 	let parsedEvents: AnsteelTeamEvent[];
 	try {
+		assertState(state);
 		parsedEvents = events.map((event) => parseAnsteelTeamEvent(event));
 		let previousHash: string | null = null;
 		for (let index = 0; index < parsedEvents.length; index++) {
@@ -2484,7 +2484,9 @@ export function getAnsteelTeamSharedBoard(
 		counts: {
 			activeCheckpoints: activeCheckpoints.length,
 			openProcessIssues: openProcessIssues.length,
-			blockingProcessIssues: openProcessIssues.filter((issue) => issue.severity === "blocking").length,
+			blockingProcessIssues: openProcessIssues.filter(
+				(issue) => issue.severity === "blocking" || issue.severity === "critical",
+			).length,
 			escalatedProcessIssues: openProcessIssues.filter((issue) => issue.status === "escalated").length,
 		},
 	};

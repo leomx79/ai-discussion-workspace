@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	type AnsteelWorkCheckpoint,
 	appendAnsteelTeamEvent,
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
@@ -249,6 +250,53 @@ describe("public collaboration state", () => {
 		state.workCheckpoints[0].currentUnderstanding = "State was modified without an event";
 
 		expect(() => getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd))).toThrow("state-projection-mismatch");
+	});
+
+	it("normalizes invalid persisted collaboration state to a projection mismatch", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-MISMATCH-0002",
+			goal: "Reject invalid persisted collaboration state",
+			currentUnderstanding: "The projection must fail closed",
+			assumptions: [],
+			evidenceRefs: ["event:1"],
+			uncertainties: [],
+			nextAction: { kind: "read", target: "team.json", expectedResult: "Invalid state is rejected" },
+			risk: "green",
+			confidence: "L1",
+		});
+		state.workCheckpoints[0].status = "closed" as AnsteelWorkCheckpoint["status"];
+
+		expect(() => getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd))).toThrow("state-projection-mismatch");
+	});
+
+	it("counts open critical process issues as blockers", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-CRITICAL-0001",
+			goal: "Protect the critical safety boundary",
+			currentUnderstanding: "Critical issues must block affected work",
+			assumptions: [],
+			evidenceRefs: ["file:src/safety.ts:1"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/safety.ts", expectedResult: "The boundary is enforced" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-CRITICAL-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "critical",
+			claim: "The safety boundary is not enforced",
+			evidenceRefs: ["test:safety-boundary"],
+			suggestedCorrection: "Add a fail-closed boundary check",
+		});
+
+		const board = getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd));
+
+		expect(board.counts.blockingProcessIssues).toBe(1);
 	});
 
 	it("requires the issue author to verify a checkpoint correction", () => {
