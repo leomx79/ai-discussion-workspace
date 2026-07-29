@@ -398,6 +398,21 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
+	it("rejects an active-team board when the persisted event ledger is missing", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "events.jsonl"));
+
+		await expect(command("board", harness.ctx)).rejects.toThrow("ledger head hash");
+
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
+			{ triggerTurn: false },
+		);
+	});
+
 	it("fails closed instead of rendering a board when every historical runtime log is missing", async () => {
 		const harness = setup();
 		const command = harness.commands.get("ansteel-team");
