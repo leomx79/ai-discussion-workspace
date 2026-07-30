@@ -26,7 +26,7 @@
 - [x] 最终双独立批准可得到协作与治理完成，但仍不能得到交付通过或工作流完成。
 - [x] 旧 v9/v10 遗留批准状态不会伪造持续协作或交付成功。
 - [x] `status --explain` 与工作板显示相同的机械三轴与原因。
-- [ ] 构建、类型检查、串行 Vitest、双独立复审、详细中文提交、推送和 GitHub Actions 完成。
+- [x] 构建、类型检查、串行 Vitest、双独立复审、详细中文提交、推送和 GitHub Actions 完成。
 
 ## 本地自审记录
 
@@ -34,3 +34,4 @@
 - `deliveryStatus` 当前只会给出 `not-started`。没有新增受信任、可重放的交付证据记录之前，任务/里程碑批准、动作会签、Git 或 CI 文本不能导出 `passed`。
 - 两份独立复审分别发现并关闭了三类假阳性：遗留 v9 `final-verification`/`approved` 不得声称协作就绪、动作-only 会签拒绝必须阻断工作流、`status` 必须和工作板一样拒绝持久状态投影不一致。
 - 已运行 `npm run build`、`tsgo --noEmit -p packages/coding-agent/tsconfig.build.json` 与 GitHub workflow 等价的六文件串行 Vitest：`325 passed`。讨论超时和扩展集成测试仅放宽 Vitest 外层等待，内部协议超时与失败关闭断言保持不变。
+- 提交 `f5f571140a86e34b6873b465a574fc729bc7b756` 已推送 `main`。GitHub Actions `Ansteel governance gate` 运行 `30574642567`、`Ansteel delivery candidate` 运行 `30574826383` 均为 `success`；候选工作流只产出并上传未发布的包，因此不改变 `deliveryStatus: not-started` 的协议边界。
