@@ -23,7 +23,7 @@ import {
 	redactAnsteelSensitiveValue,
 } from "./ansteel-team-observability.ts";
 
-const ANSTEEL_TEAM_STATE_VERSION = 8;
+const ANSTEEL_TEAM_STATE_VERSION = 9;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
 const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
@@ -31,12 +31,36 @@ const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
 
 export type AnsteelTeamStatus = "active" | "stopped";
 
+/**
+ * Coordinator-assigned task categories make the intended division of labor
+ * durable instead of relying on a role prompt or a human-readable description.
+ */
+export const ANSTEEL_TEAM_TASK_TYPES = ["architecture", "integration", "implementation", "verification"] as const;
+
+export type AnsteelTeamTaskType = (typeof ANSTEEL_TEAM_TASK_TYPES)[number];
+
+/** Default owner used when a caller omits a type and to detect cross-role exceptions. */
+const DEFAULT_TASK_TYPE_BY_ROLE: Record<AnsteelRole, AnsteelTeamTaskType> = {
+	"tech-lead": "architecture",
+	"staff-engineer": "implementation",
+	"qa-engineer": "verification",
+};
+
+/** Normal role for each explicit task type. Non-default assignments need a public reason. */
+const DEFAULT_TASK_OWNER_BY_TYPE: Record<AnsteelTeamTaskType, AnsteelRole> = {
+	architecture: "tech-lead",
+	integration: "tech-lead",
+	implementation: "staff-engineer",
+	verification: "qa-engineer",
+};
+
 export type AnsteelTeamEventType =
 	| "role-report"
 	| "challenge"
 	| "resolution"
 	| "role-failure"
 	| "task-assigned"
+	| "tasks-assigned"
 	| "task-claimed"
 	| "task-submitted"
 	| "task-review"
@@ -205,6 +229,9 @@ export type AnsteelTeamPublicEventPayload =
 export interface AnsteelTeamTask {
 	id: string;
 	owner: AnsteelRole;
+	type: AnsteelTeamTaskType;
+	/** Required when the owner differs from the task type's default role. */
+	assignmentReason?: string;
 	files: string[];
 	description: string;
 	acceptanceCriteria: string;
@@ -269,6 +296,12 @@ export interface AnsteelTeamMilestoneReview {
 export interface ClaimAnsteelTeamTaskInput {
 	id: string;
 	owner: AnsteelRole;
+	/**
+	 * Older in-process callers may omit the type; the owner-specific default is
+	 * materialized before persistence. User and agent command schemas require it.
+	 */
+	type?: AnsteelTeamTaskType;
+	assignmentReason?: string;
 	files: string[];
 	description: string;
 	acceptanceCriteria: string;
@@ -328,6 +361,8 @@ export interface AnsteelTeamSharedBoard {
 	tasks: Array<{
 		id: string;
 		owner: AnsteelRole;
+		type: AnsteelTeamTaskType;
+		assignmentReason?: string;
 		status: AnsteelTeamTask["status"];
 		dependsOn: string[];
 	}>;
@@ -514,6 +549,34 @@ function assertLedgerHash(value: unknown, field: string, allowNull: boolean): as
 	}
 }
 
+function normalizeTaskAssignment(
+	owner: AnsteelRole,
+	type: unknown,
+	assignmentReason: unknown,
+): { type: AnsteelTeamTaskType; assignmentReason?: string } {
+	const normalizedType = type === undefined ? DEFAULT_TASK_TYPE_BY_ROLE[owner] : type;
+	if (typeof normalizedType !== "string" || !ANSTEEL_TEAM_TASK_TYPES.includes(normalizedType as AnsteelTeamTaskType)) {
+		throw new AnsteelTeamStateError("Ansteel team task requires a valid task type");
+	}
+	if (
+		assignmentReason !== undefined &&
+		(typeof assignmentReason !== "string" || assignmentReason.trim().length === 0)
+	) {
+		throw new AnsteelTeamStateError("Ansteel team task assignment reason must be a non-empty string");
+	}
+	const taskType = normalizedType as AnsteelTeamTaskType;
+	const reason = typeof assignmentReason === "string" ? assignmentReason.trim() : undefined;
+	if (DEFAULT_TASK_OWNER_BY_TYPE[taskType] !== owner && reason === undefined) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team ${taskType} task assigned to ${owner} requires a public assignment reason`,
+		);
+	}
+	return {
+		type: taskType,
+		...(reason === undefined ? {} : { assignmentReason: reason }),
+	};
+}
+
 function assertState(state: AnsteelTeamState): void {
 	if (state.version !== ANSTEEL_TEAM_STATE_VERSION) {
 		throw new AnsteelTeamStateError(`Unsupported Ansteel team state version: ${state.version}`);
@@ -568,6 +631,7 @@ function assertState(state: AnsteelTeamState): void {
 		if (taskIds.has(task.id)) throw new AnsteelTeamStateError(`Ansteel team task ${task.id} is duplicated`);
 		taskIds.add(task.id);
 		assertRole(task.owner, "task owner");
+		normalizeTaskAssignment(task.owner, task.type, task.assignmentReason);
 		if (
 			!Array.isArray(task.files) ||
 			task.files.length === 0 ||
@@ -1661,13 +1725,12 @@ export function isAnsteelTeamGovernancePath(cwd: string, file: unknown): boolean
 	return resolvedFile === teamDirectory || getCwdRelativePath(resolvedFile, teamDirectory) !== undefined;
 }
 
-export function claimAnsteelTeamTask(
-	cwd: string,
+function claimAnsteelTeamTaskInState(
+	projectDirectory: string,
 	state: AnsteelTeamState,
 	input: ClaimAnsteelTeamTaskInput,
-	allowedOwners: readonly AnsteelRole[] = DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
+	allowedOwners: readonly AnsteelRole[],
 ): AnsteelTeamTask {
-	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
 	assertTaskId(input.id);
 	assertRole(input.owner, "task owner");
@@ -1685,6 +1748,7 @@ export function claimAnsteelTeamTask(
 	if (typeof input.acceptanceCriteria !== "string" || input.acceptanceCriteria.trim().length === 0) {
 		throw new AnsteelTeamStateError("Ansteel team task requires acceptance criteria");
 	}
+	const assignment = normalizeTaskAssignment(input.owner, input.type, input.assignmentReason);
 	if (state.tasks.some((task) => task.id === input.id)) {
 		throw new AnsteelTeamStateError(`Ansteel team task ${input.id} already exists`);
 	}
@@ -1717,6 +1781,7 @@ export function claimAnsteelTeamTask(
 	const task: AnsteelTeamTask = {
 		id: input.id,
 		owner: input.owner,
+		...assignment,
 		files,
 		description: input.description.trim(),
 		acceptanceCriteria: input.acceptanceCriteria.trim(),
@@ -1730,8 +1795,103 @@ export function claimAnsteelTeamTask(
 		reviews: [],
 	};
 	state.tasks.push(task);
+	return task;
+}
+
+export function claimAnsteelTeamTask(
+	cwd: string,
+	state: AnsteelTeamState,
+	input: ClaimAnsteelTeamTaskInput,
+	allowedOwners: readonly AnsteelRole[] = DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
+): AnsteelTeamTask {
+	const projectDirectory = assertProjectDirectory(cwd);
+	const task = claimAnsteelTeamTaskInState(projectDirectory, state, input, allowedOwners);
 	saveAnsteelTeamState(projectDirectory, state);
 	return task;
+}
+
+/**
+ * Atomically claims a parallel batch. Every task is validated against a cloned
+ * state first, so a duplicate ID, role-policy violation, dependency error, or
+ * overlapping file leaves the caller's state and durable state unchanged.
+ */
+export function claimAnsteelTeamTasks(
+	cwd: string,
+	state: AnsteelTeamState,
+	inputs: readonly ClaimAnsteelTeamTaskInput[],
+	allowedOwners: readonly AnsteelRole[] = DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
+): AnsteelTeamTask[] {
+	const projectDirectory = assertProjectDirectory(cwd);
+	const { preview, claimedIds } = prepareAnsteelTeamTaskBatch(projectDirectory, state, inputs, allowedOwners);
+	// Persist the validated preview before publishing it to the live object. A
+	// disk failure therefore cannot expose an in-memory half-commit.
+	saveAnsteelTeamState(projectDirectory, preview);
+	Object.assign(state, preview);
+	return state.tasks.filter((task) => claimedIds.has(task.id));
+}
+
+function prepareAnsteelTeamTaskBatch(
+	projectDirectory: string,
+	state: AnsteelTeamState,
+	inputs: readonly ClaimAnsteelTeamTaskInput[],
+	allowedOwners: readonly AnsteelRole[],
+): { preview: AnsteelTeamState; claimedIds: Set<string> } {
+	assertState(state);
+	if (!Array.isArray(inputs) || inputs.length < 2 || inputs.length > ANSTEEL_ROLES.length) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team parallel task batch requires between 2 and ${ANSTEEL_ROLES.length} tasks`,
+		);
+	}
+	const owners = inputs.map((input) => input.owner);
+	if (new Set(owners).size !== owners.length) {
+		throw new AnsteelTeamStateError("Ansteel team parallel task batch requires distinct task owners");
+	}
+
+	const preview = structuredClone(state);
+	const claimed = inputs.map((input) => claimAnsteelTeamTaskInState(projectDirectory, preview, input, allowedOwners));
+	if (claimed.some((task) => task.status !== "claimed")) {
+		throw new AnsteelTeamStateError("Ansteel team parallel task batch requires every dependency to be approved");
+	}
+	return { preview, claimedIds: new Set(claimed.map((task) => task.id)) };
+}
+
+/**
+ * Commits a parallel batch and its one public assignment event through the
+ * existing pending-transaction protocol. Event validation happens before the
+ * live state or durable state exposes any claimed task.
+ */
+export function assignAnsteelTeamTasks(
+	cwd: string,
+	state: AnsteelTeamState,
+	inputs: readonly ClaimAnsteelTeamTaskInput[],
+	allowedOwners: readonly AnsteelRole[] = DEFAULT_ANSTEEL_TEAM_TASK_OWNERS,
+	persistence?: AnsteelTeamPersistenceContext,
+): { tasks: AnsteelTeamTask[]; event: AnsteelTeamEvent } {
+	const projectDirectory = assertProjectDirectory(cwd);
+	const { preview, claimedIds } = prepareAnsteelTeamTaskBatch(projectDirectory, state, inputs, allowedOwners);
+	const tasks = preview.tasks.filter((task) => claimedIds.has(task.id));
+	const content = [
+		`Assigned parallel task batch (${tasks.length} tasks):`,
+		...tasks.map(
+			(task) =>
+				`- ${task.id} (${task.type}) -> ${task.owner}; status=${task.status}; dependencies=${
+					task.dependsOn.length === 0 ? "none" : task.dependsOn.join(", ")
+				}; files=${task.files.join(", ")}; assignment reason=${
+					task.assignmentReason ?? "default role assignment"
+				}; acceptance=${task.acceptanceCriteria}`,
+		),
+	].join("\n");
+	const event = appendAnsteelTeamEvent(
+		projectDirectory,
+		preview,
+		{ type: "tasks-assigned", role: "coordinator", content },
+		persistence,
+	);
+	Object.assign(state, preview);
+	return {
+		tasks: state.tasks.filter((task) => claimedIds.has(task.id)),
+		event,
+	};
 }
 
 export function createAnsteelTeamMilestone(
@@ -2324,13 +2484,27 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 	if (state.version === 7) {
 		state = {
 			...state,
-			version: ANSTEEL_TEAM_STATE_VERSION,
+			// Advance exactly one schema version so later migrations cannot be skipped when the current version grows.
+			version: 8,
 			workCheckpoints: Array.isArray(state.workCheckpoints)
 				? state.workCheckpoints.map((checkpoint) =>
 						isRecord(checkpoint) ? { ...checkpoint, status: "superseded", governedAction: null } : checkpoint,
 					)
 				: state.workCheckpoints,
 			actionReviews: [],
+		};
+	}
+	if (state.version === 8) {
+		state = {
+			...state,
+			version: ANSTEEL_TEAM_STATE_VERSION,
+			tasks: Array.isArray(state.tasks)
+				? state.tasks.map((task) =>
+						isRecord(task) && typeof task.owner === "string" && ANSTEEL_ROLES.includes(task.owner as AnsteelRole)
+							? { ...task, type: DEFAULT_TASK_TYPE_BY_ROLE[task.owner as AnsteelRole] }
+							: task,
+					)
+				: state.tasks,
 		};
 	}
 	return state;
@@ -2559,6 +2733,7 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "resolution" &&
 		event.type !== "role-failure" &&
 		event.type !== "task-assigned" &&
+		event.type !== "tasks-assigned" &&
 		event.type !== "task-claimed" &&
 		event.type !== "task-submitted" &&
 		event.type !== "task-review" &&
@@ -2580,9 +2755,9 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 	}
 	const isPublicCollaborationEvent = isAnsteelPublicCollaborationEventType(event.type);
 	if (event.role === "coordinator") {
-		if (event.type !== "task-assigned" && event.type !== "runtime-recovery") {
+		if (event.type !== "task-assigned" && event.type !== "tasks-assigned" && event.type !== "runtime-recovery") {
 			throw new AnsteelTeamStateError(
-				"Ansteel team coordinator can only record task-assigned or runtime-recovery events",
+				"Ansteel team coordinator can only record task-assigned, tasks-assigned, or runtime-recovery events",
 			);
 		}
 	} else {
@@ -2604,6 +2779,14 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 			throw new AnsteelTeamStateError("Ansteel team task-assigned events require the coordinator actor");
 		}
 		assertRole(event.targetRole, "assigned task owner");
+	}
+	if (event.type === "tasks-assigned") {
+		if (event.role !== "coordinator") {
+			throw new AnsteelTeamStateError("Ansteel team tasks-assigned events require the coordinator actor");
+		}
+		if (event.targetRole !== undefined) {
+			throw new AnsteelTeamStateError("Ansteel team tasks-assigned events cannot name one target role");
+		}
 	}
 	if (isPublicCollaborationEvent) {
 		assertAnsteelTeamPublicEventEnvelope(event);
@@ -3277,6 +3460,8 @@ export function getAnsteelTeamSharedBoard(
 		tasks: state.tasks.map((task) => ({
 			id: task.id,
 			owner: task.owner,
+			type: task.type,
+			...(task.assignmentReason === undefined ? {} : { assignmentReason: task.assignmentReason }),
 			status: task.status,
 			dependsOn: [...task.dependsOn],
 		})),

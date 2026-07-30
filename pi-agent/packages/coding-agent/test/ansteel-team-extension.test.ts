@@ -1356,7 +1356,7 @@ describe("Ansteel team extension", () => {
 		await command("start Review the parser", harness.ctx);
 
 		await command(
-			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			'task {"id":"TASK-1","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
 			harness.ctx,
 		);
 
@@ -1393,6 +1393,522 @@ describe("Ansteel team extension", () => {
 		).toMatchObject({ taskId: "TASK-1", outcome: "succeeded" });
 	});
 
+	it("runs three typed owners in parallel before sequential immutable peer reviews", async () => {
+		const config = createConfig();
+		config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
+		config.teamTaskMaxEpochs = 2;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		const ownerTaskByRole = {
+			"tech-lead": "TASK-ARCHITECTURE",
+			"staff-engineer": "TASK-IMPLEMENTATION",
+			"qa-engineer": "TASK-VERIFICATION",
+		} as const;
+		const ownerFileByRole = {
+			"tech-lead": ["src/architecture.ts", "export const architecture = 'after';\n"],
+			"staff-engineer": ["src/implementation.ts", "export const implementation = 'after';\n"],
+			"qa-engineer": [
+				"test/verification.test.mjs",
+				"import test from 'node:test';\ntest('verification', () => {});\ntest('parallel owner', () => {});\n",
+			],
+		} as const;
+		const startedOwners = new Set<string>();
+		let finishedOwners = 0;
+		let releaseOwnerWave: (() => void) | undefined;
+		const allOwnersStarted = new Promise<void>((resolve) => {
+			releaseOwnerWave = resolve;
+		});
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			const ownerTaskId = ownerTaskByRole[role as keyof typeof ownerTaskByRole];
+			if (prompt.includes(`Execute governed task ${ownerTaskId}`)) {
+				startedOwners.add(role);
+				if (startedOwners.size === 3) releaseOwnerWave?.();
+				await allOwnersStarted;
+				const [path, content] = ownerFileByRole[role as keyof typeof ownerFileByRole];
+				writeFileSync(join(harness.ctx.cwd, path), content, "utf8");
+				await roleOptions.taskOperations.submitTask(ownerTaskId, "node --test test/verification.test.mjs");
+				finishedOwners++;
+				return `${role} submitted ${ownerTaskId}.`;
+			}
+			if (prompt.startsWith("You are the independent ")) {
+				expect(finishedOwners).toBe(3);
+				const reviewedTaskId = prompt.match(/reviewer for (TASK-[A-Z0-9-]+) revision/)?.[1];
+				if (!reviewedTaskId) throw new Error("Missing task ID in review prompt");
+				await roleOptions.taskOperations.reviewTask(reviewedTaskId, { verdict: "approve" });
+				return `${role} approved ${reviewedTaskId}.`;
+			}
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		writeFileSync(join(harness.ctx.cwd, "src", "architecture.ts"), "export const architecture = 'before';\n", "utf8");
+		writeFileSync(
+			join(harness.ctx.cwd, "src", "implementation.ts"),
+			"export const implementation = 'before';\n",
+			"utf8",
+		);
+		writeFileSync(
+			join(harness.ctx.cwd, "test", "verification.test.mjs"),
+			"import test from 'node:test';\ntest('verification', () => {});\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "src/architecture.ts", "src/implementation.ts", "test/verification.test.mjs"], {
+			cwd: harness.ctx.cwd,
+			stdio: "ignore",
+		});
+		execFileSync("git", ["commit", "-m", "parallel baseline"], { cwd: harness.ctx.cwd, stdio: "ignore" });
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review typed parallel ownership", harness.ctx);
+
+		await command(
+			`task ${JSON.stringify([
+				{
+					id: "TASK-ARCHITECTURE",
+					owner: "tech-lead",
+					type: "architecture",
+					files: ["src/architecture.ts"],
+					description: "Define the architecture seam.",
+					acceptanceCriteria: "The shared verification test passes.",
+					dependsOn: [],
+				},
+				{
+					id: "TASK-IMPLEMENTATION",
+					owner: "staff-engineer",
+					type: "implementation",
+					files: ["src/implementation.ts"],
+					description: "Implement the product behavior.",
+					acceptanceCriteria: "The shared verification test passes.",
+					dependsOn: [],
+				},
+				{
+					id: "TASK-VERIFICATION",
+					owner: "qa-engineer",
+					type: "verification",
+					files: ["test/verification.test.mjs"],
+					description: "Extend the acceptance automation.",
+					acceptanceCriteria: "The shared verification test passes.",
+					dependsOn: [],
+				},
+			])}`,
+			harness.ctx,
+		);
+
+		expect(startedOwners).toEqual(new Set(["tech-lead", "staff-engineer", "qa-engineer"]));
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual([
+			expect.objectContaining({
+				id: "TASK-ARCHITECTURE",
+				owner: "tech-lead",
+				type: "architecture",
+				status: "approved",
+			}),
+			expect.objectContaining({
+				id: "TASK-IMPLEMENTATION",
+				owner: "staff-engineer",
+				type: "implementation",
+				status: "approved",
+			}),
+			expect.objectContaining({
+				id: "TASK-VERIFICATION",
+				owner: "qa-engineer",
+				type: "verification",
+				status: "approved",
+			}),
+		]);
+		const events = listAnsteelTeamEvents(harness.ctx.cwd);
+		const assignmentEvents = events.filter((event) => event.type === "tasks-assigned");
+		expect(assignmentEvents).toHaveLength(1);
+		expect(assignmentEvents[0]?.content).toContain("TASK-ARCHITECTURE");
+		expect(assignmentEvents[0]?.content).toContain("TASK-IMPLEMENTATION");
+		expect(assignmentEvents[0]?.content).toContain("TASK-VERIFICATION");
+		expect(events.filter((event) => event.type === "task-review")).toHaveLength(6);
+		const parallelRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(parallelRun).toBeDefined();
+		expect(
+			readAnsteelRuntimeLogs(harness.ctx.cwd, parallelRun!.runId).some(
+				(entry) => entry.eventName === "task.claim.parallel" && entry.outcome === "succeeded",
+			),
+		).toBe(true);
+	});
+
+	it("rejects a parallel assignment event without leaving a partial batch", async () => {
+		const config = createConfig();
+		config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
+		let ownerPrompts = 0;
+		const harness = setup(config, async (role, prompt) => {
+			if (prompt.includes("Execute governed task")) ownerPrompts++;
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Exercise atomic parallel assignment", harness.ctx);
+		const eventsBefore = listAnsteelTeamEvents(harness.ctx.cwd);
+
+		await expect(
+			command(
+				`task ${JSON.stringify([
+					{
+						id: "TASK-ARCHITECTURE",
+						owner: "tech-lead",
+						type: "architecture",
+						files: ["src/architecture.ts"],
+						description: "Define the architecture.",
+						acceptanceCriteria: "The architecture test passes.",
+						dependsOn: [],
+					},
+					{
+						id: "TASK-IMPLEMENTATION",
+						owner: "staff-engineer",
+						type: "implementation",
+						files: ["src/implementation.ts"],
+						description: "Implement the feature.",
+						acceptanceCriteria: "x".repeat(17_000),
+						dependsOn: [],
+					},
+					{
+						id: "TASK-VERIFICATION",
+						owner: "qa-engineer",
+						type: "verification",
+						files: ["test/verification.ts"],
+						description: "Verify the feature.",
+						acceptanceCriteria: "The verification test passes.",
+						dependsOn: [],
+					},
+				])}`,
+				harness.ctx,
+			),
+		).rejects.toThrow("public content exceeds");
+
+		expect(ownerPrompts).toBe(0);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual([]);
+		expect(listAnsteelTeamEvents(harness.ctx.cwd)).toEqual(eventsBefore);
+	});
+
+	it("queues cross-role review when a parallel owner submits an older task", async () => {
+		const config = createConfig();
+		config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
+		config.teamTaskMaxEpochs = 1;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		let finishedOwners = 0;
+		let reviewPrompts = 0;
+		let prematureReviewPrompts = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.includes("Execute governed task TASK-IMPLEMENTATION")) {
+				writeFileSync(
+					join(harness.ctx.cwd, "src", "parser.ts"),
+					"export const parser = 'old-task-change';\n",
+					"utf8",
+				);
+				await roleOptions.taskOperations.submitTask("TASK-OLD", "node --test test/parser.test.mjs");
+				finishedOwners++;
+				return "Staff submitted its older task during the new owner wave.";
+			}
+			if (prompt.includes("Execute governed task")) {
+				finishedOwners++;
+				return `${role} completed its new owner task.`;
+			}
+			if (prompt.startsWith("You are the independent ") && prompt.includes("reviewer for TASK-OLD revision")) {
+				reviewPrompts++;
+				if (finishedOwners < 3) prematureReviewPrompts++;
+				await roleOptions.taskOperations.reviewTask("TASK-OLD", { verdict: "approve" });
+				return `${role} approved TASK-OLD.`;
+			}
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Exercise cross-task parallel prompt deferral", harness.ctx);
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		if (!staff) throw new Error("Missing Staff Engineer operations");
+		await staff.taskOperations.claimTask({
+			id: "TASK-OLD",
+			type: "implementation",
+			files: ["src/parser.ts"],
+			description: "Keep an older Staff task active.",
+			acceptanceCriteria: "The parser test passes.",
+			dependsOn: [],
+		});
+		reviewPrompts = 0;
+
+		await command(
+			`task ${JSON.stringify([
+				{
+					id: "TASK-ARCHITECTURE",
+					owner: "tech-lead",
+					type: "architecture",
+					files: ["src/architecture.ts"],
+					description: "Exercise the architecture owner.",
+					acceptanceCriteria: "The batch remains isolated.",
+					dependsOn: [],
+				},
+				{
+					id: "TASK-IMPLEMENTATION",
+					owner: "staff-engineer",
+					type: "implementation",
+					files: ["src/implementation.ts"],
+					description: "Exercise the Staff owner.",
+					acceptanceCriteria: "The batch remains isolated.",
+					dependsOn: [],
+				},
+				{
+					id: "TASK-VERIFICATION",
+					owner: "qa-engineer",
+					type: "verification",
+					files: ["test/verification.ts"],
+					description: "Exercise the QA owner.",
+					acceptanceCriteria: "The batch remains isolated.",
+					dependsOn: [],
+				},
+			])}`,
+			harness.ctx,
+		);
+
+		expect(prematureReviewPrompts).toBe(0);
+		expect(reviewPrompts).toBe(2);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: "TASK-OLD", status: "approved" })]),
+		);
+	});
+
+	it("flushes a deferred older milestone after every parallel owner settles", async () => {
+		const config = createConfig();
+		config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
+		config.teamTaskMaxEpochs = 1;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		let finishedOwners = 0;
+		let expectedOwners = 3;
+		let milestoneReviewPrompts = 0;
+		let prematureMilestoneReviews = 0;
+		let qaMilestoneAttempts = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.filter((entry) => entry.role === role).at(-1);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.includes("reviewer for TASK-PREREQUISITE revision")) {
+				await roleOptions.taskOperations.reviewTask("TASK-PREREQUISITE", { verdict: "approve" });
+				return `${role} approved the prerequisite task.`;
+			}
+			if (prompt.includes("Execute governed task TASK-ARCHITECTURE. This")) {
+				await roleOptions.taskOperations.submitMilestone("MILESTONE-OLD", "node --test test/parser.test.mjs");
+				finishedOwners++;
+				return "Tech Lead submitted the older milestone during the new owner wave.";
+			}
+			if (prompt.includes("Execute governed task")) {
+				finishedOwners++;
+				return `${role} completed its new owner task.`;
+			}
+			if (prompt.includes("reviewer for MILESTONE-OLD integration revision")) {
+				milestoneReviewPrompts++;
+				if (finishedOwners < expectedOwners) prematureMilestoneReviews++;
+				if (role === "qa-engineer" && ++qaMilestoneAttempts === 1) {
+					throw new Error("transient QA provider failure");
+				}
+				await roleOptions.taskOperations.reviewMilestone("MILESTONE-OLD", { verdict: "approve" });
+				return `${role} approved MILESTONE-OLD.`;
+			}
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Exercise milestone prompt deferral", harness.ctx);
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		const techLead = harness.roleSessionOptions.find((entry) => entry.role === "tech-lead");
+		if (!staff || !techLead) throw new Error("Missing task operations for milestone setup");
+		await staff.taskOperations.claimTask({
+			id: "TASK-PREREQUISITE",
+			type: "implementation",
+			files: ["src/parser.ts"],
+			description: "Prepare an approved task for an older integration milestone.",
+			acceptanceCriteria: "The parser test passes.",
+			dependsOn: [],
+		});
+		writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'milestone-ready';\n", "utf8");
+		await staff.taskOperations.submitTask("TASK-PREREQUISITE", "node --test test/parser.test.mjs");
+		await techLead.taskOperations.createMilestone({
+			id: "MILESTONE-OLD",
+			taskIds: ["TASK-PREREQUISITE"],
+			description: "Verify the approved prerequisite as one integration unit.",
+			acceptanceCriteria: "The parser integration test passes.",
+		});
+		finishedOwners = 0;
+
+		await command(
+			`task ${JSON.stringify([
+				{
+					id: "TASK-ARCHITECTURE",
+					owner: "tech-lead",
+					type: "architecture",
+					files: ["src/architecture.ts"],
+					description: "Exercise the architecture owner.",
+					acceptanceCriteria: "The batch remains isolated.",
+					dependsOn: [],
+				},
+				{
+					id: "TASK-IMPLEMENTATION",
+					owner: "staff-engineer",
+					type: "implementation",
+					files: ["src/implementation.ts"],
+					description: "Exercise the Staff owner.",
+					acceptanceCriteria: "The batch remains isolated.",
+					dependsOn: [],
+				},
+				{
+					id: "TASK-VERIFICATION",
+					owner: "qa-engineer",
+					type: "verification",
+					files: ["test/verification.ts"],
+					description: "Exercise the QA owner.",
+					acceptanceCriteria: "The batch remains isolated.",
+					dependsOn: [],
+				},
+			])}`,
+			harness.ctx,
+		);
+
+		expect(prematureMilestoneReviews).toBe(0);
+		expect(milestoneReviewPrompts).toBe(2);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.milestones).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "MILESTONE-OLD",
+					status: "submitted",
+					reviews: [expect.objectContaining({ reviewer: "staff-engineer", verdict: "approve" })],
+				}),
+			]),
+		);
+
+		await command("stop", harness.ctx);
+		finishedOwners = 0;
+		expectedOwners = 0;
+		await command("start Exercise milestone prompt deferral", harness.ctx);
+
+		expect(prematureMilestoneReviews).toBe(0);
+		expect(milestoneReviewPrompts).toBe(3);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.milestones).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "MILESTONE-OLD",
+					status: "approved",
+					reviews: expect.arrayContaining([
+						expect.objectContaining({ reviewer: "staff-engineer", verdict: "approve" }),
+						expect.objectContaining({ reviewer: "qa-engineer", verdict: "approve" }),
+					]),
+				}),
+			]),
+		);
+	});
+
+	it("keeps peer reviews deferred until every parallel owner settles after an infrastructure failure", async () => {
+		const config = createConfig();
+		config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
+		config.teamTaskMaxEpochs = 1;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		let releaseStaff: (() => void) | undefined;
+		let releaseQa: (() => void) | undefined;
+		const staffMayContinue = new Promise<void>((resolve) => {
+			releaseStaff = resolve;
+		});
+		const qaMayContinue = new Promise<void>((resolve) => {
+			releaseQa = resolve;
+		});
+		let finishedOwners = 0;
+		let prematureReviewPrompts = 0;
+		let staffSubmitted = false;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.includes("Execute governed task TASK-ARCHITECTURE")) {
+				finishedOwners++;
+				return "Tech Lead completed the owner callback.";
+			}
+			if (prompt.includes("Execute governed task TASK-IMPLEMENTATION")) {
+				await staffMayContinue;
+				writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+				await roleOptions.taskOperations.submitTask("TASK-IMPLEMENTATION", "node --test test/parser.test.mjs");
+				staffSubmitted = true;
+				finishedOwners++;
+				releaseQa?.();
+				return "Staff completed the delayed owner callback.";
+			}
+			if (prompt.includes("Execute governed task TASK-VERIFICATION")) {
+				await qaMayContinue;
+				finishedOwners++;
+				return "QA completed the delayed owner callback.";
+			}
+			if (prompt.startsWith("You are the independent ")) {
+				if (finishedOwners < 3) prematureReviewPrompts++;
+				return `${role} observed a review prompt.`;
+			}
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Exercise parallel infrastructure failure isolation", harness.ctx);
+		harness.sendMessage.mockImplementation((message) => {
+			if (
+				message.customType === "ansteel-team-event" &&
+				typeof message.content === "string" &&
+				message.content.includes("tech-lead parallel task epoch 1")
+			) {
+				// Delay the other owners until a reject-fast Promise.all would
+				// already have entered its finally block and cleared deferral.
+				setTimeout(() => releaseStaff?.(), 0);
+				throw new Error("simulated timeline infrastructure failure");
+			}
+		});
+
+		await expect(
+			command(
+				`task ${JSON.stringify([
+					{
+						id: "TASK-ARCHITECTURE",
+						owner: "tech-lead",
+						type: "architecture",
+						files: ["src/architecture.ts"],
+						description: "Exercise a failing owner result.",
+						acceptanceCriteria: "The batch fails closed.",
+						dependsOn: [],
+					},
+					{
+						id: "TASK-IMPLEMENTATION",
+						owner: "staff-engineer",
+						type: "implementation",
+						files: ["src/parser.ts"],
+						description: "Submit after the peer owner fails.",
+						acceptanceCriteria: "The parser test passes.",
+						dependsOn: [],
+					},
+					{
+						id: "TASK-VERIFICATION",
+						owner: "qa-engineer",
+						type: "verification",
+						files: ["test/verification.ts"],
+						description: "Remain active while Staff submits.",
+						acceptanceCriteria: "No reviewer re-enters this session.",
+						dependsOn: [],
+					},
+				])}`,
+				harness.ctx,
+			),
+		).rejects.toThrow("simulated timeline infrastructure failure");
+
+		expect(staffSubmitted).toBe(true);
+		expect(finishedOwners).toBe(3);
+		expect(prematureReviewPrompts).toBe(0);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: "TASK-IMPLEMENTATION", status: "submitted" })]),
+		);
+	});
+
 	it("fails a task command with the audited collaboration tool when the owner provider also errors", async () => {
 		const config = createConfig();
 		config.teamTaskMaxEpochs = 1;
@@ -1417,7 +1933,7 @@ describe("Ansteel team extension", () => {
 
 		await expect(
 			command(
-				'task {"id":"TASK-AUDIT-FAIL","owner":"staff-engineer","files":["src/parser.ts"],"description":"Exercise owner error handling","acceptanceCriteria":"The command fails closed","dependsOn":[]}',
+				'task {"id":"TASK-AUDIT-FAIL","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Exercise owner error handling","acceptanceCriteria":"The command fails closed","dependsOn":[]}',
 				harness.ctx,
 			),
 		).rejects.toThrow("ansteel_publish_checkpoint returned an error");
@@ -1438,7 +1954,7 @@ describe("Ansteel team extension", () => {
 		await command("start Review the parser", harness.ctx);
 
 		await command(
-			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			'task {"id":"TASK-1","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
 			harness.ctx,
 		);
 
@@ -1470,7 +1986,7 @@ describe("Ansteel team extension", () => {
 		await command("start Review the parser", harness.ctx);
 
 		await command(
-			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			'task {"id":"TASK-1","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
 			harness.ctx,
 		);
 
@@ -1540,7 +2056,7 @@ describe("Ansteel team extension", () => {
 		await expect(command("task {bad-json", harness.ctx)).rejects.toThrow("Usage:");
 		await expect(
 			command(
-				'task {"id":"TASK-TL","owner":"tech-lead","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
+				'task {"id":"TASK-TL","owner":"tech-lead","type":"architecture","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
 				harness.ctx,
 			),
 		).rejects.toThrow("not authorized");
@@ -1549,7 +2065,7 @@ describe("Ansteel team extension", () => {
 		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toHaveLength(0);
 
 		await command(
-			'task {"id":"TASK-OK","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
+			'task {"id":"TASK-OK","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"Pass","dependsOn":[]}',
 			harness.ctx,
 		);
 		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ status: "approved" });
@@ -1591,7 +2107,7 @@ describe("Ansteel team extension", () => {
 		await command("start Review the parser", harness.ctx);
 
 		await command(
-			'task {"id":"TASK-1","owner":"staff-engineer","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			'task {"id":"TASK-1","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
 			harness.ctx,
 		);
 

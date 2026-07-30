@@ -15,6 +15,7 @@ import {
 	loadAnsteelConfig,
 } from "../../core/ansteel-discussion.ts";
 import {
+	ANSTEEL_TEAM_TASK_TYPES,
 	type AnsteelActionAssessment,
 	type AnsteelActionReview,
 	type AnsteelActionReviewInput,
@@ -33,10 +34,12 @@ import {
 	type AnsteelTeamTask,
 	type AnsteelTeamTaskReview,
 	type AnsteelTeamTaskSubmission,
+	type AnsteelTeamTaskType,
 	type AnsteelWorkCheckpoint,
 	type AnsteelWorkCheckpointInput,
 	appendAnsteelTeamEvent,
 	assessAnsteelTeamAction,
+	assignAnsteelTeamTasks,
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
@@ -185,11 +188,31 @@ interface ActiveAnsteelTeam {
 	maxToolCallsPerStage: number;
 	taskMaxEpochs: number;
 	taskMaxNoProgressEpochs: number;
+	/**
+	 * Any positive depth queues tool-triggered cross-role prompts for the whole
+	 * coordinator-controlled parallel command. This also covers an owner or
+	 * reviewer submitting an older task or milestone during the batch.
+	 */
+	crossRolePromptDeferralDepth: number;
+	/**
+	 * Immutable review identities deferred while owner sessions are running.
+	 * Entries survive a failed flush in this active coordinator so a later
+	 * parallel command can retry without manufacturing a new submission.
+	 */
+	deferredCrossRoleReviews: DeferredCrossRoleReview[];
+}
+
+interface DeferredCrossRoleReview {
+	kind: "task" | "milestone";
+	id: string;
+	revision: number;
 }
 
 interface CoordinatorTaskInput {
 	id: string;
 	owner: AnsteelRole;
+	type: AnsteelTeamTaskType;
+	assignmentReason?: string;
 	files: string[];
 	description: string;
 	acceptanceCriteria: string;
@@ -554,10 +577,17 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			name: "ansteel_claim_task",
 			label: "claim task",
 			description:
-				"Claim exact project-relative files before editing. A task must include a unique TASK-<UPPERCASE-ID>, description, acceptance criteria, and every predecessor task ID in dependsOn.",
+				"Claim a typed task and exact project-relative files before editing. Architecture/integration normally belong to Tech Lead, implementation to Staff, and verification to QA; a cross-role assignment requires a public reason.",
 			promptSnippet: "Claim exact files before using edit or write.",
 			parameters: Type.Object({
 				id: Type.String(),
+				type: Type.Union([
+					Type.Literal("architecture"),
+					Type.Literal("integration"),
+					Type.Literal("implementation"),
+					Type.Literal("verification"),
+				]),
+				assignmentReason: Type.Optional(Type.String()),
 				files: Type.Array(Type.String(), { minItems: 1 }),
 				description: Type.String(),
 				acceptanceCriteria: Type.String(),
@@ -566,8 +596,8 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			async execute(_toolCallId, input) {
 				const task = await taskOperations.claimTask(input);
 				return {
-					content: [{ type: "text", text: `Claimed ${task.id}: ${task.files.join(", ")}` }],
-					details: { taskId: task.id },
+					content: [{ type: "text", text: `Claimed ${task.id} (${task.type}): ${task.files.join(", ")}` }],
+					details: { taskId: task.id, taskType: task.type },
 				};
 			},
 		}),
@@ -587,7 +617,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 					content: [
 						{
 							type: "text",
-							text: `Submitted ${input.taskId} revision ${submission.revision}; peer reviews have been requested.`,
+							text: `Submitted ${input.taskId} revision ${submission.revision}; peer reviews are requested or queued by the coordinator.`,
 						},
 					],
 					details: { revision: submission.revision, taskId: input.taskId },
@@ -645,7 +675,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			name: "ansteel_submit_integration",
 			label: "submit integration",
 			description:
-				"Tech Lead runs one allowed integration command, freezes its real output, and requests Staff and QA review of the same evidence.",
+				"Tech Lead runs one allowed integration command, freezes its real output, and requests or queues Staff and QA review of the same evidence.",
 			promptSnippet: "Submit integration evidence only after every milestone task is approved.",
 			parameters: Type.Object({ milestoneId: Type.String(), testCommand: Type.String() }),
 			async execute(_toolCallId, input) {
@@ -897,6 +927,8 @@ function buildTaskReviewPrompt(
 		"Review the immutable evidence package below. Inspect the current project with read-only tools when needed. You cannot edit this task.",
 		"Do not rely on another reviewer's response. When ready, call ansteel_review_task exactly once. A rejection must state a concrete issue.",
 		`Task owner: ${task.owner}`,
+		`Task type: ${task.type}`,
+		task.assignmentReason === undefined ? undefined : `Cross-role assignment reason: ${task.assignmentReason}`,
 		`Files: ${task.files.join(", ")}`,
 		`Dependencies: ${task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")}`,
 		`Description: ${task.description}`,
@@ -911,7 +943,9 @@ function buildTaskReviewPrompt(
 		submission.diff,
 		"```",
 		"Return a concise public review update after recording the verdict with the tool.",
-	].join("\n\n");
+	]
+		.filter((section): section is string => section !== undefined)
+		.join("\n\n");
 }
 
 function buildActionReviewPrompt(checkpoint: AnsteelWorkCheckpoint): string {
@@ -990,6 +1024,8 @@ function buildTaskOwnerPrompt(task: AnsteelTeamTask, epoch: number, maxToolCalls
 	return [
 		`Execute governed task ${task.id}. This is owner epoch ${epoch}.`,
 		`Owner: ${task.owner}`,
+		`Task type: ${task.type}`,
+		task.assignmentReason === undefined ? undefined : `Cross-role assignment reason: ${task.assignmentReason}`,
 		`Status: ${task.status}`,
 		`Revision: ${task.revision}`,
 		`Files: ${task.files.join(", ")}`,
@@ -1001,35 +1037,48 @@ function buildTaskOwnerPrompt(task: AnsteelTeamTask, epoch: number, maxToolCalls
 		"After bounded inspection, use edit/write on the governed files to leave a syntactically valid implementation checkpoint before doing more research. A later epoch can continue from that real Git diff.",
 		"Call ansteel_submit_change with a real supported test command when the acceptance criteria are satisfied.",
 		"Public prose alone is not task progress. Return a concise public update after making the governed state change, or report the concrete tool error that blocked it.",
-	].join("\n\n");
+	]
+		.filter((section): section is string => section !== undefined)
+		.join("\n\n");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseCoordinatorTaskArgument(
-	argument: string,
-): { kind: "create"; input: CoordinatorTaskInput } | { kind: "resume"; taskId: string } {
-	if (/^TASK-[A-Z0-9][A-Z0-9-]*$/.test(argument)) {
-		return { kind: "resume", taskId: argument };
-	}
+/**
+ * Infrastructure failures must not reject before sibling role prompts return;
+ * a caller may otherwise start the next task against a still-busy session.
+ */
+async function waitForAnsteelRoleOperations(operations: Promise<unknown>[]): Promise<void> {
+	const results = await Promise.allSettled(operations);
+	const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+	if (failure) throw failure.reason;
+}
 
-	let value: unknown;
-	try {
-		value = JSON.parse(argument);
-	} catch {
-		throw new Error(
-			'Usage: /ansteel-team task {"id":"TASK-ID","owner":"staff-engineer","files":["src/file.ts"],"description":"...","acceptanceCriteria":"...","dependsOn":[]}',
-		);
-	}
+function parseCoordinatorTaskInput(value: unknown): CoordinatorTaskInput {
 	if (!isRecord(value)) throw new Error("Ansteel team coordinator task must be a JSON object");
-	const allowedKeys = new Set(["id", "owner", "files", "description", "acceptanceCriteria", "dependsOn"]);
+	const allowedKeys = new Set([
+		"id",
+		"owner",
+		"type",
+		"assignmentReason",
+		"files",
+		"description",
+		"acceptanceCriteria",
+		"dependsOn",
+	]);
 	const unexpectedKey = Object.keys(value).find((key) => !allowedKeys.has(key));
 	if (unexpectedKey) throw new Error(`Ansteel team coordinator task has an unexpected field: ${unexpectedKey}`);
 	if (typeof value.id !== "string") throw new Error("Ansteel team coordinator task requires a string id");
 	if (typeof value.owner !== "string" || !ANSTEEL_ROLES.includes(value.owner as AnsteelRole)) {
 		throw new Error("Ansteel team coordinator task requires a valid owner");
+	}
+	if (typeof value.type !== "string" || !ANSTEEL_TEAM_TASK_TYPES.includes(value.type as AnsteelTeamTaskType)) {
+		throw new Error("Ansteel team coordinator task requires a valid type");
+	}
+	if (value.assignmentReason !== undefined && typeof value.assignmentReason !== "string") {
+		throw new Error("Ansteel team coordinator task assignmentReason must be a string");
 	}
 	if (!Array.isArray(value.files) || !value.files.every((file) => typeof file === "string")) {
 		throw new Error("Ansteel team coordinator task requires a string files array");
@@ -1044,16 +1093,39 @@ function parseCoordinatorTaskArgument(
 		throw new Error("Ansteel team coordinator task requires a string dependsOn array");
 	}
 	return {
-		kind: "create",
-		input: {
-			id: value.id,
-			owner: value.owner as AnsteelRole,
-			files: value.files as string[],
-			description: value.description,
-			acceptanceCriteria: value.acceptanceCriteria,
-			dependsOn: value.dependsOn as string[],
-		},
+		id: value.id,
+		owner: value.owner as AnsteelRole,
+		type: value.type as AnsteelTeamTaskType,
+		...(value.assignmentReason === undefined ? {} : { assignmentReason: value.assignmentReason }),
+		files: value.files as string[],
+		description: value.description,
+		acceptanceCriteria: value.acceptanceCriteria,
+		dependsOn: value.dependsOn as string[],
 	};
+}
+
+function parseCoordinatorTaskArgument(
+	argument: string,
+):
+	| { kind: "create"; input: CoordinatorTaskInput }
+	| { kind: "parallel"; inputs: CoordinatorTaskInput[] }
+	| { kind: "resume"; taskId: string } {
+	if (/^TASK-[A-Z0-9][A-Z0-9-]*$/.test(argument)) {
+		return { kind: "resume", taskId: argument };
+	}
+
+	let value: unknown;
+	try {
+		value = JSON.parse(argument);
+	} catch {
+		throw new Error(
+			'Usage: /ansteel-team task {"id":"TASK-ID","owner":"staff-engineer","type":"implementation","files":["src/file.ts"],"description":"...","acceptanceCriteria":"...","dependsOn":[]}',
+		);
+	}
+	if (Array.isArray(value)) {
+		return { kind: "parallel", inputs: value.map((item) => parseCoordinatorTaskInput(item)) };
+	}
+	return { kind: "create", input: parseCoordinatorTaskInput(value) };
 }
 
 function emitTimelineMessage(pi: ExtensionAPI, content: string): void {
@@ -1071,7 +1143,9 @@ function formatStatus(state: AnsteelTeamState): string {
 	const openChallenges = state.openChallenges.filter((challenge) => challenge.status === "open");
 	const taskLines = state.tasks.map(
 		(task) =>
-			`- ${task.id}: ${task.status}${task.dependsOn.length === 0 ? "" : ` (depends on ${task.dependsOn.join(", ")})`}`,
+			`- ${task.id}: ${task.type}; owner=${task.owner}; ${task.status}${
+				task.dependsOn.length === 0 ? "" : ` (depends on ${task.dependsOn.join(", ")})`
+			}`,
 	);
 	const milestoneLines = state.milestones.map(
 		(milestone) => `- ${milestone.id}: ${milestone.status} (${milestone.taskIds.join(", ")})`,
@@ -1098,9 +1172,9 @@ export function formatSharedBoard(board: AnsteelTeamSharedBoard): string {
 	});
 	const taskLines = board.tasks.map(
 		(task) =>
-			`- ${task.id}: owner=${task.owner}; status=${task.status}; dependencies=${
+			`- ${task.id}: type=${task.type}; owner=${task.owner}; status=${task.status}; dependencies=${
 				task.dependsOn.length === 0 ? "none" : task.dependsOn.join(", ")
-			}`,
+			}${task.assignmentReason === undefined ? "" : `; assignment reason=${task.assignmentReason}`}`,
 	);
 	const checkpointLines = board.activeCheckpoints.map(
 		(checkpoint) =>
@@ -1443,7 +1517,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					role !== task.owner &&
 					!task.reviews.some((review) => review.revision === submission.revision && review.reviewer === role),
 			);
-			await Promise.all(
+			await waitForAnsteelRoleOperations(
 				reviewers.map(async (reviewer) => {
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
@@ -1522,7 +1596,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			if (reviewers.length === 0) return;
 			const prompt = buildActionReviewPrompt(checkpoint);
 
-			await Promise.all(
+			await waitForAnsteelRoleOperations(
 				reviewers.map(async (reviewer) => {
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
@@ -1568,8 +1642,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			milestone: AnsteelTeamMilestone,
 			submission: AnsteelTeamMilestoneSubmission,
 		): Promise<void> => {
-			const reviewers: AnsteelRole[] = ["staff-engineer", "qa-engineer"];
-			await Promise.all(
+			const reviewers: AnsteelRole[] = (["staff-engineer", "qa-engineer"] satisfies AnsteelRole[]).filter(
+				(reviewer) =>
+					!milestone.reviews.some(
+						(review) => review.revision === submission.revision && review.reviewer === reviewer,
+					),
+			);
+			await waitForAnsteelRoleOperations(
 				reviewers.map(async (reviewer) => {
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
@@ -1618,6 +1697,83 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					}
 				}),
 			);
+		};
+
+		const queueDeferredCrossRoleReview = (activeTeam: ActiveAnsteelTeam, request: DeferredCrossRoleReview): void => {
+			if (
+				activeTeam.deferredCrossRoleReviews.some(
+					(item) => item.kind === request.kind && item.id === request.id && item.revision === request.revision,
+				)
+			) {
+				return;
+			}
+			activeTeam.deferredCrossRoleReviews.push(request);
+		};
+
+		/**
+		 * Flushes one stable queue snapshot in submission order. A failed request,
+		 * or a provider response that leaves reviewers missing, is requeued after
+		 * every sibling request has been attempted so one failure cannot starve
+		 * unrelated task or milestone evidence.
+		 */
+		const flushDeferredCrossRoleReviews = async (
+			activeTeam: ActiveAnsteelTeam,
+			ctx: ExtensionCommandContext,
+		): Promise<void> => {
+			const pending = activeTeam.deferredCrossRoleReviews.splice(0);
+			const retry: DeferredCrossRoleReview[] = [];
+			const failures: unknown[] = [];
+			for (const request of pending) {
+				try {
+					if (request.kind === "task") {
+						const task = activeTeam.state.tasks.find((item) => item.id === request.id);
+						if (!task || task.status !== "submitted" || task.revision !== request.revision) continue;
+						const submission = task.submissions.find((item) => item.revision === request.revision);
+						if (!submission) {
+							throw new Error(`Ansteel team task ${request.id} has no deferred immutable submission`);
+						}
+						await requestPeerReviews(activeTeam, ctx, task, submission);
+						const current = activeTeam.state.tasks.find((item) => item.id === request.id);
+						if (current?.status === "submitted" && current.revision === request.revision) retry.push(request);
+						continue;
+					}
+
+					const milestone = activeTeam.state.milestones.find((item) => item.id === request.id);
+					if (!milestone || milestone.status !== "submitted" || milestone.revision !== request.revision) continue;
+					const submission = milestone.submissions.find((item) => item.revision === request.revision);
+					if (!submission) {
+						throw new Error(`Ansteel team milestone ${request.id} has no deferred immutable submission`);
+					}
+					await requestMilestoneReviews(activeTeam, ctx, milestone, submission);
+					const current = activeTeam.state.milestones.find((item) => item.id === request.id);
+					if (current?.status === "submitted" && current.revision === request.revision) retry.push(request);
+				} catch (error) {
+					retry.push(request);
+					failures.push(error);
+				}
+			}
+			for (const request of retry) queueDeferredCrossRoleReview(activeTeam, request);
+			if (failures.length === 1) throw failures[0];
+			if (failures.length > 1) {
+				throw new AggregateError(failures, "Multiple deferred Ansteel cross-role reviews failed");
+			}
+		};
+
+		const flushQueuedCrossRoleReviews = async (
+			activeTeam: ActiveAnsteelTeam,
+			ctx: ExtensionCommandContext,
+		): Promise<void> => {
+			if (activeTeam.crossRolePromptDeferralDepth !== 0 || activeTeam.deferredCrossRoleReviews.length === 0) {
+				return;
+			}
+			// Reviewer tools can submit other work. Keep that work queued instead of
+			// recursively entering a persistent session already used by this flush.
+			activeTeam.crossRolePromptDeferralDepth++;
+			try {
+				await flushDeferredCrossRoleReviews(activeTeam, ctx);
+			} finally {
+				activeTeam.crossRolePromptDeferralDepth--;
+			}
 		};
 
 		const createTaskOperations = (
@@ -1802,9 +1958,11 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						activeTeam.state,
 						"task-claimed",
 						role,
-						`${task.id} claimed by ${role}\n\nStatus: ${task.status}\n\nDependencies: ${
+						`${task.id} (${task.type}) claimed by ${role}\n\nStatus: ${task.status}\n\nDependencies: ${
 							task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
-						}\n\nFiles: ${task.files.join(", ")}\n\nAcceptance: ${task.acceptanceCriteria}`,
+						}\n\nFiles: ${task.files.join(", ")}\n\nAssignment reason: ${
+							task.assignmentReason ?? "default role assignment"
+						}\n\nAcceptance: ${task.acceptanceCriteria}`,
 					);
 					return task;
 				});
@@ -1844,7 +2002,15 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						role,
 						`${task.id} revision ${submission.revision} submitted by ${role}\n\nTest: ${submission.test.command}\n\nDiff bytes: ${submission.diff.length}`,
 					);
-					await requestPeerReviews(activeTeam, ctx, task, submission);
+					if (activeTeam.crossRolePromptDeferralDepth === 0) {
+						await requestPeerReviews(activeTeam, ctx, task, submission);
+					} else {
+						queueDeferredCrossRoleReview(activeTeam, {
+							kind: "task",
+							id: task.id,
+							revision: submission.revision,
+						});
+					}
 					return submission;
 				});
 			},
@@ -1942,7 +2108,15 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							role,
 							`${milestone.id} integration revision ${submission.revision} submitted\n\nTest: ${submission.test.command}`,
 						);
-						await requestMilestoneReviews(activeTeam, ctx, milestone, submission);
+						if (activeTeam.crossRolePromptDeferralDepth === 0) {
+							await requestMilestoneReviews(activeTeam, ctx, milestone, submission);
+						} else {
+							queueDeferredCrossRoleReview(activeTeam, {
+								kind: "milestone",
+								id: milestone.id,
+								revision: submission.revision,
+							});
+						}
 						return submission;
 					},
 				);
@@ -2095,6 +2269,204 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			emitTimelineMessage(pi, `## ${task.owner} task stopped [${event.sequence}]\n\n${event.content}`);
 		};
 
+		/**
+		 * Runs one owner epoch for each distinct role at the same time, then
+		 * performs action and immutable-submission reviews only after the owner
+		 * wave is finished. This preserves real parallel work without re-entering
+		 * a persistent role session as both owner and reviewer.
+		 */
+		const runParallelTaskEpochs = async (
+			activeTeam: ActiveAnsteelTeam,
+			ctx: ExtensionCommandContext,
+			taskIds: readonly string[],
+		): Promise<void> => {
+			const noProgressEpochs = new Map(taskIds.map((taskId) => [taskId, 0]));
+			const stoppedTaskIds = new Set<string>();
+			activeTeam.crossRolePromptDeferralDepth++;
+			let executionFailure: unknown;
+			try {
+				await (async () => {
+					for (let epoch = 1; epoch <= activeTeam.taskMaxEpochs; epoch++) {
+						// Resume or settle prior submissions before allocating a new owner wave.
+						for (const taskId of taskIds) {
+							if (stoppedTaskIds.has(taskId)) continue;
+							let task = activeTeam.state.tasks.find((item) => item.id === taskId);
+							if (!task) throw new Error(`Ansteel team task ${taskId} does not exist`);
+							if (task.status === "blocked") {
+								throw new Error(`Ansteel team task ${task.id} is waiting for approved dependencies`);
+							}
+							if (task.status === "submitted") {
+								await requestOutstandingTaskReviews(activeTeam, ctx, task);
+								task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
+								// A provider failure can leave an immutable submission waiting
+								// for a later explicit resume; do not re-enter its owner session.
+								if (task.status === "submitted") stoppedTaskIds.add(taskId);
+							}
+						}
+
+						const runnableTasks = taskIds
+							.filter((taskId) => !stoppedTaskIds.has(taskId))
+							.map((taskId) => activeTeam.state.tasks.find((item) => item.id === taskId))
+							.filter(
+								(task): task is AnsteelTeamTask =>
+									task !== undefined &&
+									task.status !== "approved" &&
+									(task.status === "claimed" || task.status === "revision-required"),
+							);
+						if (runnableTasks.length === 0) return;
+
+						const beforeFingerprints = new Map(
+							runnableTasks.map((task) => [
+								task.id,
+								getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id),
+							]),
+						);
+						const ownerResults = await Promise.allSettled(
+							runnableTasks.map(async (task) => {
+								const session = activeTeam.sessions.get(task.owner);
+								if (!session) throw new Error(`Ansteel team ${task.owner} session is not active`);
+								activeTeam.state.roles[task.owner].status = "working";
+								saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+								try {
+									const response = await promptObservedRole(
+										ctx.cwd,
+										task.owner,
+										session,
+										buildTaskOwnerPrompt(task, epoch, activeTeam.maxToolCallsPerStage),
+										activeTeam.stageTimeoutMs,
+										{ taskId: task.id },
+									);
+									activeTeam.state.roles[task.owner].status = "idle";
+									saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+									const event = appendAnsteelTeamEvent(
+										ctx.cwd,
+										activeTeam.state,
+										{ type: "role-report", role: task.owner, content: response.trim() },
+										getPersistenceContext(ctx.cwd),
+									);
+									emitTimelineMessage(
+										pi,
+										`## ${task.owner} parallel task epoch ${epoch} [${event.sequence}]\n\n${event.content}`,
+									);
+								} catch (error) {
+									activeTeam.state.roles[task.owner].status = "failed";
+									saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+									const content = formatAnsteelPublicError(error);
+									const event = appendAnsteelTeamEvent(
+										ctx.cwd,
+										activeTeam.state,
+										{ type: "role-failure", role: task.owner, content },
+										getPersistenceContext(ctx.cwd),
+									);
+									emitTimelineMessage(
+										pi,
+										`## ${task.owner} parallel task epoch ${epoch} failure [${event.sequence}]\n\n${content}`,
+									);
+								}
+							}),
+						);
+						// Promise.all would reject before slower owners return. Keeping the
+						// deferral active until every owner settles prevents a late submit
+						// from re-entering another role session as a reviewer.
+						const failedOwner = ownerResults.find(
+							(result): result is PromiseRejectedResult => result.status === "rejected",
+						);
+						if (failedOwner) throw failedOwner.reason;
+
+						// Cross-role prompts run only after every owner session is idle.
+						for (const taskId of runnableTasks.map((task) => task.id)) {
+							let task = activeTeam.state.tasks.find((item) => item.id === taskId);
+							if (!task || task.status === "approved") continue;
+							await requestPendingActionReviews(activeTeam, ctx, task);
+							task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
+							if (task.status === "submitted") {
+								await requestOutstandingTaskReviews(activeTeam, ctx, task);
+								task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
+								if (task.status === "submitted") {
+									stoppedTaskIds.add(taskId);
+									continue;
+								}
+							}
+							if (task.status === "approved") continue;
+							const after = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+							const before = beforeFingerprints.get(task.id);
+							const noProgress = after === before ? (noProgressEpochs.get(task.id) ?? 0) + 1 : 0;
+							noProgressEpochs.set(task.id, noProgress);
+							if (noProgress >= activeTeam.taskMaxNoProgressEpochs) {
+								activeTeam.state.roles[task.owner].status = "failed";
+								saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+								const event = appendAnsteelTeamEvent(
+									ctx.cwd,
+									activeTeam.state,
+									{
+										type: "role-failure",
+										role: task.owner,
+										content: `Ansteel team task ${task.id} stopped: owner-no-progress after ${noProgress} consecutive parallel epochs`,
+									},
+									getPersistenceContext(ctx.cwd),
+								);
+								emitTimelineMessage(
+									pi,
+									`## ${task.owner} task stopped [${event.sequence}]\n\n${event.content}`,
+								);
+								stoppedTaskIds.add(task.id);
+							}
+						}
+
+						if (
+							taskIds.every(
+								(taskId) =>
+									stoppedTaskIds.has(taskId) ||
+									activeTeam.state.tasks.find((task) => task.id === taskId)?.status === "approved",
+							)
+						) {
+							return;
+						}
+					}
+
+					for (const taskId of taskIds) {
+						if (stoppedTaskIds.has(taskId)) continue;
+						const task = activeTeam.state.tasks.find((item) => item.id === taskId);
+						if (!task || task.status === "approved" || task.status === "submitted") continue;
+						activeTeam.state.roles[task.owner].status = "failed";
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{
+								type: "role-failure",
+								role: task.owner,
+								content: `Ansteel team task ${task.id} stopped: parallel-task-epoch-limit ${activeTeam.taskMaxEpochs}`,
+							},
+							getPersistenceContext(ctx.cwd),
+						);
+						emitTimelineMessage(pi, `## ${task.owner} task stopped [${event.sequence}]\n\n${event.content}`);
+					}
+				})();
+			} catch (error) {
+				executionFailure = error;
+			} finally {
+				activeTeam.crossRolePromptDeferralDepth--;
+			}
+
+			let deferredReviewFailure: unknown;
+			if (activeTeam.crossRolePromptDeferralDepth === 0 && activeTeam.deferredCrossRoleReviews.length > 0) {
+				try {
+					await flushQueuedCrossRoleReviews(activeTeam, ctx);
+				} catch (error) {
+					deferredReviewFailure = error;
+				}
+			}
+			if (executionFailure !== undefined && deferredReviewFailure !== undefined) {
+				throw new AggregateError(
+					[executionFailure, deferredReviewFailure],
+					"Parallel Ansteel task execution and deferred review flush both failed",
+				);
+			}
+			if (executionFailure !== undefined) throw executionFailure;
+			if (deferredReviewFailure !== undefined) throw deferredReviewFailure;
+		};
+
 		const runRound = async (
 			activeTeam: ActiveAnsteelTeam,
 			ctx: ExtensionCommandContext,
@@ -2164,6 +2536,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					);
 				}
 				await runObservedCommand(ctx.cwd, existingActive.state.id, `start ${topic}`, async () => {
+					await flushQueuedCrossRoleReviews(existingActive, ctx);
 					emitTimelineMessage(pi, formatStatus(existingActive.state));
 				});
 				return;
@@ -2278,6 +2651,19 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					maxToolCallsPerStage,
 					taskMaxEpochs,
 					taskMaxNoProgressEpochs,
+					crossRolePromptDeferralDepth: 0,
+					deferredCrossRoleReviews: [
+						...state.tasks
+							.filter((task) => task.status === "submitted")
+							.map((task) => ({ kind: "task" as const, id: task.id, revision: task.revision })),
+						...state.milestones
+							.filter((milestone) => milestone.status === "submitted")
+							.map((milestone) => ({
+								kind: "milestone" as const,
+								id: milestone.id,
+								revision: milestone.revision,
+							})),
+					],
 				};
 				try {
 					for (const role of ANSTEEL_ROLES) {
@@ -2305,6 +2691,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				}
 				activeTeams.set(ctx.cwd, activeTeam);
 				emitTimelineMessage(pi, `Ansteel team started.\n\n${formatStatus(state)}`);
+				if (existing) await flushQueuedCrossRoleReviews(activeTeam, ctx);
 				if (!existing) {
 					await runRound(activeTeam, ctx, topic, "investigation");
 					await runRound(
@@ -2342,6 +2729,34 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						if (!activeTeam) throw new Error("Ansteel team is not active. Start a team first.");
 						await runObservedCommand(ctx.cwd, activeTeam.state.id, `task ${argument}`, async () => {
 							const parsed = parseCoordinatorTaskArgument(argument);
+							if (parsed.kind === "parallel") {
+								const assignment = await runObservedOperation(
+									ctx.cwd,
+									"task.claim.parallel",
+									{
+										role: "coordinator",
+										data: { taskIds: parsed.inputs.map((input) => input.id) },
+									},
+									() =>
+										assignAnsteelTeamTasks(
+											ctx.cwd,
+											activeTeam.state,
+											parsed.inputs,
+											activeTeam.state.taskOwners,
+											getPersistenceContext(ctx.cwd),
+										),
+								);
+								emitTimelineMessage(
+									pi,
+									`## tasks-assigned [${assignment.event.sequence}]\n\n${assignment.event.content}`,
+								);
+								await runParallelTaskEpochs(
+									activeTeam,
+									ctx,
+									assignment.tasks.map((task) => task.id),
+								);
+								return;
+							}
 							let task: AnsteelTeamTask;
 							if (parsed.kind === "create") {
 								task = await runObservedOperation(
@@ -2361,9 +2776,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 									activeTeam.state,
 									"task-assigned",
 									"coordinator",
-									`${task.id} assigned to ${task.owner}\n\nStatus: ${task.status}\n\nDependencies: ${
+									`${task.id} (${task.type}) assigned to ${task.owner}\n\nStatus: ${
+										task.status
+									}\n\nDependencies: ${
 										task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
-									}\n\nFiles: ${task.files.join(", ")}\n\nAcceptance: ${task.acceptanceCriteria}`,
+									}\n\nFiles: ${task.files.join(", ")}\n\nAssignment reason: ${
+										task.assignmentReason ?? "default role assignment"
+									}\n\nAcceptance: ${task.acceptanceCriteria}`,
 									task.owner,
 								);
 							} else {

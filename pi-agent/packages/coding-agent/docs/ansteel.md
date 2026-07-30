@@ -60,7 +60,7 @@ For a monorepo review, do not rely on a topic's relative paths to reach a parent
 ```text
 /ansteel-team start "Review the motor safety change"
 /ansteel-team ask "Compare the encoder implementations and identify the next safe task"
-/ansteel-team task {"id":"TASK-MOTOR","owner":"staff-engineer","files":["src/motor.ts"],"description":"Implement the approved motor change","acceptanceCriteria":"The motor tests pass","dependsOn":[]}
+/ansteel-team task {"id":"TASK-MOTOR","owner":"staff-engineer","type":"implementation","files":["src/motor.ts"],"description":"Implement the approved motor change","acceptanceCriteria":"The motor tests pass","dependsOn":[]}
 /ansteel-team task TASK-MOTOR
 /ansteel-team status
 /ansteel-team stop
@@ -68,7 +68,28 @@ For a monorepo review, do not rely on a topic's relative paths to reach a parent
 
 `start` creates or resumes a dedicated Pi session for Tech Lead, Staff Engineer, and QA Engineer using the role models in `.pi/ansteel.json`. A new team first performs three independent investigations, then a public cross-examination round. `ask` continues the work from an isolated conversation branch for each role, with current facts reconstructed from the bounded public ledger. The append-only session file remains available for audit, but old assistant messages and truncated private work are not automatically injected into the next role stage. Role responses are shown in the host Pi timeline as public updates; hidden reasoning and raw provider payloads are not shared.
 
-Project state lives under `.pi/ansteel-team/`: `team.json` records the team, role-session locations, immutable task-owner policy, task ownership, evidence packages, and peer verdicts; `events.jsonl` is an append-only public ledger. `stop` disposes live role sessions but retains these files so a later `start` can resume the team. Resume requires the current `teamTaskOwners` configuration to match the persisted policy. Starting a different topic requires removing or archiving the existing team state first.
+Project state lives under `.pi/ansteel-team/`: `team.json` records the team, role-session locations, immutable task-owner policy, typed task ownership, evidence packages, and peer verdicts; `events.jsonl` is an append-only public ledger. `stop` disposes live role sessions but retains these files so a later `start` can resume the team. Resume requires the current `teamTaskOwners` configuration to match the persisted policy. Starting a different topic requires removing or archiving the existing team state first.
+
+### Typed parallel tasks
+
+Task types are mechanical state, not prose inferred from the description:
+
+| Type | Default owner | Typical scope |
+|---|---|---|
+| `architecture` | Tech Lead | Architecture and interface decisions |
+| `integration` | Tech Lead | Cross-module integration |
+| `implementation` | Staff Engineer | Main product implementation |
+| `verification` | QA Engineer | Test fixtures, adversarial tests, and acceptance automation |
+
+A non-default owner is allowed only when the task includes a non-empty `assignmentReason`; the reason is persisted and published in the task-assignment event. Every owner must also be permitted by the team's immutable `teamTaskOwners` policy.
+
+Pass a JSON array containing two or three tasks to run distinct owners in a parallel owner wave:
+
+```text
+/ansteel-team task [{"id":"TASK-API","owner":"tech-lead","type":"architecture","files":["src/contracts.ts"],"description":"Define the integration contract","acceptanceCriteria":"The contract test passes","dependsOn":[]},{"id":"TASK-CORE","owner":"staff-engineer","type":"implementation","files":["src/core.ts"],"description":"Implement the contract","acceptanceCriteria":"The core test passes","dependsOn":[]},{"id":"TASK-QA","owner":"qa-engineer","type":"verification","files":["test/core.test.ts"],"description":"Add acceptance automation","acceptanceCriteria":"The acceptance test passes","dependsOn":[]}]
+```
+
+The coordinator validates the whole batch against a cloned state, then commits the task state and one aggregate `tasks-assigned` event through the pending-transaction protocol. A duplicate owner, unauthorized owner, unresolved dependency, duplicate task ID, overlapping file, or invalid public event rejects the complete batch without leaving a partial claim or partial assignment ledger. Owner sessions then run concurrently. All tool-triggered task and milestone reviews are queued for the duration of the parallel command, including submissions for older work. The coordinator reviews current batch tasks one at a time after every owner settles, with both non-owners still reviewing the same immutable revision independently. Other deferred submissions are flushed in stable `kind/id/revision` order after the parallel command; missing reviews remain queued, and a same-topic restart rebuilds the queue from submitted tasks and milestones so only missing reviewers are prompted again. This ordering prevents a persistent role session from being entered simultaneously as an owner and a reviewer without losing recoverability after a provider or host failure.
 
 ### Public collaboration board
 
@@ -253,7 +274,7 @@ Create `.pi/ansteel.json` in the project being reviewed. The `model` field is re
 		"maxProjectToolCalls": 96
 	},
 	"allowProviderFallback": false,
-	"teamTaskOwners": ["staff-engineer"],
+	"teamTaskOwners": ["tech-lead", "staff-engineer", "qa-engineer"],
 	"allowSingleModel": false
 }
 ```
@@ -274,7 +295,7 @@ Keep API credentials out of `.pi/ansteel.json`. Configure authentication through
 
 `teamTools` configures interactive team sessions independently. It is optional and defaults to `read`, `grep`, `find`, `ls`, `bash`, `edit`, and `write`. The task tools are always present in interactive team mode. Even when `edit`, `write`, or `bash` are listed, task ownership remains enforced: `edit` and `write` require an active exact-file claim, `bash` is limited to read-only inspection, and the only test execution path is `ansteel_submit_change`.
 
-`teamTaskOwners` controls which interactive roles may claim code-change tasks. It defaults to `["staff-engineer"]`; Tech Lead or QA may only claim changes when explicitly listed, for example `["staff-engineer", "tech-lead"]`. The selected policy is written into the team state when the team starts; a changed policy rejects a resume rather than silently changing an existing team's authority. The other roles still independently review every submitted task.
+`teamTaskOwners` controls which interactive roles may claim code-change tasks. It defaults to `["staff-engineer"]`; enable typed three-role batches explicitly with `["tech-lead", "staff-engineer", "qa-engineer"]`. The selected policy is written into the team state when the team starts; a changed policy rejects a resume rather than silently changing an existing team's authority. Task type defaults and cross-role `assignmentReason` checks apply in addition to this allowlist. Both non-owners still independently review every submitted task.
 
 `reportDirectory` is resolved from the project directory and must remain inside it. Omit it to use the default `.pi/ansteel-reports` location.
 

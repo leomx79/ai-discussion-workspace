@@ -952,7 +952,7 @@ describe("Ansteel team CLI", () => {
 			const task = await rpc.send({
 				id: "task",
 				type: "prompt",
-				message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Implement the Staff fixture","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
+				message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","type":"implementation","files":["src/staff.ts"],"description":"Implement the Staff fixture","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
 			});
 			expect(task).toMatchObject({ success: true, command: "prompt" });
 
@@ -1118,7 +1118,7 @@ describe("Ansteel team CLI", () => {
 				const taskResponse = await rpc.send({
 					id: "task",
 					type: "prompt",
-					message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Exercise the real RPC action gate","acceptanceCriteria":"A blocked action cannot change the tracked file","dependsOn":[]}`,
+					message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","type":"implementation","files":["src/staff.ts"],"description":"Exercise the real RPC action gate","acceptanceCriteria":"A blocked action cannot change the tracked file","dependsOn":[]}`,
 				});
 				expect(taskResponse).toMatchObject({
 					success: testCase.expectedRpcSuccess,
@@ -1209,7 +1209,7 @@ describe("Ansteel team CLI", () => {
 			const task = await rpc.send({
 				id: "task-owner-failure",
 				type: "prompt",
-				message: `/${teamCommand} task {"id":"TASK-OWNER-FAIL","owner":"staff-engineer","files":["src/staff.ts"],"description":"Exercise owner failure propagation","acceptanceCriteria":"The rejected checkpoint fails the RPC","dependsOn":[]}`,
+				message: `/${teamCommand} task {"id":"TASK-OWNER-FAIL","owner":"staff-engineer","type":"implementation","files":["src/staff.ts"],"description":"Exercise owner failure propagation","acceptanceCriteria":"The rejected checkpoint fails the RPC","dependsOn":[]}`,
 			});
 
 			expect(task).toMatchObject({
@@ -1245,7 +1245,7 @@ describe("Ansteel team CLI", () => {
 			const task = await rpc.send({
 				id: "task-review-failure",
 				type: "prompt",
-				message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Exercise peer failure propagation","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
+				message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","type":"implementation","files":["src/staff.ts"],"description":"Exercise peer failure propagation","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
 			});
 
 			expect(task).toMatchObject({
@@ -1281,7 +1281,7 @@ describe("Ansteel team CLI", () => {
 				await rpc.send({
 					id: "task",
 					type: "prompt",
-					message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Prepare milestone input","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
+					message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","type":"implementation","files":["src/staff.ts"],"description":"Prepare milestone input","acceptanceCriteria":"The Staff test passes","dependsOn":[]}`,
 				}),
 			).toMatchObject({ success: true, command: "prompt" });
 

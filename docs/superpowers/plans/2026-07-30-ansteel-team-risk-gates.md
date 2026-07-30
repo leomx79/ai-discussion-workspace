@@ -673,7 +673,9 @@ Expected:
 - 高熵密钥扫描无命中；短假测试夹具由人工核对，不得当作真实凭据或无条件加入忽略列表；
 - 没有 `.pi/`、日志、事故包或本机配置。
 
-- [ ] **Step 7: 提交阶段报告并推送 main**
+- [x] **Step 7: 提交阶段报告并推送 main**
+
+完成证据：提交 `d86ebc58f218f9ca82021f8e58070d3f106796b5` 已推送至 `origin/main`，提交标题为 `fix(鞍钢协作): 完成机械风险门禁原子身份验收`。
 
 ```powershell
 git add -- docs/superpowers/plans/2026-07-30-ansteel-team-risk-gates.md docs/superpowers/reviews/2026-07-30-ansteel-team-risk-gates-spec-review.md docs/superpowers/reviews/2026-07-30-ansteel-team-risk-gates-quality-review.md docs/superpowers/reports/2026-07-30-ansteel-team-risk-gates-report.md docs/superpowers/specs/2026-07-29-ansteel-team-continuous-collaboration-protocol-design.md pi-agent/packages/coding-agent/docs/ansteel.md pi-agent/packages/coding-agent/src/core/ansteel-team.ts pi-agent/packages/coding-agent/src/core/ansteel-team-observability.ts pi-agent/packages/coding-agent/src/core/tools/guarded-file-mutation.ts pi-agent/packages/coding-agent/src/core/tools/edit.ts pi-agent/packages/coding-agent/src/core/tools/write.ts pi-agent/packages/coding-agent/src/extensions/ansteel-team/index.ts pi-agent/packages/coding-agent/test/ansteel-team.test.ts pi-agent/packages/coding-agent/test/ansteel-team-observability.test.ts pi-agent/packages/coding-agent/test/ansteel-team-extension.test.ts pi-agent/packages/coding-agent/test/ansteel-team-cli.test.ts
@@ -682,7 +684,9 @@ git commit -m "docs(鞍钢协作): 完成机械风险门禁阶段验收" -m "记
 git push origin main
 ```
 
-- [ ] **Step 8: 核验 GitHub Actions**
+- [x] **Step 8: 核验 GitHub Actions**
+
+完成证据：`Ansteel governance gate` 运行 `30548808891` 对应提交 `d86ebc58f218f9ca82021f8e58070d3f106796b5`，结论为 `success`。
 
 使用仓库当前 `main` 对应的 workflow run，确认 commit SHA 与本地 `HEAD` 一致。若检查失败，读取具体 job 日志，先用最小机械反例复现根因再修复，不创建分支。
 

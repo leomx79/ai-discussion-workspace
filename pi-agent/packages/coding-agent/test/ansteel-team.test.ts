@@ -19,6 +19,7 @@ import {
 	appendAnsteelTeamEvent,
 	assessAnsteelTeamAction,
 	claimAnsteelTeamTask,
+	claimAnsteelTeamTasks,
 	classifyAnsteelTeamActionRisk,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
@@ -225,6 +226,13 @@ describe("public collaboration state", () => {
 	it("migrates v7 teams without inventing action reviews or reusable action approval", () => {
 		const cwd = createTemporaryProject();
 		const state = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, state, {
+			id: "TASK-MIGRATE-RISK",
+			owner: "staff-engineer",
+			files: ["src/migrate-risk.ts"],
+			description: "Preserve a legacy task while migrating risk governance state.",
+			acceptanceCriteria: "The legacy task receives the staff implementation type.",
+		});
 		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
 			id: "CP-MIGRATE-RISK-0001",
 			goal: "Migrate an existing public checkpoint",
@@ -240,6 +248,8 @@ describe("public collaboration state", () => {
 		const legacy = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
 		legacy.version = 7;
 		delete legacy.actionReviews;
+		const tasks = legacy.tasks as Array<Record<string, unknown>>;
+		delete tasks[0].type;
 		const checkpoints = legacy.workCheckpoints as Array<Record<string, unknown>>;
 		delete checkpoints[0].governedAction;
 		writePersistedTeamState(cwd, legacy);
@@ -247,8 +257,9 @@ describe("public collaboration state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 8,
+			version: 9,
 			actionReviews: [],
+			tasks: [{ id: "TASK-MIGRATE-RISK", type: "implementation", owner: "staff-engineer" }],
 			workCheckpoints: [{ id: checkpoint.id, status: "superseded", governedAction: null }],
 		});
 	});
@@ -1113,14 +1124,14 @@ describe("public collaboration state", () => {
 		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
 
 		expect(migrated).toMatchObject({
-			version: 8,
+			version: 9,
 			workCheckpoints: [],
 			processIssues: [],
 			actionReviews: [],
 			...preserved,
 		});
 		expect(persisted).toMatchObject({
-			version: 8,
+			version: 9,
 			workCheckpoints: [],
 			processIssues: [],
 			actionReviews: [],
@@ -1133,7 +1144,7 @@ describe("public collaboration state", () => {
 		writePersistedTeamState(cwd, createValidPublicCollaborationState(cwd));
 
 		expect(loadAnsteelTeamState(cwd)).toMatchObject({
-			version: 8,
+			version: 9,
 			workCheckpoints: [{ id: "CP-PARSER-0001" }],
 			processIssues: [{ id: "PI-PARSER-0001" }],
 			actionReviews: [],
@@ -1367,7 +1378,7 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 8,
+			version: 9,
 			tasks: [],
 			milestones: [],
 			workCheckpoints: [],
@@ -1409,8 +1420,8 @@ describe("Ansteel team state", () => {
 			previousHash: null,
 			hash: expect.stringMatching(/^[a-f0-9]{64}$/),
 		});
-		expect(migrated).toMatchObject({ version: 8, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
-		expect(persistedState).toMatchObject({ version: 8, ledgerHeadHash: events[0]?.hash });
+		expect(migrated).toMatchObject({ version: 9, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
+		expect(persistedState).toMatchObject({ version: 9, ledgerHeadHash: events[0]?.hash });
 		expect(persistedEvent).toMatchObject({ previousHash: null, hash: events[0]?.hash });
 	});
 
@@ -1425,9 +1436,9 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		const persistedState = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
 
-		expect(migrated).toMatchObject({ version: 8, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
+		expect(migrated).toMatchObject({ version: 9, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
 		expect(persistedState).toMatchObject({
-			version: 8,
+			version: 9,
 			taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"],
 		});
 	});
@@ -1919,6 +1930,117 @@ describe("Ansteel team state", () => {
 				["staff-engineer", "tech-lead"],
 			),
 		).toMatchObject({ owner: "tech-lead", status: "claimed" });
+	});
+
+	it("persists task types and requires a public reason for a cross-role assignment", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		const allowedOwners = ["tech-lead", "staff-engineer", "qa-engineer"] as const;
+
+		const implementation = claimAnsteelTeamTask(
+			cwd,
+			team,
+			{
+				id: "TASK-IMPLEMENTATION",
+				owner: "staff-engineer",
+				files: ["src/implementation.ts"],
+				description: "Implement the product change.",
+				acceptanceCriteria: "The implementation test passes.",
+			},
+			allowedOwners,
+		);
+		expect(implementation).toMatchObject({ type: "implementation", owner: "staff-engineer" });
+
+		expect(() =>
+			claimAnsteelTeamTask(
+				cwd,
+				team,
+				{
+					id: "TASK-CROSS-ROLE-BLOCKED",
+					owner: "qa-engineer",
+					type: "implementation",
+					files: ["src/qa-implementation.ts"],
+					description: "Temporarily implement a QA-owned change.",
+					acceptanceCriteria: "The implementation test passes.",
+				},
+				allowedOwners,
+			),
+		).toThrow("requires a public assignment reason");
+
+		const reassigned = claimAnsteelTeamTask(
+			cwd,
+			team,
+			{
+				id: "TASK-CROSS-ROLE",
+				owner: "qa-engineer",
+				type: "implementation",
+				assignmentReason: "Staff is unavailable and QA owns the isolated fixture implementation.",
+				files: ["src/qa-implementation.ts"],
+				description: "Temporarily implement a QA-owned change.",
+				acceptanceCriteria: "The implementation test passes.",
+			},
+			allowedOwners,
+		);
+		expect(reassigned).toMatchObject({
+			type: "implementation",
+			owner: "qa-engineer",
+			assignmentReason: "Staff is unavailable and QA owns the isolated fixture implementation.",
+		});
+	});
+
+	it("claims three typed non-overlapping role tasks atomically", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		const allowedOwners = ["tech-lead", "staff-engineer", "qa-engineer"] as const;
+		const baseInputs = [
+			{
+				id: "TASK-ARCHITECTURE",
+				owner: "tech-lead" as const,
+				type: "architecture" as const,
+				files: ["src/contracts.ts"],
+				description: "Define the shared contract.",
+				acceptanceCriteria: "The contract test passes.",
+			},
+			{
+				id: "TASK-IMPLEMENTATION",
+				owner: "staff-engineer" as const,
+				type: "implementation" as const,
+				files: ["src/implementation.ts"],
+				description: "Implement the contract.",
+				acceptanceCriteria: "The implementation test passes.",
+			},
+			{
+				id: "TASK-VERIFICATION",
+				owner: "qa-engineer" as const,
+				type: "verification" as const,
+				files: ["test/acceptance.test.ts"],
+				description: "Add acceptance automation.",
+				acceptanceCriteria: "The acceptance test passes.",
+			},
+		];
+
+		expect(() =>
+			claimAnsteelTeamTasks(
+				cwd,
+				team,
+				[baseInputs[0]!, { ...baseInputs[1]!, files: ["src/contracts.ts"] }, baseInputs[2]!],
+				allowedOwners,
+			),
+		).toThrow("already claimed");
+		expect(team.tasks).toEqual([]);
+
+		const tasks = claimAnsteelTeamTasks(cwd, team, baseInputs, allowedOwners);
+		expect(tasks).toEqual([
+			expect.objectContaining({ id: "TASK-ARCHITECTURE", owner: "tech-lead", type: "architecture" }),
+			expect.objectContaining({ id: "TASK-IMPLEMENTATION", owner: "staff-engineer", type: "implementation" }),
+			expect.objectContaining({ id: "TASK-VERIFICATION", owner: "qa-engineer", type: "verification" }),
+		]);
+		expect(getAnsteelTeamSharedBoard(team, [], []).tasks).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "TASK-ARCHITECTURE", type: "architecture" }),
+				expect.objectContaining({ id: "TASK-VERIFICATION", type: "verification" }),
+			]),
+		);
 	});
 
 	it("derives a dependent task's lock and release from approved predecessors", () => {
