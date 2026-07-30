@@ -68,4 +68,4 @@
 - [x] 任务与里程碑均保留双独立最终验证，不把协作更新当作会签。
 - [x] 并行 deferral、失败重试和重启重建不会丢失或提前执行跨角色提示。
 - [x] 旧 v9 状态不被伪造为已完成持续协作。
-- [ ] 远端 GitHub Actions 与实现一致。
+- [x] GitHub Actions `Ansteel governance gate` 运行 `30568236446` 已通过。
