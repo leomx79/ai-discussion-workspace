@@ -7,6 +7,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
+import type { GuardedFileMutationExecutor } from "./guarded-file-mutation.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -37,6 +38,10 @@ const defaultWriteOperations: WriteOperations = {
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
+	/** Revalidate the resolved path immediately before filesystem mutations. */
+	pathGuard?: (absolutePath: string) => void | Promise<void>;
+	/** Bind governed writes to an already verified existing file handle. */
+	guardedFileMutation?: GuardedFileMutationExecutor;
 }
 
 type WriteHighlightCache = {
@@ -210,11 +215,29 @@ export function createWriteToolDefinition(
 				};
 
 				throwIfAborted();
+				if (options?.guardedFileMutation) {
+					return options.guardedFileMutation(absolutePath, async (file) => {
+						throwIfAborted();
+						await file.revalidate();
+						throwIfAborted();
+						await file.replaceFile(content);
+						throwIfAborted();
+						return {
+							content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
+							details: undefined,
+						};
+					});
+				}
+
+				await options?.pathGuard?.(absolutePath);
+				throwIfAborted();
 				// Create parent directories if needed.
 				await ops.mkdir(dir);
 				throwIfAborted();
 
 				// Write the file contents.
+				await options?.pathGuard?.(absolutePath);
+				throwIfAborted();
 				await ops.writeFile(absolutePath, content);
 				throwIfAborted();
 

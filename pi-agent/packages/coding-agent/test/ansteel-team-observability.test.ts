@@ -57,15 +57,42 @@ describe("Ansteel team observability", () => {
 			eventName: "tool.call.completed",
 			outcome: "failed",
 			reasonCode: "tool-exit-nonzero",
-			message: "command failed",
-			data: { authorization: "Bearer top-secret", exitCode: 1 },
-			artifacts: [{ kind: "stderr", content: "API_KEY=top-secret\nfailure" }],
+			message: `command failed OPENAI_API_KEY="message secret"; provider_access_token='second secret'; API_KEY=bare-api-secret`,
+			data: {
+				authorization: "Bearer top-secret",
+				environment: `PASSWORD='bare password'; TOKEN="bare token"`,
+				exitCode: 1,
+			},
+			artifacts: [
+				{
+					kind: "stderr",
+					content:
+						'ANSTEEL_TL_API_KEY=artifact-secret, SECRET=bare-secret;\napi_key: colon-secret; authorization: Basic scheme-secret; {"access_token":"json-secret"}\nfailure',
+				},
+			],
 		});
 		logger.close();
 
 		expect(entry.data.authorization).toBe("[REDACTED]");
+		expect(entry.message).toContain("OPENAI_API_KEY=[REDACTED]");
+		expect(entry.message).toContain("provider_access_token=[REDACTED]");
+		expect(entry.message).toContain("API_KEY=[REDACTED]");
+		expect(entry.message).not.toContain("message secret");
+		expect(entry.message).not.toContain("second secret");
+		expect(entry.message).not.toContain("bare-api-secret");
+		expect(entry.data.environment).toBe("PASSWORD=[REDACTED]; TOKEN=[REDACTED]");
 		expect(entry.artifactRefs[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
-		expect(readFileSync(entry.artifactRefs[0]!.storageId, "utf8")).not.toContain("top-secret");
+		const artifact = readFileSync(entry.artifactRefs[0]!.storageId, "utf8");
+		expect(artifact).toContain("ANSTEEL_TL_API_KEY=[REDACTED]");
+		expect(artifact).toContain("SECRET=[REDACTED]");
+		expect(artifact).toContain("api_key: [REDACTED]");
+		expect(artifact).toContain("authorization: [REDACTED]");
+		expect(artifact).toContain('"access_token":[REDACTED]');
+		expect(artifact).not.toContain("artifact-secret");
+		expect(artifact).not.toContain("bare-secret");
+		expect(artifact).not.toContain("colon-secret");
+		expect(artifact).not.toContain("scheme-secret");
+		expect(artifact).not.toContain("json-secret");
 		expect(readAnsteelRuntimeLogs(cwd, context.runId)).toHaveLength(1);
 		expect(existsSync(getAnsteelRuntimeLogDirectory(cwd))).toBe(true);
 	});
@@ -179,6 +206,30 @@ describe("Ansteel team observability", () => {
 		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
 		expect(diagnosis.healthy).toBe(false);
 		expect(diagnosis.issues.map((issue) => issue.reasonCode)).toEqual(["process-orphaned"]);
+	});
+
+	it("does not accept a non-root terminal record for a root run span", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const root = logger.startSpan("run.started", { role: "coordinator" });
+		logger.write({
+			level: "info",
+			eventName: "run.started",
+			outcome: "succeeded",
+			spanId: root.spanId,
+			parentSpanId: "forged-child-parent",
+			role: "coordinator",
+			message: "forged non-root terminal",
+			data: {},
+		});
+		logger.close();
+
+		const summary = listAnsteelRuntimeRuns(cwd).find((run) => run.runId === context.runId);
+		expect(summary?.terminalOutcome).toBeUndefined();
+		const diagnosis = diagnoseAnsteelTeamRun(cwd, context.runId);
+		expect(diagnosis.healthy).toBe(false);
+		expect(diagnosis.issues.map((issue) => issue.reasonCode)).toContain("process-orphaned");
 	});
 
 	it("returns process-orphaned when a child span lacks a terminal record", async () => {

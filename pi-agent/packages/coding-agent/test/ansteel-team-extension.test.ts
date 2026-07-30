@@ -1,10 +1,21 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnsteelConfig } from "../src/core/ansteel-discussion.ts";
-import { listAnsteelTeamEvents, loadAnsteelTeamState } from "../src/core/ansteel-team.ts";
+import { listAnsteelTeamEvents, loadAnsteelTeamState, resolveAnsteelTeamWritePath } from "../src/core/ansteel-team.ts";
 import {
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
@@ -24,6 +35,7 @@ import {
 	type AnsteelTeamRoleSession,
 	type CreateAnsteelTeamRoleSessionOptions,
 	createAnsteelTeamExtension,
+	createAnsteelTeamMutationToolController,
 	getAnsteelTeamEvidenceBlockReason,
 } from "../src/extensions/ansteel-team/index.ts";
 
@@ -146,6 +158,70 @@ afterEach(() => {
 });
 
 describe("Ansteel team extension", () => {
+	it("registers guarded production mutation tools for default role sessions", async () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		const existingPath = join(cwd, "existing.ts");
+		writeFileSync(existingPath, "original\n", "utf8");
+		const existingStats = statSync(existingPath, { bigint: true });
+		const existingIdentity = {
+			dev: existingStats.dev,
+			ino: existingStats.ino,
+			sha256: createHash("sha256").update(readFileSync(existingPath)).digest("hex"),
+		};
+		const approvedPath = resolveAnsteelTeamWritePath(cwd, "pending/escaped.ts");
+		symlinkSync(outside, join(cwd, "pending"), process.platform === "win32" ? "junction" : "dir");
+		const mutationTools = createAnsteelTeamMutationToolController(cwd);
+		const writeTool = mutationTools.tools.find((tool) => tool.name === "write");
+		if (!writeTool) throw new Error("Missing guarded Ansteel write tool");
+		mutationTools.authorize(approvedPath, existingIdentity);
+
+		await expect(
+			writeTool.execute(
+				"TOOL-DEFAULT-WRITE-TOCTOU-1",
+				{
+					path: approvedPath,
+					content: "must not escape\n",
+				},
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("changed after approval");
+		expect(existsSync(join(outside, "escaped.ts"))).toBe(false);
+
+		mutationTools.authorize(existingPath, existingIdentity);
+		await expect(
+			writeTool.execute(
+				"TOOL-DEFAULT-WRITE-EXISTING-1",
+				{
+					path: existingPath,
+					content: "updated safely\n",
+				},
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).resolves.toBeDefined();
+		expect(readFileSync(existingPath, "utf8")).toBe("updated safely\n");
+
+		const missingPath = resolveAnsteelTeamWritePath(cwd, "new-file.ts");
+		mutationTools.authorize(missingPath, existingIdentity);
+		await expect(
+			writeTool.execute(
+				"TOOL-DEFAULT-WRITE-MISSING-1",
+				{
+					path: missingPath,
+					content: "must fail closed\n",
+				},
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("atomic creation is unavailable");
+		expect(existsSync(missingPath)).toBe(false);
+	});
+
 	it("blocks role tools from reading coordinator-generated state while preserving project evidence", () => {
 		for (const [toolName, args] of [
 			["read", { path: ".pi/ansteel-team/team.json" }],
@@ -183,6 +259,62 @@ describe("Ansteel team extension", () => {
 			expect.objectContaining({ customType: "ansteel-team-event", display: true }),
 			{ triggerTurn: false },
 		);
+	});
+
+	it("redacts provider failures before writing the public ledger or UI timeline", async () => {
+		const harness = setup(createConfig(), async (role) => {
+			if (role === "tech-lead") {
+				throw new Error("provider api_key: provider-secret; authorization: Basic scheme-secret");
+			}
+			return `${role} completed collaboration.`;
+		});
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+
+		const publicError = await command("start Review provider failure redaction", harness.ctx).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(publicError).toBeInstanceOf(Error);
+		expect((publicError as Error).message).not.toContain("provider-secret");
+		expect((publicError as Error).message).not.toContain("scheme-secret");
+
+		const failure = listAnsteelTeamEvents(harness.ctx.cwd).find(
+			(event) => event.type === "role-failure" && event.role === "tech-lead",
+		);
+		expect(failure?.content).toContain("api_key: [REDACTED]");
+		expect(failure?.content).toContain("authorization: [REDACTED]");
+		expect(failure?.content).not.toContain("provider-secret");
+		expect(failure?.content).not.toContain("scheme-secret");
+		const renderedTimeline = JSON.stringify(harness.sendMessage.mock.calls);
+		expect(renderedTimeline).not.toContain("provider-secret");
+		expect(renderedTimeline).not.toContain("scheme-secret");
+	});
+
+	it("redacts successful role output at both the public ledger and UI boundaries", async () => {
+		const harness = setup(createConfig(), async (role) =>
+			role === "tech-lead"
+				? 'api_key: ledger-secret; {"access_token":"json-secret"}; Authorization: Bearer bearer-secret'
+				: `${role} completed collaboration.`,
+		);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+
+		await command("start Review successful output redaction", harness.ctx);
+
+		const report = listAnsteelTeamEvents(harness.ctx.cwd).find(
+			(event) => event.type === "role-report" && event.role === "tech-lead",
+		);
+		expect(report?.content).toContain("api_key: [REDACTED]");
+		expect(report?.content).toContain('"access_token":[REDACTED]');
+		expect(report?.content).toContain("Authorization: [REDACTED]");
+		const publicData = JSON.stringify({
+			events: listAnsteelTeamEvents(harness.ctx.cwd),
+			timeline: harness.sendMessage.mock.calls,
+		});
+		expect(publicData).not.toContain("ledger-secret");
+		expect(publicData).not.toContain("json-secret");
+		expect(publicData).not.toContain("bearer-secret");
 	});
 
 	it("publishes public checkpoints, corrections, timeline entries, and correlated runtime spans", async () => {
@@ -644,11 +776,134 @@ describe("Ansteel team extension", () => {
 
 		// The current board command must not treat an empty runtime projection as verified history.
 		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "logs"), { force: true, recursive: true });
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
 
 		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
 		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
 		expect(harness.sendMessage).toHaveBeenLastCalledWith(
 			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
+			{ triggerTurn: false },
+		);
+	});
+
+	it("rejects an orphaned same-team run whose last completed child tool succeeded", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		if (!state) throw new Error("Missing persisted Ansteel team state");
+
+		const orphanedContext = createAnsteelRunContext({
+			teamId: state.id,
+			command: "task TASK-BOARD-ORPHAN-1",
+		});
+		const orphanedLogger = createAnsteelRuntimeLogger(harness.ctx.cwd, orphanedContext);
+		const root = orphanedLogger.startSpan("run.started", { role: "coordinator" });
+		const tool = orphanedLogger.startSpan("tool.call.completed", {
+			parent: root,
+			role: "tech-lead",
+			taskId: "TASK-BOARD-ORPHAN-1",
+			toolCallId: "TOOL-BOARD-ORPHAN-1",
+		});
+		tool.end({
+			outcome: "succeeded",
+			message: "child tool completed before the host crashed",
+			data: { exitCode: 0 },
+		});
+		await orphanedLogger.forceFlush();
+		orphanedLogger.close();
+
+		const otherRunIds = listAnsteelRuntimeRuns(harness.ctx.cwd)
+			.filter((run) => run.teamId === state.id && run.runId !== orphanedContext.runId)
+			.map((run) => run.runId);
+		const logDirectory = getAnsteelRuntimeLogDirectory(harness.ctx.cwd);
+		for (const fileName of readdirSync(logDirectory)) {
+			if (otherRunIds.some((runId) => fileName.startsWith(`run-${runId}-`))) {
+				rmSync(join(logDirectory, fileName), { force: true });
+			}
+		}
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
+
+		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
+	});
+
+	it("rejects a same-team run whose forged successful root terminal has a parent", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		if (!state) throw new Error("Missing persisted Ansteel team state");
+
+		const forgedContext = createAnsteelRunContext({
+			teamId: state.id,
+			command: "task TASK-BOARD-FORGED-ROOT-1",
+		});
+		const forgedLogger = createAnsteelRuntimeLogger(harness.ctx.cwd, forgedContext);
+		const root = forgedLogger.startSpan("run.started", { role: "coordinator" });
+		forgedLogger.write({
+			level: "info",
+			eventName: "run.started",
+			outcome: "succeeded",
+			spanId: root.spanId,
+			parentSpanId: "forged-child-parent",
+			role: "coordinator",
+			taskId: "TASK-BOARD-FORGED-ROOT-1",
+			message: "forged non-root terminal",
+			data: {},
+		});
+		forgedLogger.close();
+
+		const otherRunIds = listAnsteelRuntimeRuns(harness.ctx.cwd)
+			.filter((run) => run.teamId === state.id && run.runId !== forgedContext.runId)
+			.map((run) => run.runId);
+		const logDirectory = getAnsteelRuntimeLogDirectory(harness.ctx.cwd);
+		for (const fileName of readdirSync(logDirectory)) {
+			if (otherRunIds.some((runId) => fileName.startsWith(`run-${runId}-`))) {
+				rmSync(join(logDirectory, fileName), { force: true });
+			}
+		}
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
+
+		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
+	});
+
+	it("renders a successful same-team tool fact after rebuilding the runtime index", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		if (!state) throw new Error("Missing persisted Ansteel team state");
+
+		const successfulContext = createAnsteelRunContext({
+			teamId: state.id,
+			command: "task TASK-BOARD-HISTORY-1",
+		});
+		const successfulLogger = createAnsteelRuntimeLogger(harness.ctx.cwd, successfulContext);
+		const root = successfulLogger.startSpan("run.started", { role: "coordinator" });
+		const tool = successfulLogger.startSpan("tool.call.completed", {
+			parent: root,
+			role: "tech-lead",
+			taskId: "TASK-BOARD-HISTORY-1",
+			toolCallId: "TOOL-BOARD-HISTORY-1",
+		});
+		tool.end({
+			outcome: "succeeded",
+			message: "same-team tool fact survived index rebuild",
+			data: { exitCode: 0 },
+		});
+		root.end({ outcome: "succeeded", message: "same-team run completed" });
+		await successfulLogger.forceFlush();
+		successfulLogger.close();
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
+		harness.sendMessage.mockClear();
+
+		await command("board", harness.ctx);
+
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("tool.call.completed: succeeded") }),
 			{ triggerTurn: false },
 		);
 	});

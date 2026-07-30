@@ -3,19 +3,25 @@ import { createHash } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
+	fstatSync,
 	fsyncSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import { ANSTEEL_ROLES, type AnsteelRole, DEFAULT_ANSTEEL_TEAM_TASK_OWNERS } from "./ansteel-discussion.ts";
-import type { AnsteelRuntimeLogEntry, AnsteelRuntimeLogger } from "./ansteel-team-observability.ts";
+import {
+	type AnsteelRuntimeLogEntry,
+	type AnsteelRuntimeLogger,
+	redactAnsteelSensitiveValue,
+} from "./ansteel-team-observability.ts";
 
 const ANSTEEL_TEAM_STATE_VERSION = 8;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
@@ -147,6 +153,15 @@ export interface AnsteelActionAssessment {
 	requiredReviewers: AnsteelRole[];
 	approvedReviewers: AnsteelRole[];
 	blockReason?: string;
+}
+
+export interface AnsteelActionFileIdentity {
+	/** Filesystem device identity captured when the governed checkpoint was published. */
+	dev: bigint;
+	/** Non-zero file identity captured from the same open handle as the approved content hash. */
+	ino: bigint;
+	/** Lowercase SHA-256 captured from that same handle and approved by both peers. */
+	sha256: string;
 }
 
 export type AnsteelWorkCheckpointInput = Omit<
@@ -1118,19 +1133,97 @@ export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): 
 	return state;
 }
 
-function normalizeTaskFilePath(cwd: string, file: unknown): string {
-	if (typeof file !== "string" || file.trim().length === 0 || isAbsolute(file)) {
+interface CanonicalProjectTarget {
+	absolutePath: string;
+	relativePath: string;
+}
+
+function resolveCanonicalProjectTarget(cwd: string, target: string): CanonicalProjectTarget | undefined {
+	const projectDirectory = assertProjectDirectory(cwd);
+	const lexicalTarget = resolvePath(target, projectDirectory);
+	const lexicalRelative = getCwdRelativePath(lexicalTarget, projectDirectory);
+	if (lexicalRelative === undefined) return undefined;
+
+	let existingAncestor = lexicalTarget;
+	const missingSegments: string[] = [];
+	while (!existsSync(existingAncestor)) {
+		const parent = dirname(existingAncestor);
+		if (parent === existingAncestor) return undefined;
+		missingSegments.unshift(basename(existingAncestor));
+		existingAncestor = parent;
+	}
+
+	let canonicalProjectDirectory: string;
+	let canonicalAncestor: string;
+	try {
+		canonicalProjectDirectory = realpathSync(projectDirectory);
+		canonicalAncestor = realpathSync(existingAncestor);
+	} catch {
+		return undefined;
+	}
+	const absolutePath = resolvePath(join(canonicalAncestor, ...missingSegments));
+	const relativePath = getCwdRelativePath(absolutePath, canonicalProjectDirectory);
+	if (relativePath === undefined) return undefined;
+	return { absolutePath, relativePath: relativePath.replace(/\\/g, "/") };
+}
+
+function requireCanonicalTaskFileTarget(
+	cwd: string,
+	file: unknown,
+	options: { allowAbsolute: boolean },
+): CanonicalProjectTarget {
+	if (typeof file !== "string" || file.trim().length === 0 || (!options.allowAbsolute && isAbsolute(file))) {
 		throw new AnsteelTeamStateError("Ansteel team task files must use non-empty project-relative paths");
 	}
-	const relativePath = getCwdRelativePath(resolvePath(file, cwd), cwd);
-	if (relativePath === undefined || relativePath === ".") {
+	let projectDirectory = cwd;
+	if (options.allowAbsolute) {
+		try {
+			projectDirectory = realpathSync(assertProjectDirectory(cwd));
+		} catch {
+			throw new AnsteelTeamStateError("Ansteel team task files must stay inside the project");
+		}
+	}
+	const resolved = resolveCanonicalProjectTarget(projectDirectory, file);
+	if (resolved === undefined || resolved.relativePath === ".") {
 		throw new AnsteelTeamStateError("Ansteel team task files must stay inside the project");
 	}
-	const normalizedPath = relativePath.replace(/\\/g, "/");
-	if (normalizedPath === ".pi" || normalizedPath.startsWith(".pi/")) {
+	const normalizedPath = resolved.relativePath;
+	const comparablePath = process.platform === "win32" ? normalizedPath.toLowerCase() : normalizedPath;
+	if (comparablePath === ".pi" || comparablePath.startsWith(".pi/")) {
 		throw new AnsteelTeamStateError("Ansteel team task files cannot modify team governance state");
 	}
-	return normalizedPath;
+	return resolved;
+}
+
+function normalizeTaskFilePath(cwd: string, file: unknown): string {
+	return requireCanonicalTaskFileTarget(cwd, file, { allowAbsolute: false }).relativePath;
+}
+
+export function resolveAnsteelTeamWritePath(cwd: string, file: unknown): string {
+	return requireCanonicalTaskFileTarget(cwd, file, { allowAbsolute: false }).absolutePath;
+}
+
+export function revalidateAnsteelTeamWritePath(cwd: string, approvedAbsolutePath: unknown): string {
+	if (
+		typeof approvedAbsolutePath !== "string" ||
+		approvedAbsolutePath.trim().length === 0 ||
+		!isAbsolute(approvedAbsolutePath)
+	) {
+		throw new AnsteelTeamStateError("Ansteel team approved write path must be absolute");
+	}
+	const approvedPath = resolvePath(approvedAbsolutePath);
+	let current: string;
+	try {
+		current = requireCanonicalTaskFileTarget(cwd, approvedPath, { allowAbsolute: true }).absolutePath;
+	} catch {
+		throw new AnsteelTeamStateError("Ansteel team write target changed after approval");
+	}
+	const comparableApproved = process.platform === "win32" ? approvedPath.toLowerCase() : approvedPath;
+	const comparableCurrent = process.platform === "win32" ? current.toLowerCase() : current;
+	if (comparableCurrent !== comparableApproved) {
+		throw new AnsteelTeamStateError("Ansteel team write target changed after approval");
+	}
+	return current;
 }
 
 const ANSTEEL_ACTION_RISK_ORDER: Record<AnsteelActionRisk, number> = {
@@ -1149,11 +1242,9 @@ function getActionPath(args: unknown): string | undefined {
 }
 
 function isSensitiveActionTarget(cwd: string, target: string): boolean {
-	const projectDirectory = assertProjectDirectory(cwd);
-	const resolvedTarget = resolvePath(target, projectDirectory);
-	const relativeTarget = getCwdRelativePath(resolvedTarget, projectDirectory);
-	if (relativeTarget === undefined) return true;
-	const normalizedTarget = relativeTarget.replace(/\\/g, "/").toLowerCase();
+	const resolved = resolveCanonicalProjectTarget(cwd, target);
+	if (resolved === undefined) return true;
+	const normalizedTarget = resolved.relativePath.toLowerCase();
 	return (
 		normalizedTarget === ".git" ||
 		normalizedTarget.startsWith(".git/") ||
@@ -1244,15 +1335,26 @@ function getCheckpointActionVersion(
 		if (!existsSync(resolvedTarget)) {
 			return `${taskVersion};${normalizedTarget}@missing`;
 		}
+		let fd: number | undefined;
 		try {
-			const hash = createHash("sha256").update(readFileSync(resolvedTarget)).digest("hex");
-			return `${taskVersion};${normalizedTarget}@sha256:${hash}`;
+			// Bind review approval to the exact opened file object, not only its
+			// contents. A same-content file reached through a swapped junction must
+			// not satisfy an approval for the original project file.
+			fd = openSync(resolvedTarget, "r");
+			const stats = fstatSync(fd, { bigint: true });
+			if (!stats.isFile() || stats.ino === 0n) {
+				throw new Error("the target does not expose a stable regular-file identity");
+			}
+			const hash = createHash("sha256").update(readFileSync(fd)).digest("hex");
+			return `${taskVersion};${normalizedTarget}@file:${stats.dev}:${stats.ino};sha256:${hash}`;
 		} catch (error) {
 			throw new AnsteelTeamStateError(
 				`Ansteel team action target ${normalizedTarget} cannot be versioned: ${
 					error instanceof Error ? error.message : String(error)
 				}`,
 			);
+		} finally {
+			if (fd !== undefined) closeSync(fd);
 		}
 	}
 	if (action.kind === "commit" || action.kind === "publish") {
@@ -1267,6 +1369,20 @@ function getCheckpointActionVersion(
 		return `${taskVersion};git-head:${head.stdout.trim()}`;
 	}
 	return `${taskVersion};checkpoint:${checkpointId}`;
+}
+
+/**
+ * Recover the immutable file identity embedded in an approved action version.
+ * Missing targets and legacy content-only versions intentionally return no
+ * identity, so governed mutation fails closed and requires a new checkpoint.
+ */
+export function getAnsteelTeamActionFileIdentity(version: string): AnsteelActionFileIdentity | undefined {
+	const match = /@file:([0-9]+):([0-9]+);sha256:([0-9a-f]{64})$/i.exec(version);
+	if (!match) return undefined;
+	const dev = BigInt(match[1]!);
+	const ino = BigInt(match[2]!);
+	if (ino === 0n) return undefined;
+	return { dev, ino, sha256: match[3]!.toLowerCase() };
 }
 
 function isTaskStillActive(task: AnsteelTeamTask): boolean {
@@ -1362,7 +1478,24 @@ export function assessAnsteelTeamAction(
 	assertRole(role, "action actor");
 	const computedRisk = classifyAnsteelTeamActionRisk(projectDirectory, input);
 	const kind = getAnsteelToolActionKind(input.toolName, input.args);
-	const target = getAnsteelToolActionTarget(projectDirectory, input.toolName, input.args);
+	let target: string;
+	try {
+		target = getAnsteelToolActionTarget(projectDirectory, input.toolName, input.args);
+	} catch (error) {
+		const unresolvedTarget = getActionPath(input.args) ?? input.toolName.trim().toLowerCase();
+		return {
+			action: {
+				kind,
+				target: unresolvedTarget,
+				version: "immediate",
+				computedRisk,
+				effectiveRisk: computedRisk,
+			},
+			requiredReviewers: getRequiredAnsteelActionReviewers(role),
+			approvedReviewers: [],
+			blockReason: error instanceof Error ? error.message : String(error),
+		};
+	}
 	const immediateAction: AnsteelGovernedAction = {
 		kind,
 		target,
@@ -2707,8 +2840,12 @@ export function appendAnsteelTeamEvent(
 	assertProjectDirectory(cwd);
 	assertState(state);
 	assertAnsteelTeamEventLedger(cwd, state);
+	// Public collaboration events are durable and rendered to every role. Apply
+	// one recursive redaction boundary before hashing, replaying, or persisting
+	// any model/provider-authored payload so no caller can bypass sanitization.
+	const redactedInput = redactAnsteelSensitiveValue(input) as AnsteelTeamEventInput;
 	const unsignedEvent = {
-		...input,
+		...redactedInput,
 		sequence: state.nextEventSequence,
 		createdAt: new Date().toISOString(),
 		previousHash: state.ledgerHeadHash,

@@ -20,6 +20,7 @@ import {
 	stripBom,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
+import type { GuardedFileMutationExecutor } from "./guarded-file-mutation.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -89,6 +90,10 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
+	/** Revalidate the resolved path immediately before filesystem access or mutation. */
+	pathGuard?: (absolutePath: string) => void | Promise<void>;
+	/** Bind governed reads and writes to one verified existing file handle. */
+	guardedFileMutation?: GuardedFileMutationExecutor;
 }
 
 function prepareEditArguments(input: unknown): EditToolInput {
@@ -318,6 +323,53 @@ export function createEditToolDefinition(
 					if (signal?.aborted) throw new Error("Operation aborted");
 				};
 
+				const applyMutation = async (
+					buffer: Buffer,
+					replaceFile: (content: string) => Promise<void>,
+				): Promise<{
+					content: Array<{ type: "text"; text: string }>;
+					details: EditToolDetails;
+				}> => {
+					const rawContent = buffer.toString("utf-8");
+					throwIfAborted();
+
+					// Strip BOM before matching. The model will not include an invisible BOM in oldText.
+					const { bom, text: content } = stripBom(rawContent);
+					const originalEnding = detectLineEnding(content);
+					const normalizedContent = normalizeToLF(content);
+					const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+					throwIfAborted();
+
+					const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+					await replaceFile(finalContent);
+					throwIfAborted();
+
+					const diffResult = generateDiffString(baseContent, newContent);
+					const patch = generateUnifiedPatch(path, baseContent, newContent);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							},
+						],
+						details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					};
+				};
+
+				throwIfAborted();
+				if (options?.guardedFileMutation) {
+					return options.guardedFileMutation(absolutePath, async (file) => {
+						const buffer = await file.readFile();
+						return applyMutation(buffer, async (finalContent) => {
+							await file.revalidate();
+							throwIfAborted();
+							await file.replaceFile(finalContent);
+						});
+					});
+				}
+
+				await options?.pathGuard?.(absolutePath);
 				throwIfAborted();
 
 				// Check if file exists.
@@ -332,32 +384,14 @@ export function createEditToolDefinition(
 				throwIfAborted();
 
 				// Read the file.
+				await options?.pathGuard?.(absolutePath);
+				throwIfAborted();
 				const buffer = await ops.readFile(absolutePath);
-				const rawContent = buffer.toString("utf-8");
-				throwIfAborted();
-
-				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-				const { bom, text: content } = stripBom(rawContent);
-				const originalEnding = detectLineEnding(content);
-				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
-				throwIfAborted();
-
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-				await ops.writeFile(absolutePath, finalContent);
-				throwIfAborted();
-
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
-						},
-					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
-				};
+				return applyMutation(buffer, async (finalContent) => {
+					await options?.pathGuard?.(absolutePath);
+					throwIfAborted();
+					await ops.writeFile(absolutePath, finalContent);
+				});
 			});
 		},
 		renderCall(args, theme, context) {

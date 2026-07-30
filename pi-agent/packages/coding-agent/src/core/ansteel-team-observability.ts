@@ -289,28 +289,37 @@ function getAnsteelRuntimeLogPath(cwd: string, runId: string, segment = 1): stri
 
 const SENSITIVE_FIELD = /authorization|api[_-]?key|token|cookie|secret|password|private[_-]?key/i;
 
-function redactString(value: string): string {
+/**
+ * Remove credentials before text crosses either the runtime-log boundary or
+ * the public collaboration/UI boundary. The assignment rule accepts `=` and
+ * `:` plus quoted JSON keys/values; scheme credentials are handled first so an
+ * `Authorization: Basic <value>` suffix cannot survive a shorter key match.
+ */
+export function redactAnsteelSensitiveText(value: string): string {
 	return value
-		.replace(/\bBearer\s+[^\s"',;]+/gi, "Bearer [REDACTED]")
-		.replace(/\bsk-[A-Za-z0-9._-]+\b/g, "sk-[REDACTED]")
-		.replace(/\b(API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD|PRIVATE_KEY|SECRET|TOKEN)=([^\s]+)/gi, "$1=[REDACTED]");
+		.replace(
+			/((?:"|')?([A-Za-z_][A-Za-z0-9_-]*)(?:"|')?\s*[:=]\s*)((?:Bearer|Basic)\s+[^\s"',;}\]]+|"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+			(match, prefix: string, key: string) => (SENSITIVE_FIELD.test(key) ? `${prefix}[REDACTED]` : match),
+		)
+		.replace(/\b(Bearer|Basic)\s+[^\s"',;}\]]+/gi, "$1 [REDACTED]")
+		.replace(/\bsk-[A-Za-z0-9._-]+\b/g, "sk-[REDACTED]");
 }
 
-function redactValue(value: unknown, seen = new WeakSet<object>()): unknown {
-	if (typeof value === "string") return redactString(value);
-	if (Array.isArray(value)) return value.map((item) => redactValue(item, seen));
+export function redactAnsteelSensitiveValue(value: unknown, seen = new WeakSet<object>()): unknown {
+	if (typeof value === "string") return redactAnsteelSensitiveText(value);
+	if (Array.isArray(value)) return value.map((item) => redactAnsteelSensitiveValue(item, seen));
 	if (typeof value !== "object" || value === null) return value;
 	if (seen.has(value)) return "[Circular]";
 	seen.add(value);
 	const result = Object.create(null) as Record<string, unknown>;
 	for (const [key, entry] of Object.entries(value)) {
-		result[key] = SENSITIVE_FIELD.test(key) ? "[REDACTED]" : redactValue(entry, seen);
+		result[key] = SENSITIVE_FIELD.test(key) ? "[REDACTED]" : redactAnsteelSensitiveValue(entry, seen);
 	}
 	return result;
 }
 
 function redactRecord(value: Record<string, unknown>): Record<string, unknown> {
-	return redactValue(value) as Record<string, unknown>;
+	return redactAnsteelSensitiveValue(value) as Record<string, unknown>;
 }
 
 function writeBuffer(fd: number, content: Buffer): void {
@@ -329,7 +338,7 @@ function writeNewDurableFile(path: string, content: string): void {
 }
 
 function storeArtifact(cwd: string, artifact: { kind: string; content: string }): AnsteelRuntimeArtifactRef {
-	const content = redactString(artifact.content);
+	const content = redactAnsteelSensitiveText(artifact.content);
 	const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
 	const directory = getAnsteelRuntimeArtifactDirectory(cwd);
 	mkdirSync(directory, { recursive: true });
@@ -935,6 +944,7 @@ export interface AnsteelRuntimeRunSummary {
 	endedAt?: string;
 	entryCount: number;
 	lastOutcome?: AnsteelRuntimeLogEntry["outcome"];
+	terminalOutcome?: AnsteelRuntimeLogEntry["outcome"];
 }
 
 export interface AnsteelIncidentBundle {
@@ -953,6 +963,28 @@ export interface AnsteelIncidentBundle {
 	};
 }
 
+function getRuntimeTerminalOutcome(
+	entries: readonly AnsteelRuntimeLogEntry[],
+): AnsteelRuntimeLogEntry["outcome"] | undefined {
+	const rootStarts = entries.filter(
+		(entry) => entry.eventName === "run.started" && entry.outcome === "started" && entry.parentSpanId === undefined,
+	);
+	if (rootStarts.length !== 1) return undefined;
+	const rootStart = rootStarts[0]!;
+	const terminals = entries.filter(
+		(entry) =>
+			entry.sequence > rootStart.sequence &&
+			entry.eventName === rootStart.eventName &&
+			entry.spanId === rootStart.spanId &&
+			entry.parentSpanId === rootStart.parentSpanId &&
+			(entry.outcome === "succeeded" ||
+				entry.outcome === "failed" ||
+				entry.outcome === "cancelled" ||
+				entry.outcome === "abandoned"),
+	);
+	return terminals.length === 1 ? terminals[0]!.outcome : undefined;
+}
+
 export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] {
 	return withRuntimeIndexLock(cwd, () => {
 		const index = readOrRebuildRuntimeIndexLocked(cwd, true);
@@ -961,6 +993,7 @@ export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] 
 				const entries = readAnsteelRuntimeLogs(cwd, runId);
 				const first = entries[0];
 				const last = entries.at(-1);
+				const terminalOutcome = getRuntimeTerminalOutcome(entries);
 				return {
 					runId,
 					...(first?.traceId === undefined ? {} : { traceId: first.traceId }),
@@ -969,6 +1002,7 @@ export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] 
 					...(last?.timestampUtc === undefined ? {} : { endedAt: last.timestampUtc }),
 					entryCount: entries.length,
 					...(last?.outcome === undefined ? {} : { lastOutcome: last.outcome }),
+					...(terminalOutcome === undefined ? {} : { terminalOutcome }),
 				};
 			})
 			.sort(
@@ -1021,7 +1055,7 @@ export function traceAnsteelTeamRuntime(cwd: string, selector: string): AnsteelR
 function getOrphanedRuntimeSpans(entries: readonly AnsteelRuntimeLogEntry[]): AnsteelRuntimeLogEntry[] {
 	const openSpans = new Map<string, AnsteelRuntimeLogEntry[]>();
 	for (const entry of entries) {
-		const key = `${entry.spanId}\0${entry.eventName}`;
+		const key = `${entry.spanId}\0${entry.eventName}\0${entry.parentSpanId ?? ""}`;
 		if (entry.outcome === "started") {
 			const starts = openSpans.get(key);
 			if (starts === undefined) openSpans.set(key, [entry]);
@@ -1344,7 +1378,7 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 			traceId: context.traceId,
 			spanId: inputSpanId ?? randomBytes(8).toString("hex"),
 			teamId: context.teamId,
-			message: redactString(input.message),
+			message: redactAnsteelSensitiveText(input.message),
 			data: redactRecord(data),
 			artifactRefs,
 			previousHash,

@@ -1,5 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,6 +34,8 @@ import {
 	raiseAnsteelProcessIssue,
 	recordAnsteelTeamTaskTestResult,
 	resolveAnsteelProcessIssue,
+	resolveAnsteelTeamWritePath,
+	revalidateAnsteelTeamWritePath,
 	reviewAnsteelProcessResolution,
 	reviewAnsteelTeamAction,
 	reviewAnsteelTeamMilestone,
@@ -40,6 +52,9 @@ import {
 	createAnsteelRuntimeLogger,
 	readAnsteelRuntimeLogs,
 } from "../src/core/ansteel-team-observability.ts";
+import { createEditTool } from "../src/core/tools/edit.ts";
+import { createGuardedFileMutationController } from "../src/core/tools/guarded-file-mutation.ts";
+import { createWriteTool } from "../src/core/tools/write.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -47,6 +62,16 @@ function createTemporaryProject(): string {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-team-"));
 	temporaryDirectories.push(cwd);
 	return cwd;
+}
+
+function getStableFileIdentity(path: string): { dev: bigint; ino: bigint; sha256: string } {
+	const stats = statSync(path, { bigint: true });
+	if (!stats.isFile() || stats.ino === 0n) throw new Error(`Test target has no stable file identity: ${path}`);
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
+	};
 }
 
 function createTeam(cwd: string) {
@@ -1609,6 +1634,224 @@ describe("Ansteel team state", () => {
 		).toThrow("must stay inside the project");
 		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "src/parser.ts")).toBeUndefined();
 		expect(getAnsteelTeamWriteBlockReason(cwd, team, "qa-engineer", "src/parser.ts")).toContain("must be claimed");
+	});
+
+	it("rejects a task file that escapes the project through a directory link", () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		writeFileSync(join(outside, "outside.ts"), "export const outside = true;\n", "utf8");
+		symlinkSync(outside, join(cwd, "linked"), process.platform === "win32" ? "junction" : "dir");
+		const team = createTeam(cwd);
+
+		expect(() =>
+			claimAnsteelTeamTask(cwd, team, {
+				id: "TASK-LINK-ESCAPE",
+				owner: "staff-engineer",
+				files: ["linked/outside.ts"],
+				description: "Attempt to claim a linked file outside the project.",
+				acceptanceCriteria: "The project boundary remains intact.",
+			}),
+		).toThrow("must stay inside the project");
+	});
+
+	it("rechecks the canonical project boundary when a claimed path becomes a directory link", () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		writeFileSync(join(outside, "outside.ts"), "export const outside = true;\n", "utf8");
+		const team = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-LINK-DRIFT",
+			owner: "staff-engineer",
+			files: ["linked/outside.ts"],
+			description: "Edit a file whose parent does not exist yet.",
+			acceptanceCriteria: "The write remains inside the project.",
+		});
+		symlinkSync(outside, join(cwd, "linked"), process.platform === "win32" ? "junction" : "dir");
+
+		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "linked/outside.ts")).toContain(
+			"must stay inside the project",
+		);
+		expect(classifyAnsteelTeamActionRisk(cwd, { toolName: "edit", args: { path: "linked/outside.ts" } })).toBe("red");
+		expect(
+			assessAnsteelTeamAction(cwd, team, "staff-engineer", {
+				toolName: "edit",
+				args: { path: "linked/outside.ts" },
+			}).blockReason,
+		).toContain("must stay inside the project");
+		expect(() => resolveAnsteelTeamWritePath(cwd, "linked/outside.ts")).toThrow("must stay inside the project");
+	});
+
+	it("binds an allowed linked write target to its canonical in-project path", () => {
+		const cwd = createTemporaryProject();
+		mkdirSync(join(cwd, "real"), { recursive: true });
+		writeFileSync(join(cwd, "real", "inside.ts"), "export const inside = true;\n", "utf8");
+		symlinkSync(join(cwd, "real"), join(cwd, "linked"), process.platform === "win32" ? "junction" : "dir");
+
+		expect(resolveAnsteelTeamWritePath(cwd, "linked/inside.ts")).toBe(realpathSync(join(cwd, "real", "inside.ts")));
+	});
+
+	it("blocks the production write tool when a missing parent becomes an external directory link", async () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		const seedPath = join(cwd, "approved-seed.ts");
+		writeFileSync(seedPath, "approved seed\n", "utf8");
+		const approvedPath = resolveAnsteelTeamWritePath(cwd, "pending/escaped.ts");
+		symlinkSync(outside, join(cwd, "pending"), process.platform === "win32" ? "junction" : "dir");
+		const guardedFileMutation = createGuardedFileMutationController((absolutePath) => {
+			revalidateAnsteelTeamWritePath(cwd, absolutePath);
+		});
+		const writeTool = createWriteTool(cwd, {
+			guardedFileMutation: guardedFileMutation.execute,
+		});
+		guardedFileMutation.authorize(approvedPath, getStableFileIdentity(seedPath));
+
+		await expect(
+			writeTool.execute("TOOL-WRITE-TOCTOU-1", {
+				path: approvedPath,
+				content: "must not escape\n",
+			}),
+		).rejects.toThrow("changed after approval");
+		expect(() => readFileSync(join(outside, "escaped.ts"), "utf8")).toThrow();
+	});
+
+	it("blocks the production edit tool when an approved parent becomes an external directory link", async () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		mkdirSync(join(cwd, "pending"), { recursive: true });
+		writeFileSync(join(cwd, "pending", "target.ts"), "inside original\n", "utf8");
+		writeFileSync(join(outside, "target.ts"), "outside original\n", "utf8");
+		const approvedPath = resolveAnsteelTeamWritePath(cwd, "pending/target.ts");
+		const approvedIdentity = getStableFileIdentity(approvedPath);
+		rmSync(join(cwd, "pending"), { recursive: true, force: true });
+		symlinkSync(outside, join(cwd, "pending"), process.platform === "win32" ? "junction" : "dir");
+		const guardedFileMutation = createGuardedFileMutationController((absolutePath) => {
+			revalidateAnsteelTeamWritePath(cwd, absolutePath);
+		});
+		const editTool = createEditTool(cwd, {
+			guardedFileMutation: guardedFileMutation.execute,
+		});
+		guardedFileMutation.authorize(approvedPath, approvedIdentity);
+
+		await expect(
+			editTool.execute("TOOL-EDIT-TOCTOU-1", {
+				path: approvedPath,
+				edits: [{ oldText: "outside original", newText: "outside changed" }],
+			}),
+		).rejects.toThrow("changed after approval");
+		expect(readFileSync(join(outside, "target.ts"), "utf8")).toBe("outside original\n");
+	});
+
+	it("binds production write I/O to the approved file when a directory link changes after validation", async () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		mkdirSync(join(cwd, "pending"), { recursive: true });
+		writeFileSync(join(cwd, "pending", "target.ts"), "inside original\n", "utf8");
+		writeFileSync(join(outside, "target.ts"), "outside original\n", "utf8");
+		const approvedPath = resolveAnsteelTeamWritePath(cwd, "pending/target.ts");
+		const approvedIdentity = getStableFileIdentity(approvedPath);
+		let guardCalls = 0;
+		const guardedFileMutation = createGuardedFileMutationController((absolutePath) => {
+			revalidateAnsteelTeamWritePath(cwd, absolutePath);
+			guardCalls += 1;
+			if (guardCalls === 2) {
+				rmSync(join(cwd, "pending"), { recursive: true, force: true });
+				symlinkSync(outside, join(cwd, "pending"), process.platform === "win32" ? "junction" : "dir");
+			}
+		});
+		const writeTool = createWriteTool(cwd, { guardedFileMutation: guardedFileMutation.execute });
+		guardedFileMutation.authorize(approvedPath, approvedIdentity);
+
+		await expect(
+			writeTool.execute("TOOL-WRITE-ATOMIC-BOUNDARY-1", {
+				path: approvedPath,
+				content: "must not escape\n",
+			}),
+		).rejects.toThrow("changed after approval");
+		expect(readFileSync(join(outside, "target.ts"), "utf8")).toBe("outside original\n");
+	});
+
+	it("rejects an outside handle opened during an alternating junction race", async () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		mkdirSync(join(cwd, "pending"), { recursive: true });
+		writeFileSync(join(cwd, "pending", "target.ts"), "inside original\n", "utf8");
+		writeFileSync(join(outside, "target.ts"), "outside original\n", "utf8");
+		const approvedPath = resolveAnsteelTeamWritePath(cwd, "pending/target.ts");
+		const approvedIdentity = getStableFileIdentity(approvedPath);
+		const guardedFileMutation = createGuardedFileMutationController((absolutePath) => {
+			revalidateAnsteelTeamWritePath(cwd, absolutePath);
+			// Reproduce the reviewer's strongest race: validation sees the
+			// approved in-project target, then open() sees the outside junction.
+			rmSync(join(cwd, "pending"), { recursive: true, force: true });
+			symlinkSync(outside, join(cwd, "pending"), process.platform === "win32" ? "junction" : "dir");
+		});
+		const writeTool = createWriteTool(cwd, { guardedFileMutation: guardedFileMutation.execute });
+		guardedFileMutation.authorize(approvedPath, approvedIdentity);
+
+		await expect(
+			writeTool.execute("TOOL-WRITE-ALTERNATING-JUNCTION-1", {
+				path: approvedPath,
+				content: "outside mutated\n",
+			}),
+		).rejects.toThrow("opened a different file than the approved checkpoint");
+		expect(readFileSync(join(outside, "target.ts"), "utf8")).toBe("outside original\n");
+	});
+
+	it("rejects same-inode content drift after peers approve the file hash", async () => {
+		const cwd = createTemporaryProject();
+		const targetPath = join(cwd, "target.ts");
+		writeFileSync(targetPath, "peer approved\n", "utf8");
+		const approvedIdentity = getStableFileIdentity(targetPath);
+		const guardedFileMutation = createGuardedFileMutationController((absolutePath) => {
+			revalidateAnsteelTeamWritePath(cwd, absolutePath);
+		});
+		const writeTool = createWriteTool(cwd, { guardedFileMutation: guardedFileMutation.execute });
+
+		// An in-place rewrite preserves dev/ino on the tested platform. The
+		// approved SHA-256 must therefore be checked independently by the handle.
+		writeFileSync(targetPath, "unreviewed drift\n", "utf8");
+		expect(getStableFileIdentity(targetPath)).toMatchObject({
+			dev: approvedIdentity.dev,
+			ino: approvedIdentity.ino,
+		});
+		guardedFileMutation.authorize(targetPath, approvedIdentity);
+
+		await expect(
+			writeTool.execute("TOOL-WRITE-CONTENT-DRIFT-1", {
+				path: targetPath,
+				content: "must not overwrite drift\n",
+			}),
+		).rejects.toThrow("contents changed after peer approval");
+		expect(readFileSync(targetPath, "utf8")).toBe("unreviewed drift\n");
+	});
+
+	it("binds production edit I/O to the approved file when a directory link changes after validation", async () => {
+		const cwd = createTemporaryProject();
+		const outside = createTemporaryProject();
+		mkdirSync(join(cwd, "pending"), { recursive: true });
+		writeFileSync(join(cwd, "pending", "target.ts"), "inside original\n", "utf8");
+		writeFileSync(join(outside, "target.ts"), "inside original\n", "utf8");
+		const approvedPath = resolveAnsteelTeamWritePath(cwd, "pending/target.ts");
+		const approvedIdentity = getStableFileIdentity(approvedPath);
+		let guardCalls = 0;
+		const guardedFileMutation = createGuardedFileMutationController((absolutePath) => {
+			revalidateAnsteelTeamWritePath(cwd, absolutePath);
+			guardCalls += 1;
+			if (guardCalls === 3) {
+				rmSync(join(cwd, "pending"), { recursive: true, force: true });
+				symlinkSync(outside, join(cwd, "pending"), process.platform === "win32" ? "junction" : "dir");
+			}
+		});
+		const editTool = createEditTool(cwd, { guardedFileMutation: guardedFileMutation.execute });
+		guardedFileMutation.authorize(approvedPath, approvedIdentity);
+
+		await expect(
+			editTool.execute("TOOL-EDIT-ATOMIC-BOUNDARY-1", {
+				path: approvedPath,
+				edits: [{ oldText: "inside original", newText: "must not escape" }],
+			}),
+		).rejects.toThrow("changed after approval");
+		expect(readFileSync(join(outside, "target.ts"), "utf8")).toBe("inside original\n");
 	});
 
 	it("allows only Staff Engineer to claim change tasks by default", () => {

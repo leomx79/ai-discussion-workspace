@@ -40,6 +40,7 @@ import {
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
+	getAnsteelTeamActionFileIdentity,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamTaskProgressFingerprint,
 	isAnsteelTeamGovernancePath,
@@ -49,6 +50,8 @@ import {
 	raiseAnsteelProcessIssue,
 	recordAnsteelTeamActionAssessment,
 	resolveAnsteelProcessIssue,
+	resolveAnsteelTeamWritePath,
+	revalidateAnsteelTeamWritePath,
 	reviewAnsteelProcessResolution,
 	reviewAnsteelTeamAction,
 	reviewAnsteelTeamMilestone,
@@ -72,6 +75,7 @@ import {
 	formatAnsteelTeamDiagnosis,
 	listAnsteelRuntimeRuns,
 	readAnsteelRuntimeLogs,
+	redactAnsteelSensitiveText,
 	traceAnsteelTeamRuntime,
 } from "../../core/ansteel-team-observability.ts";
 import {
@@ -85,6 +89,12 @@ import { DefaultResourceLoader } from "../../core/resource-loader.ts";
 import { createAgentSession } from "../../core/sdk.ts";
 import { SessionManager } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
+import { createEditToolDefinition } from "../../core/tools/edit.ts";
+import {
+	createGuardedFileMutationController,
+	type GuardedFileIdentity,
+} from "../../core/tools/guarded-file-mutation.ts";
+import { createWriteToolDefinition } from "../../core/tools/write.ts";
 
 const MAX_LEDGER_EVENTS_IN_PROMPT = 24;
 const DEFAULT_ANSTEEL_TEAM_STAGE_TIMEOUT_MS = 120_000;
@@ -206,12 +216,23 @@ function classifyAnsteelRuntimeError(error: unknown): AnsteelRuntimeReasonCode {
 	return "unclassified-runtime-error";
 }
 
+function formatAnsteelPublicError(error: unknown): string {
+	return redactAnsteelSensitiveText(error instanceof Error ? error.message : String(error));
+}
+
+function createAnsteelPublicError(error: unknown): Error {
+	const message = formatAnsteelPublicError(error);
+	return error instanceof AnsteelObservabilityError
+		? new AnsteelObservabilityError(error.reasonCode, message)
+		: new Error(message);
+}
+
 function verifyPersistedAnsteelTeamIntegrity(cwd: string): AnsteelTeamState {
 	let events: ReturnType<typeof listAnsteelTeamEvents>;
 	try {
 		events = listAnsteelTeamEvents(cwd);
 	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
+		const detail = formatAnsteelPublicError(error);
 		throw new AnsteelObservabilityError(
 			"event-chain-invalid",
 			`Ansteel persisted team integrity verification failed: ${detail}`,
@@ -226,7 +247,7 @@ function verifyPersistedAnsteelTeamIntegrity(cwd: string): AnsteelTeamState {
 		getAnsteelTeamSharedBoard(persistedState, events);
 		return persistedState;
 	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
+		const detail = formatAnsteelPublicError(error);
 		throw new AnsteelObservabilityError(
 			"state-projection-mismatch",
 			`Ansteel persisted team integrity verification failed: ${detail}`,
@@ -713,6 +734,33 @@ export function getAnsteelTeamEvidenceBlockReason(cwd: string, toolName: string,
 	return createAnsteelReviewToolPolicy(cwd).beforeToolCall(toolName, args)?.reason;
 }
 
+export interface AnsteelTeamMutationToolController {
+	tools: ToolDefinition[];
+	/**
+	 * Bind the next mutation to the file identity approved in the immutable
+	 * checkpoint. The authorization is single-use and consumed by edit/write.
+	 */
+	authorize: (absolutePath: string, identity: GuardedFileIdentity) => void;
+}
+
+export function createAnsteelTeamMutationToolController(cwd: string): AnsteelTeamMutationToolController {
+	const mutationPathGuard = (absolutePath: string): void => {
+		revalidateAnsteelTeamWritePath(cwd, absolutePath);
+	};
+	const guardedFileMutation = createGuardedFileMutationController(mutationPathGuard);
+	return {
+		tools: [
+			createEditToolDefinition(cwd, {
+				guardedFileMutation: guardedFileMutation.execute,
+			}) as unknown as ToolDefinition,
+			createWriteToolDefinition(cwd, {
+				guardedFileMutation: guardedFileMutation.execute,
+			}) as unknown as ToolDefinition,
+		],
+		authorize: guardedFileMutation.authorize,
+	};
+}
+
 async function createDefaultRoleSession(
 	options: CreateAnsteelTeamRoleSessionOptions,
 	modelRuntime: ModelRuntime,
@@ -736,6 +784,7 @@ async function createDefaultRoleSession(
 		appendSystemPrompt: [buildRoleSystemPrompt(options.role, memory, options.allowedTaskOwners)],
 	});
 	await resourceLoader.reload();
+	const mutationTools = createAnsteelTeamMutationToolController(options.cwd);
 	const created = await createAgentSession({
 		cwd: options.cwd,
 		model: aiModel,
@@ -745,7 +794,7 @@ async function createDefaultRoleSession(
 		sessionManager: SessionManager.open(options.sessionFile, undefined, options.cwd),
 		settingsManager,
 		tools: [...(roleConfig.teamTools ?? ANSTEEL_TEAM_TOOLS), ...ANSTEEL_TEAM_TASK_TOOL_NAMES],
-		customTools: createTeamTaskTools(options.taskOperations),
+		customTools: [...mutationTools.tools, ...createTeamTaskTools(options.taskOperations)],
 	});
 	const previousBeforeToolCall = created.session.agent.beforeToolCall;
 	let readOnlyToolCallsThisStage = 0;
@@ -782,7 +831,23 @@ async function createDefaultRoleSession(
 			if (assessment.blockReason !== undefined) {
 				return { block: true, reason: assessment.blockReason };
 			}
-			if (context.toolCall.name === "edit" || context.toolCall.name === "write") return undefined;
+			if (context.toolCall.name === "edit" || context.toolCall.name === "write") {
+				if (!isRecord(context.args) || typeof context.args.path !== "string") {
+					return { block: true, reason: "Ansteel team file mutation requires a verifiable path" };
+				}
+				const absolutePath = resolveAnsteelTeamWritePath(options.cwd, context.args.path);
+				const identity = getAnsteelTeamActionFileIdentity(assessment.action.version);
+				if (identity === undefined) {
+					return {
+						block: true,
+						reason:
+							"Ansteel team governed mutation requires an existing regular file identity from the approved checkpoint; atomic new-file creation is unavailable",
+					};
+				}
+				mutationTools.authorize(absolutePath, identity);
+				context.args.path = absolutePath;
+				return undefined;
+			}
 			return consumeReadOnlyToolBudget();
 		}
 		return undefined;
@@ -992,7 +1057,10 @@ function parseCoordinatorTaskArgument(
 }
 
 function emitTimelineMessage(pi: ExtensionAPI, content: string): void {
-	pi.sendMessage({ customType: "ansteel-team-event", content, display: true }, { triggerTurn: false });
+	pi.sendMessage(
+		{ customType: "ansteel-team-event", content: redactAnsteelSensitiveText(content), display: true },
+		{ triggerTurn: false },
+	);
 }
 
 function formatStatus(state: AnsteelTeamState): string {
@@ -1139,7 +1207,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			root.end({
 				outcome: "failed",
 				reasonCode,
-				message: propagatedError instanceof Error ? propagatedError.message : String(propagatedError),
+				message: formatAnsteelPublicError(propagatedError),
 				data: { command },
 				artifacts:
 					propagatedError instanceof Error && propagatedError.stack
@@ -1219,7 +1287,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		} catch (error) {
 			const propagatedError = getFailedCollaborationToolError() ?? error;
 			const reasonCode = classifyAnsteelRuntimeError(propagatedError);
-			const message = propagatedError instanceof Error ? propagatedError.message : String(propagatedError);
+			const message = formatAnsteelPublicError(propagatedError);
 			const artifacts =
 				propagatedError instanceof Error && propagatedError.stack
 					? [{ kind: "exception-stack", content: propagatedError.stack }]
@@ -1265,7 +1333,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			span.end({
 				outcome: "failed",
 				reasonCode,
-				message: error instanceof Error ? error.message : String(error),
+				message: formatAnsteelPublicError(error),
 				data: fields.data ?? {},
 				artifacts:
 					error instanceof Error && error.stack ? [{ kind: "exception-stack", content: error.stack }] : undefined,
@@ -1290,9 +1358,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			} catch (error) {
 				return {
 					block: true,
-					reason: `Ansteel team state cannot be verified; host tool execution is blocked: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
+					reason: `Ansteel team state cannot be verified; host tool execution is blocked: ${formatAnsteelPublicError(
+						error,
+					)}`,
 				};
 			}
 			if (state?.status !== "active") return undefined;
@@ -1406,7 +1474,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					} catch (error) {
 						activeTeam.state.roles[reviewer].status = "failed";
 						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
-						const content = error instanceof Error ? error.message : String(error);
+						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -1481,7 +1549,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					} catch (error) {
 						activeTeam.state.roles[reviewer].status = "failed";
 						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
-						const content = error instanceof Error ? error.message : String(error);
+						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -1532,7 +1600,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					} catch (error) {
 						activeTeam.state.roles[reviewer].status = "failed";
 						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
-						const content = error instanceof Error ? error.message : String(error);
+						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -1964,7 +2032,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				} catch (error) {
 					activeTeam.state.roles[task.owner].status = "failed";
 					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
-					const content = error instanceof Error ? error.message : String(error);
+					const content = formatAnsteelPublicError(error);
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
 						activeTeam.state,
@@ -2069,7 +2137,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					}
 					activeTeam.state.roles[role].status = "failed";
 					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
-					const content = error instanceof Error ? error.message : String(error);
+					const content = formatAnsteelPublicError(error);
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
 						activeTeam.state,
@@ -2233,7 +2301,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					await disposeSessions(sessions);
 					state.status = "stopped";
 					saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
-					throw error;
+					throw createAnsteelPublicError(error);
 				}
 				activeTeams.set(ctx.cwd, activeTeam);
 				emitTimelineMessage(pi, `Ansteel team started.\n\n${formatStatus(state)}`);
@@ -2317,7 +2385,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						await runObservedCommand(ctx.cwd, state.id, "board", async (logger) => {
 							const events = listAnsteelTeamEvents(ctx.cwd);
 							const runtimeEntries = listAnsteelRuntimeRuns(ctx.cwd)
-								.filter((run) => run.runId !== logger.context.runId && run.teamId === state.id)
+								.filter(
+									(run) =>
+										run.runId !== logger.context.runId &&
+										run.teamId === state.id &&
+										run.terminalOutcome === "succeeded" &&
+										diagnoseAnsteelTeamRun(ctx.cwd, run.runId).healthy,
+								)
 								.flatMap((run) => readAnsteelRuntimeLogs(ctx.cwd, run.runId));
 							if (runtimeEntries.length === 0) {
 								throw new Error("No verifiable historical runtime run exists for the shared board.");
@@ -2438,9 +2512,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						"Usage: /ansteel-team <start|ask|task|board|status|trace|doctor|incident|stop> [argument]",
 					);
 				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
+					const message = formatAnsteelPublicError(error);
 					emitTimelineMessage(pi, `Ansteel team command failed: ${message}`);
-					throw error;
+					throw createAnsteelPublicError(error);
 				}
 			},
 		});

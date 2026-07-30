@@ -1,6 +1,6 @@
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -754,15 +754,21 @@ function initializeTaskDeliveryProject(projectDir: string): void {
 	execFileSync("git", ["config", "user.name", "Ansteel Test"], { cwd: projectDir, stdio: "ignore" });
 	execFileSync("git", ["add", "src/staff.ts", "test/staff.test.mjs"], { cwd: projectDir, stdio: "ignore" });
 	execFileSync("git", ["commit", "-m", "baseline"], { cwd: projectDir, stdio: "ignore" });
-	const baselineVersion = `TASK-STAFF@0;src/staff.ts@sha256:${createHash("sha256")
-		.update(readFileSync(join(projectDir, "src", "staff.ts")))
-		.digest("hex")}`;
+	const baselineVersion = createTaskStaffFileVersion(projectDir, readFileSync(join(projectDir, "src", "staff.ts")));
 	const providerPath = join(projectDir, ".pi", "extensions", "deterministic-team-provider.ts");
 	writeFileSync(
 		providerPath,
 		readFileSync(providerPath, "utf8").replaceAll("TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__", baselineVersion),
 		"utf8",
 	);
+}
+
+function createTaskStaffFileVersion(projectDir: string, content: string | Buffer): string {
+	const stats = statSync(join(projectDir, "src", "staff.ts"), { bigint: true });
+	if (!stats.isFile() || stats.ino === 0n)
+		throw new Error("Deterministic task target requires a stable file identity");
+	const hash = createHash("sha256").update(content).digest("hex");
+	return `TASK-STAFF@0;src/staff.ts@file:${stats.dev}:${stats.ino};sha256:${hash}`;
 }
 
 function startRpcCli(projectDir: string, agentDir: string): RpcCliProcess {
@@ -1016,9 +1022,7 @@ describe("Ansteel team CLI", () => {
 						action: {
 							kind: "edit",
 							target: "src/staff.ts",
-							version: `TASK-STAFF@0;src/staff.ts@sha256:${createHash("sha256")
-								.update("export const staff = 'NOT_IMPLEMENTED';\n")
-								.digest("hex")}`,
+							version: createTaskStaffFileVersion(projectDir, "export const staff = 'NOT_IMPLEMENTED';\n"),
 						},
 					}),
 					expect.objectContaining({
@@ -1028,9 +1032,7 @@ describe("Ansteel team CLI", () => {
 						action: {
 							kind: "edit",
 							target: "src/staff.ts",
-							version: `TASK-STAFF@0;src/staff.ts@sha256:${createHash("sha256")
-								.update("export const staff = 'NOT_IMPLEMENTED';\n")
-								.digest("hex")}`,
+							version: createTaskStaffFileVersion(projectDir, "export const staff = 'NOT_IMPLEMENTED';\n"),
 						},
 					}),
 				]),
