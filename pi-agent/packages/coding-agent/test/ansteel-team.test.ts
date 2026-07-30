@@ -18,6 +18,8 @@ import {
 	type AnsteelWorkCheckpointInput,
 	appendAnsteelTeamEvent,
 	assessAnsteelTeamAction,
+	beginAnsteelTeamMilestoneFinalVerification,
+	beginAnsteelTeamTaskFinalVerification,
 	claimAnsteelTeamTask,
 	claimAnsteelTeamTasks,
 	classifyAnsteelTeamActionRisk,
@@ -26,12 +28,16 @@ import {
 	getAnsteelTeamEventPath,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatePath,
+	getAnsteelTeamMilestoneFinalVerificationReadiness,
 	getAnsteelTeamTaskProgressFingerprint,
+	getAnsteelTeamTaskFinalVerificationReadiness,
 	getAnsteelTeamTransactionPath,
 	getAnsteelTeamWriteBlockReason,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
 	publishAnsteelWorkCheckpoint,
+	publishAnsteelTeamMilestoneCollaboration,
+	publishAnsteelTeamTaskCollaboration,
 	raiseAnsteelProcessIssue,
 	recordAnsteelTeamTaskTestResult,
 	resolveAnsteelProcessIssue,
@@ -216,6 +222,35 @@ function initializeGitProject(cwd: string): void {
 	execFileSync("git", ["commit", "-m", "baseline"], { cwd, stdio: "ignore" });
 }
 
+function beginTaskFinalVerificationForTest(cwd: string, team: ReturnType<typeof createTeam>, taskId: string): void {
+	const task = team.tasks.find((item) => item.id === taskId);
+	if (!task) throw new Error(`Missing task ${taskId}`);
+	for (const collaborator of ["tech-lead", "staff-engineer", "qa-engineer"] as const) {
+		if (collaborator === task.owner) continue;
+		publishAnsteelTeamTaskCollaboration(cwd, team, collaborator, taskId, {
+			summary: `${collaborator} inspected the frozen task evidence before final verification.`,
+			evidenceRefs: [`test:${taskId}:${collaborator}:continuous-collaboration`],
+			uncertainties: [],
+		});
+	}
+	beginAnsteelTeamTaskFinalVerification(cwd, team, taskId);
+}
+
+function beginMilestoneFinalVerificationForTest(
+	cwd: string,
+	team: ReturnType<typeof createTeam>,
+	milestoneId: string,
+): void {
+	for (const collaborator of ["staff-engineer", "qa-engineer"] as const) {
+		publishAnsteelTeamMilestoneCollaboration(cwd, team, collaborator, milestoneId, {
+			summary: `${collaborator} inspected frozen integration evidence before final verification.`,
+			evidenceRefs: [`test:${milestoneId}:${collaborator}:continuous-collaboration`],
+			uncertainties: [],
+		});
+	}
+	beginAnsteelTeamMilestoneFinalVerification(cwd, team, milestoneId);
+}
+
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { force: true, recursive: true });
@@ -257,7 +292,7 @@ describe("public collaboration state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 9,
+			version: 10,
 			actionReviews: [],
 			tasks: [{ id: "TASK-MIGRATE-RISK", type: "implementation", owner: "staff-engineer" }],
 			workCheckpoints: [{ id: checkpoint.id, status: "superseded", governedAction: null }],
@@ -1124,14 +1159,14 @@ describe("public collaboration state", () => {
 		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
 
 		expect(migrated).toMatchObject({
-			version: 9,
+			version: 10,
 			workCheckpoints: [],
 			processIssues: [],
 			actionReviews: [],
 			...preserved,
 		});
 		expect(persisted).toMatchObject({
-			version: 9,
+			version: 10,
 			workCheckpoints: [],
 			processIssues: [],
 			actionReviews: [],
@@ -1144,7 +1179,7 @@ describe("public collaboration state", () => {
 		writePersistedTeamState(cwd, createValidPublicCollaborationState(cwd));
 
 		expect(loadAnsteelTeamState(cwd)).toMatchObject({
-			version: 9,
+			version: 10,
 			workCheckpoints: [{ id: "CP-PARSER-0001" }],
 			processIssues: [{ id: "PI-PARSER-0001" }],
 			actionReviews: [],
@@ -1242,6 +1277,7 @@ describe("public collaboration state", () => {
 					revision: 0,
 					testEvidence: [],
 					submissions: [],
+					collaborationUpdates: [],
 					reviews: [],
 				});
 			},
@@ -1378,7 +1414,7 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 9,
+			version: 10,
 			tasks: [],
 			milestones: [],
 			workCheckpoints: [],
@@ -1420,8 +1456,8 @@ describe("Ansteel team state", () => {
 			previousHash: null,
 			hash: expect.stringMatching(/^[a-f0-9]{64}$/),
 		});
-		expect(migrated).toMatchObject({ version: 9, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
-		expect(persistedState).toMatchObject({ version: 9, ledgerHeadHash: events[0]?.hash });
+		expect(migrated).toMatchObject({ version: 10, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
+		expect(persistedState).toMatchObject({ version: 10, ledgerHeadHash: events[0]?.hash });
 		expect(persistedEvent).toMatchObject({ previousHash: null, hash: events[0]?.hash });
 	});
 
@@ -1436,9 +1472,9 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		const persistedState = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
 
-		expect(migrated).toMatchObject({ version: 9, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
+		expect(migrated).toMatchObject({ version: 10, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
 		expect(persistedState).toMatchObject({
-			version: 9,
+			version: 10,
 			taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"],
 		});
 	});
@@ -2075,6 +2111,7 @@ describe("Ansteel team state", () => {
 			isError: false,
 		});
 		submitAnsteelTeamTask(cwd, team, "staff-engineer", predecessor.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, predecessor.id);
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", predecessor.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", predecessor.id, { verdict: "approve" });
 
@@ -2166,6 +2203,7 @@ describe("Ansteel team state", () => {
 			isError: false,
 		});
 		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, task.id);
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
 
@@ -2186,6 +2224,17 @@ describe("Ansteel team state", () => {
 			"node --test test/integration.test.mjs",
 		);
 		expect(submission.test.output).toMatch(/pass 1/i);
+		expect(() =>
+			reviewAnsteelTeamMilestone(cwd, team, "staff-engineer", milestone.id, { verdict: "approve" }),
+		).toThrow("not in final verification");
+		expect(getAnsteelTeamMilestoneFinalVerificationReadiness(cwd, team, milestone.id)).toMatchObject({
+		ready: false,
+		blockers: expect.arrayContaining([
+			"missing continuous collaboration update from staff-engineer",
+			"missing continuous collaboration update from qa-engineer",
+		]),
+	});
+		beginMilestoneFinalVerificationForTest(cwd, team, milestone.id);
 		reviewAnsteelTeamMilestone(cwd, team, "staff-engineer", milestone.id, { verdict: "approve" });
 		reviewAnsteelTeamMilestone(cwd, team, "qa-engineer", milestone.id, { verdict: "approve" });
 
@@ -2216,6 +2265,182 @@ describe("Ansteel team state", () => {
 		expect(submission.test).toMatchObject({ command: "npm test -- parser", isError: false });
 		expect(task.status).toBe("submitted");
 		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "src/parser.ts")).toContain("code is frozen");
+	});
+
+	it("requires public continuous collaboration before independent final task verification", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-COLLABORATION",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Exercise the collaboration-to-final-verification boundary.",
+			acceptanceCriteria: "The frozen parser test evidence is independently verified.",
+		});
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'collaboration';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS collaboration boundary",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+
+		expect(() => reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" })).toThrow(
+			"not in final verification",
+		);
+		expect(getAnsteelTeamTaskFinalVerificationReadiness(cwd, team, task.id)).toMatchObject({
+			ready: false,
+			blockers: expect.arrayContaining([
+				"missing continuous collaboration update from tech-lead",
+				"missing continuous collaboration update from qa-engineer",
+			]),
+		});
+
+		publishAnsteelTeamTaskCollaboration(cwd, team, "tech-lead", task.id, {
+			summary: "Tech Lead checked the frozen parser boundary against the task contract.",
+			evidenceRefs: ["test:TASK-COLLABORATION:tech-lead"],
+			uncertainties: ["QA still needs an independent counterexample check"],
+		});
+		expect(getAnsteelTeamTaskFinalVerificationReadiness(cwd, team, task.id).ready).toBe(false);
+		publishAnsteelTeamTaskCollaboration(cwd, team, "qa-engineer", task.id, {
+			summary: "QA checked the frozen evidence and found no blocking counterexample.",
+			evidenceRefs: ["test:TASK-COLLABORATION:qa-engineer"],
+			uncertainties: [],
+		});
+		expect(getAnsteelTeamTaskFinalVerificationReadiness(cwd, team, task.id)).toMatchObject({ ready: true });
+
+		beginAnsteelTeamTaskFinalVerification(cwd, team, task.id);
+		expect(task.status).toBe("final-verification");
+		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+		expect(task.status).toBe("approved");
+	});
+
+	it("returns submitted work to the owner when continuous collaboration raises a blocking checkpoint issue", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-BLOCKING-COLLABORATION",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Exercise a structured pre-final blocking issue.",
+			acceptanceCriteria: "The owner must resolve the public concern before final verification.",
+		});
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, team, "staff-engineer", {
+			id: "CP-BLOCKING-COLLABORATION-0001",
+			taskId: task.id,
+			goal: "Publish the parser test boundary before frozen submission.",
+			currentUnderstanding: "The owner has a candidate parser change but peer counterexample coverage is incomplete.",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: ["Whether an empty token bypasses the parser"],
+			nextAction: { kind: "test", target: "test/parser.test.mjs", expectedResult: "The parser regression passes" },
+			risk: "green",
+			confidence: "L2",
+		});
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'blocking';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS before peer challenge",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		raiseAnsteelProcessIssue(cwd, team, "qa-engineer", {
+			id: "PI-BLOCKING-COLLABORATION-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "The frozen package lacks the required empty-token counterexample.",
+			evidenceRefs: ["test:counterexample:empty-token"],
+			suggestedCorrection: "Add the counterexample regression and submit a new immutable package.",
+		});
+
+		expect(task).toMatchObject({ status: "revision-required", testEvidence: [] });
+		expect(() => beginAnsteelTeamTaskFinalVerification(cwd, team, task.id)).toThrow("not submitted");
+	});
+
+	it("migrates a v9 submitted task into legacy final verification without inventing collaboration updates", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-V9-FINAL",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Preserve the old immediate-review interpretation during migration.",
+			acceptanceCriteria: "The historical package stays available for final review.",
+		});
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'legacy-v9';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS legacy package",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		const raw = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
+		raw.version = 9;
+		const rawTask = (raw.tasks as Array<Record<string, unknown>>)[0]!;
+		rawTask.status = "submitted";
+		delete rawTask.collaborationUpdates;
+		writePersistedTeamState(cwd, raw);
+
+		const migrated = loadAnsteelTeamState(cwd);
+		expect(migrated?.tasks).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: task.id, status: "final-verification", collaborationUpdates: [] }),
+			]),
+		);
+	});
+
+	it("migrates a v9 submitted milestone into legacy final verification without inventing collaboration updates", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		mkdirSync(join(cwd, "test"), { recursive: true });
+		writeFileSync(
+			join(cwd, "test", "integration.test.mjs"),
+			"import test from 'node:test';\ntest('integration', () => {});\n",
+			"utf8",
+		);
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-V9-MILESTONE-PREREQUISITE",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Approve the prerequisite before migrating an old milestone.",
+			acceptanceCriteria: "The parser evidence is approved before integration.",
+		});
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'legacy-milestone';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS legacy prerequisite",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, task.id);
+		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+		const milestone = createAnsteelTeamMilestone(cwd, team, {
+			id: "MILESTONE-V9-FINAL",
+			taskIds: [task.id],
+			description: "Preserve the old immediate-review milestone interpretation during migration.",
+			acceptanceCriteria: "The historical integration package remains available for final review.",
+		});
+		runAnsteelTeamMilestoneTest(cwd, team, "tech-lead", milestone.id, "node --test test/integration.test.mjs");
+		submitAnsteelTeamMilestone(cwd, team, "tech-lead", milestone.id, "node --test test/integration.test.mjs");
+		const raw = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
+		raw.version = 9;
+		const rawMilestone = (raw.milestones as Array<Record<string, unknown>>)[0]!;
+		rawMilestone.status = "submitted";
+		delete rawMilestone.collaborationUpdates;
+		writePersistedTeamState(cwd, raw);
+
+		const migrated = loadAnsteelTeamState(cwd);
+		expect(migrated?.milestones).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: milestone.id, status: "final-verification", collaborationUpdates: [] }),
+			]),
+		);
 	});
 
 	it("runs a bounded allowed test command and records its real output", () => {
@@ -2259,6 +2484,7 @@ describe("Ansteel team state", () => {
 			isError: false,
 		});
 		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, task.id);
 
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, {
@@ -2274,6 +2500,7 @@ describe("Ansteel team state", () => {
 			isError: false,
 		});
 		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, task.id);
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
 

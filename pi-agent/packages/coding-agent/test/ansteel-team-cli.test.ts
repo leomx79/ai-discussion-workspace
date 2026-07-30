@@ -105,6 +105,15 @@ export default function (pi) {
 		], { stopReason: "toolUse" }),
 		fauxAssistantMessage("Tech Lead approved the exact Staff edit action."),
 		fauxAssistantMessage([
+			fauxToolCall("ansteel_publish_task_collaboration", {
+				taskId: "TASK-STAFF",
+				summary: "The frozen Staff diff preserves the declared implementation scope.",
+				evidenceRefs: ["file:src/staff.ts", "test:staff.test.mjs"],
+				uncertainties: [],
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Tech Lead published the continuous collaboration update."),
+		fauxAssistantMessage([
 			fauxToolCall("ansteel_review_task", {
 				taskId: "TASK-STAFF",
 				verdict: "approve",
@@ -172,6 +181,15 @@ export default function (pi) {
 			}),
 		], { stopReason: "toolUse" }),
 		fauxAssistantMessage("QA approved the exact Staff edit action."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_publish_task_collaboration", {
+				taskId: "TASK-STAFF",
+				summary: "The frozen Staff evidence is reproducible and ready for final verification.",
+				evidenceRefs: ["test:staff.test.mjs", "git-diff:src/staff.ts"],
+				uncertainties: [],
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("QA published the continuous collaboration update."),
 		fauxAssistantMessage([
 			fauxToolCall("ansteel_review_task", {
 				taskId: "TASK-STAFF",
@@ -1009,6 +1027,9 @@ describe("Ansteel team CLI", () => {
 						targetRole: "staff-engineer",
 					}),
 					expect.objectContaining({ type: "task-submitted", role: "staff-engineer" }),
+					expect.objectContaining({ type: "task-collaboration", role: "tech-lead" }),
+					expect.objectContaining({ type: "task-collaboration", role: "qa-engineer" }),
+					expect.objectContaining({ type: "task-final-verification-requested", role: "coordinator" }),
 					expect.objectContaining({ type: "task-review", role: "tech-lead" }),
 					expect.objectContaining({ type: "task-review", role: "qa-engineer" }),
 				]),
@@ -1044,9 +1065,17 @@ describe("Ansteel team CLI", () => {
 				(event) => event.type === "action-review" && event.checkpointId === "CP-TASK-STAFF-EDIT-0001",
 			);
 			const submissionIndex = events.findIndex((event) => event.type === "task-submitted");
+			const finalVerificationIndex = events.findIndex((event) => event.type === "task-final-verification-requested");
+			const firstTaskReviewIndex = events.findIndex((event) => event.type === "task-review");
+			const collaborationIndexes = events
+				.map((event, index) => (event.type === "task-collaboration" ? index : -1))
+				.filter((index) => index >= 0);
 			expect(assessedIndex).toBeGreaterThanOrEqual(0);
 			expect(assessedIndex).toBeGreaterThan(reviewIndex);
 			expect(submissionIndex).toBeGreaterThan(assessedIndex);
+			expect(collaborationIndexes).toHaveLength(2);
+			expect(finalVerificationIndex).toBeGreaterThan(Math.max(...collaborationIndexes));
+			expect(firstTaskReviewIndex).toBeGreaterThan(finalVerificationIndex);
 			expect(readFileSync(join(projectDir, "src", "staff.ts"), "utf8")).toContain("implemented");
 			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).toContain(
 				"read-only tool budget exhausted after 4 calls",

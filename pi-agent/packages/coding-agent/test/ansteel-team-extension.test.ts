@@ -107,11 +107,46 @@ function setup(
 				dispose: vi.fn(),
 				prompt: vi.fn(async (prompt: string) => {
 					prompts.push(prompt);
-					if (rolePrompt) return await rolePrompt(role, prompt);
-					if (prompt.startsWith("You are the independent ")) {
+					let response = `## Public Update\n\n${role} completed its investigation.`;
+					if (rolePrompt) {
+						response = await rolePrompt(role, prompt);
+					} else if (prompt.startsWith("You are the independent ")) {
 						await options.taskOperations.reviewTask("TASK-1", { verdict: "approve" });
 					}
-					return `## Public Update\n\n${role} completed its investigation.`;
+					if (prompt.includes("continuous collaborator for")) {
+						const taskMatch = /for (TASK-[A-Z0-9-]+) revision/.exec(prompt);
+						const milestoneMatch = /for (MILESTONE-[A-Z0-9-]+) integration revision/.exec(prompt);
+						if (taskMatch) {
+							const task = options.taskOperations.state.tasks.find((item) => item.id === taskMatch[1]);
+							if (
+								task?.status === "submitted" &&
+								!task.collaborationUpdates.some(
+									(update) => update.revision === task.revision && update.collaborator === role,
+								)
+							) {
+								await options.taskOperations.publishTaskCollaboration(task.id, {
+									summary: `${role} recorded the default continuous collaboration update.`,
+									evidenceRefs: [`test:${task.id}:${role}:continuous-collaboration`],
+									uncertainties: [],
+								});
+							}
+						} else if (milestoneMatch) {
+							const milestone = options.taskOperations.state.milestones.find((item) => item.id === milestoneMatch[1]);
+							if (
+								milestone?.status === "submitted" &&
+								!milestone.collaborationUpdates.some(
+									(update) => update.revision === milestone.revision && update.collaborator === role,
+								)
+							) {
+								await options.taskOperations.publishMilestoneCollaboration(milestone.id, {
+									summary: `${role} recorded the default integration collaboration update.`,
+									evidenceRefs: [`test:${milestone.id}:${role}:continuous-collaboration`],
+									uncertainties: [],
+								});
+							}
+						}
+					}
+					return response;
 				}),
 				abort: vi.fn(),
 			};
@@ -1201,7 +1236,7 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
-	it("submits one immutable evidence package to both non-owner reviewers", async () => {
+	it("requires two public collaboration updates before final independent task verification", async () => {
 		const { commands, ctx, prompts, roleSessionOptions } = setup();
 		initializeGitProject(ctx.cwd);
 		const command = commands.get("ansteel-team");
@@ -1220,8 +1255,19 @@ describe("Ansteel team extension", () => {
 
 		await staff.taskOperations.submitTask("TASK-1", "node --test test/parser.test.mjs");
 
-		expect(prompts).toHaveLength(8);
+		expect(prompts).toHaveLength(10);
+		expect(prompts.filter((prompt) => prompt.includes("continuous collaborator for TASK-1 revision"))).toHaveLength(2);
 		expect(prompts.filter((prompt) => prompt.startsWith("You are the independent "))).toHaveLength(2);
+		const taskEventTypes = listAnsteelTeamEvents(ctx.cwd)
+			.filter((event) => ["task-collaboration", "task-final-verification-requested", "task-review"].includes(event.type))
+			.map((event) => event.type);
+		expect(taskEventTypes).toEqual([
+			"task-collaboration",
+			"task-collaboration",
+			"task-final-verification-requested",
+			"task-review",
+			"task-review",
+		]);
 		expect(staff.taskOperations.state.tasks[0]).toMatchObject({ status: "approved", revision: 1 });
 	});
 
@@ -1778,7 +1824,7 @@ describe("Ansteel team extension", () => {
 			expect.arrayContaining([
 				expect.objectContaining({
 					id: "MILESTONE-OLD",
-					status: "submitted",
+					status: "final-verification",
 					reviews: [expect.objectContaining({ reviewer: "staff-engineer", verdict: "approve" })],
 				}),
 			]),
@@ -1905,7 +1951,7 @@ describe("Ansteel team extension", () => {
 		expect(finishedOwners).toBe(3);
 		expect(prematureReviewPrompts).toBe(0);
 		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual(
-			expect.arrayContaining([expect.objectContaining({ id: "TASK-IMPLEMENTATION", status: "submitted" })]),
+			expect.arrayContaining([expect.objectContaining({ id: "TASK-IMPLEMENTATION", status: "final-verification" })]),
 		);
 	});
 

@@ -23,7 +23,7 @@ import {
 	redactAnsteelSensitiveValue,
 } from "./ansteel-team-observability.ts";
 
-const ANSTEEL_TEAM_STATE_VERSION = 9;
+const ANSTEEL_TEAM_STATE_VERSION = 10;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
 const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
@@ -63,9 +63,14 @@ export type AnsteelTeamEventType =
 	| "tasks-assigned"
 	| "task-claimed"
 	| "task-submitted"
+	| "task-collaboration"
+	| "task-collaboration-returned"
+	| "task-final-verification-requested"
 	| "task-review"
 	| "milestone-planned"
 	| "milestone-submitted"
+	| "milestone-collaboration"
+	| "milestone-final-verification-requested"
 	| "milestone-review"
 	| "work-checkpoint"
 	| "process-issue"
@@ -238,10 +243,11 @@ export interface AnsteelTeamTask {
 	/** Immutable task IDs that must be approved before this task can be changed. */
 	dependsOn: string[];
 	/** `blocked` is coordinator-derived from `dependsOn`; roles cannot choose it. */
-	status: "blocked" | "claimed" | "submitted" | "revision-required" | "approved";
+	status: "blocked" | "claimed" | "submitted" | "final-verification" | "revision-required" | "approved";
 	revision: number;
 	testEvidence: AnsteelTeamTaskTestEvidence[];
 	submissions: AnsteelTeamTaskSubmission[];
+	collaborationUpdates: AnsteelTeamCollaborationUpdate[];
 	reviews: AnsteelTeamTaskReview[];
 }
 
@@ -267,15 +273,35 @@ export interface AnsteelTeamTaskReview {
 	reviewedAt: string;
 }
 
+/**
+ * Public, revision-bound collaboration material. It is deliberately not an
+ * approval: both non-owners must publish one update before the coordinator can
+ * begin the separate final-verification stage.
+ */
+export interface AnsteelTeamCollaborationUpdate {
+	revision: number;
+	collaborator: AnsteelRole;
+	summary: string;
+	evidenceRefs: string[];
+	uncertainties: string[];
+	publishedAt: string;
+}
+
+export type PublishAnsteelTeamCollaborationInput = Omit<
+	AnsteelTeamCollaborationUpdate,
+	"revision" | "collaborator" | "publishedAt"
+>;
+
 export interface AnsteelTeamMilestone {
 	id: string;
 	taskIds: string[];
 	description: string;
 	acceptanceCriteria: string;
-	status: "blocked" | "ready" | "submitted" | "revision-required" | "approved";
+	status: "blocked" | "ready" | "submitted" | "final-verification" | "revision-required" | "approved";
 	revision: number;
 	testEvidence: AnsteelTeamTaskTestEvidence[];
 	submissions: AnsteelTeamMilestoneSubmission[];
+	collaborationUpdates: AnsteelTeamCollaborationUpdate[];
 	reviews: AnsteelTeamMilestoneReview[];
 }
 
@@ -577,6 +603,51 @@ function normalizeTaskAssignment(
 	};
 }
 
+function assertAnsteelTeamCollaborationUpdates(
+	value: unknown,
+	target: string,
+	owner: AnsteelRole,
+	currentRevision: number,
+	submissionRevisions: ReadonlySet<number>,
+): asserts value is AnsteelTeamCollaborationUpdate[] {
+	if (!Array.isArray(value)) {
+		throw new AnsteelTeamStateError(`Ansteel team ${target} has invalid collaboration updates`);
+	}
+	const seenCollaborators = new Set<string>();
+	for (const rawUpdate of value) {
+		if (!isRecord(rawUpdate)) {
+			throw new AnsteelTeamStateError(`Ansteel team ${target} has invalid collaboration updates`);
+		}
+		const update = rawUpdate as unknown as AnsteelTeamCollaborationUpdate;
+		if (!Number.isSafeInteger(update.revision) || update.revision < 1) {
+			throw new AnsteelTeamStateError(`Ansteel team ${target} has invalid collaboration updates`);
+		}
+		if (update.revision > currentRevision || !submissionRevisions.has(update.revision)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team ${target} collaboration update references an unknown revision ${update.revision}`,
+			);
+		}
+		assertRole(update.collaborator, `${target} collaboration collaborator`);
+		if (update.collaborator === owner) {
+			throw new AnsteelTeamStateError(`Ansteel team ${target} owner cannot publish a peer collaboration update`);
+		}
+		const key = `${update.revision}\0${update.collaborator}`;
+		if (seenCollaborators.has(key)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team ${target} already has a ${update.collaborator} collaboration update for revision ${update.revision}`,
+			);
+		}
+		seenCollaborators.add(key);
+		assertNonEmptyStateString(update.summary, `${target} collaboration summary`);
+		assertStateStringArray(update.evidenceRefs, `${target} collaboration evidence references`);
+		if (update.evidenceRefs.length === 0) {
+			throw new AnsteelTeamStateError(`Ansteel team ${target} collaboration update requires evidence references`);
+		}
+		assertStateStringArray(update.uncertainties, `${target} collaboration uncertainties`);
+		assertStateTimestamp(update.publishedAt, `${target} collaboration publication time`);
+	}
+}
+
 function assertState(state: AnsteelTeamState): void {
 	if (state.version !== ANSTEEL_TEAM_STATE_VERSION) {
 		throw new AnsteelTeamStateError(`Unsupported Ansteel team state version: ${state.version}`);
@@ -649,6 +720,7 @@ function assertState(state: AnsteelTeamState): void {
 			task.status !== "blocked" &&
 			task.status !== "claimed" &&
 			task.status !== "submitted" &&
+			task.status !== "final-verification" &&
 			task.status !== "revision-required" &&
 			task.status !== "approved"
 		) {
@@ -683,6 +755,13 @@ function assertState(state: AnsteelTeamState): void {
 				throw new AnsteelTeamStateError(`Ansteel team task ${task.id} has invalid submissions`);
 			}
 		}
+		assertAnsteelTeamCollaborationUpdates(
+			task.collaborationUpdates,
+			`task ${task.id}`,
+			task.owner,
+			task.revision,
+			new Set(task.submissions.map((submission) => submission.revision)),
+		);
 		if (!Array.isArray(task.reviews)) {
 			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} has invalid reviews`);
 		}
@@ -819,6 +898,7 @@ function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], mileston
 		if (
 			!Array.isArray(milestone.testEvidence) ||
 			!Array.isArray(milestone.submissions) ||
+			!Array.isArray(milestone.collaborationUpdates) ||
 			!Array.isArray(milestone.reviews)
 		) {
 			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} has invalid evidence`);
@@ -827,11 +907,19 @@ function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], mileston
 			milestone.status !== "blocked" &&
 			milestone.status !== "ready" &&
 			milestone.status !== "submitted" &&
+			milestone.status !== "final-verification" &&
 			milestone.status !== "revision-required" &&
 			milestone.status !== "approved"
 		) {
 			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} has an invalid status`);
 		}
+		assertAnsteelTeamCollaborationUpdates(
+			milestone.collaborationUpdates,
+			`milestone ${milestone.id}`,
+			"tech-lead",
+			revision,
+			new Set<number>((milestone.submissions as Array<{ revision: number }>).map((submission) => submission.revision)),
+		);
 		const tasksApproved = milestone.taskIds.every((taskId) => tasksById.get(taskId)?.status === "approved");
 		if (!tasksApproved && milestone.status !== "blocked") {
 			throw new AnsteelTeamStateError(
@@ -1792,6 +1880,7 @@ function claimAnsteelTeamTaskInState(
 		revision: 0,
 		testEvidence: [],
 		submissions: [],
+		collaborationUpdates: [],
 		reviews: [],
 	};
 	state.tasks.push(task);
@@ -1939,6 +2028,7 @@ export function createAnsteelTeamMilestone(
 		revision: 0,
 		testEvidence: [],
 		submissions: [],
+		collaborationUpdates: [],
 		reviews: [],
 	};
 	state.milestones.push(milestone);
@@ -2030,6 +2120,148 @@ export function submitAnsteelTeamMilestone(
 	return submission;
 }
 
+export interface AnsteelTeamFinalVerificationReadiness {
+	ready: boolean;
+	blockers: string[];
+}
+
+const ANSTEEL_MILESTONE_COLLABORATORS = ["staff-engineer", "qa-engineer"] as const satisfies readonly AnsteelRole[];
+
+function createAnsteelTeamCollaborationUpdate(
+	revision: number,
+	collaborator: AnsteelRole,
+	input: PublishAnsteelTeamCollaborationInput,
+): AnsteelTeamCollaborationUpdate {
+	if (!Number.isSafeInteger(revision) || revision < 1) {
+		throw new AnsteelTeamStateError("Ansteel team collaboration updates require a submitted revision");
+	}
+	assertRole(collaborator, "collaboration collaborator");
+	assertPublicContent(input.summary);
+	assertStateStringArray(input.evidenceRefs, "collaboration evidence references");
+	if (input.evidenceRefs.length === 0) {
+		throw new AnsteelTeamStateError("Ansteel team collaboration updates require evidence references");
+	}
+	assertStateStringArray(input.uncertainties, "collaboration uncertainties");
+	return {
+		revision,
+		collaborator,
+		summary: input.summary.trim(),
+		evidenceRefs: input.evidenceRefs.map((reference) => reference.trim()),
+		uncertainties: input.uncertainties.map((uncertainty) => uncertainty.trim()),
+		publishedAt: new Date().toISOString(),
+	};
+}
+
+function getOpenBlockingProcessIssuesForTasks(
+	state: AnsteelTeamState,
+	taskIds: ReadonlySet<string>,
+): AnsteelProcessIssue[] {
+	const checkpointIds = new Set(
+		state.workCheckpoints.filter((checkpoint) => checkpoint.taskId !== undefined && taskIds.has(checkpoint.taskId)).map(
+			(checkpoint) => checkpoint.id,
+		),
+	);
+	return state.processIssues.filter(
+		(issue) =>
+			checkpointIds.has(issue.targetCheckpointId) &&
+			issue.status !== "closed" &&
+			(issue.severity === "blocking" || issue.severity === "critical"),
+	);
+}
+
+export function publishAnsteelTeamMilestoneCollaboration(
+	cwd: string,
+	state: AnsteelTeamState,
+	collaborator: AnsteelRole,
+	milestoneId: string,
+	input: PublishAnsteelTeamCollaborationInput,
+): AnsteelTeamCollaborationUpdate {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertRole(collaborator, "milestone collaborator");
+	if (!ANSTEEL_MILESTONE_COLLABORATORS.includes(collaborator as (typeof ANSTEEL_MILESTONE_COLLABORATORS)[number])) {
+		throw new AnsteelTeamStateError("Only Staff Engineer or QA Engineer can publish milestone collaboration updates");
+	}
+	assertMilestoneId(milestoneId);
+	const milestone = state.milestones.find((item) => item.id === milestoneId);
+	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
+	if (milestone.status !== "submitted") {
+		throw new AnsteelTeamStateError(
+			`Ansteel team milestone ${milestoneId} is ${milestone.status}; it is not accepting continuous collaboration updates`,
+		);
+	}
+	if (!milestone.submissions.some((submission) => submission.revision === milestone.revision)) {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} has no immutable integration evidence package`);
+	}
+	if (
+		milestone.collaborationUpdates.some(
+			(update) => update.revision === milestone.revision && update.collaborator === collaborator,
+		)
+	) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team milestone ${milestoneId} already has a ${collaborator} collaboration update for revision ${milestone.revision}`,
+		);
+	}
+	const update = createAnsteelTeamCollaborationUpdate(milestone.revision, collaborator, input);
+	milestone.collaborationUpdates.push(update);
+	saveAnsteelTeamState(projectDirectory, state);
+	return update;
+}
+
+export function getAnsteelTeamMilestoneFinalVerificationReadiness(
+	cwd: string,
+	state: AnsteelTeamState,
+	milestoneId: string,
+): AnsteelTeamFinalVerificationReadiness {
+	assertProjectDirectory(cwd);
+	assertState(state);
+	assertMilestoneId(milestoneId);
+	const milestone = state.milestones.find((item) => item.id === milestoneId);
+	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
+	const blockers: string[] = [];
+	if (milestone.status !== "submitted") {
+		blockers.push(`milestone status is ${milestone.status}, not submitted`);
+	}
+	const submission = milestone.submissions.at(-1);
+	if (!submission || submission.revision !== milestone.revision) {
+		blockers.push("latest immutable integration evidence is missing");
+	} else if (submission.test.isError) {
+		blockers.push("latest immutable integration test did not succeed");
+	}
+	for (const collaborator of ANSTEEL_MILESTONE_COLLABORATORS) {
+		if (
+			!milestone.collaborationUpdates.some(
+				(update) => update.revision === milestone.revision && update.collaborator === collaborator,
+			)
+		) {
+			blockers.push(`missing continuous collaboration update from ${collaborator}`);
+		}
+	}
+	for (const issue of getOpenBlockingProcessIssuesForTasks(state, new Set(milestone.taskIds))) {
+		blockers.push(`open ${issue.severity} process issue ${issue.id}`);
+	}
+	return { ready: blockers.length === 0, blockers };
+}
+
+export function beginAnsteelTeamMilestoneFinalVerification(
+	cwd: string,
+	state: AnsteelTeamState,
+	milestoneId: string,
+): AnsteelTeamMilestoneSubmission {
+	const projectDirectory = assertProjectDirectory(cwd);
+	const readiness = getAnsteelTeamMilestoneFinalVerificationReadiness(projectDirectory, state, milestoneId);
+	if (!readiness.ready) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team milestone ${milestoneId} cannot begin final verification: ${readiness.blockers.join("; ")}`,
+		);
+	}
+	const milestone = state.milestones.find((item) => item.id === milestoneId)!;
+	const submission = milestone.submissions.at(-1)!;
+	milestone.status = "final-verification";
+	saveAnsteelTeamState(projectDirectory, state);
+	return submission;
+}
+
 export function reviewAnsteelTeamMilestone(
 	cwd: string,
 	state: AnsteelTeamState,
@@ -2045,9 +2277,9 @@ export function reviewAnsteelTeamMilestone(
 	assertMilestoneId(milestoneId);
 	const milestone = state.milestones.find((item) => item.id === milestoneId);
 	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
-	if (milestone.status !== "submitted" && milestone.status !== "revision-required") {
+	if (milestone.status !== "final-verification") {
 		throw new AnsteelTeamStateError(
-			`Ansteel team milestone ${milestoneId} has no submitted integration evidence to review`,
+			`Ansteel team milestone ${milestoneId} is not in final verification`,
 		);
 	}
 	if (input.verdict !== "approve" && input.verdict !== "reject") {
@@ -2216,6 +2448,132 @@ function captureTaskDiff(cwd: string, task: AnsteelTeamTask): string {
 	return diff;
 }
 
+function getTaskCollaborationRoles(task: AnsteelTeamTask): AnsteelRole[] {
+	return ANSTEEL_ROLES.filter((role) => role !== task.owner);
+}
+
+export function publishAnsteelTeamTaskCollaboration(
+	cwd: string,
+	state: AnsteelTeamState,
+	collaborator: AnsteelRole,
+	taskId: string,
+	input: PublishAnsteelTeamCollaborationInput,
+): AnsteelTeamCollaborationUpdate {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertRole(collaborator, "task collaborator");
+	assertTaskId(taskId);
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+	if (task.status !== "submitted") {
+		throw new AnsteelTeamStateError(
+			`Ansteel team task ${taskId} is ${task.status}; it is not accepting continuous collaboration updates`,
+		);
+	}
+	if (!getTaskCollaborationRoles(task).includes(collaborator)) {
+		throw new AnsteelTeamStateError(`Ansteel team task ${taskId} owner cannot publish a peer collaboration update`);
+	}
+	if (!task.submissions.some((submission) => submission.revision === task.revision)) {
+		throw new AnsteelTeamStateError(`Ansteel team task ${taskId} has no immutable evidence package`);
+	}
+	if (
+		task.collaborationUpdates.some(
+			(update) => update.revision === task.revision && update.collaborator === collaborator,
+		)
+	) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team task ${taskId} already has a ${collaborator} collaboration update for revision ${task.revision}`,
+		);
+	}
+	const update = createAnsteelTeamCollaborationUpdate(task.revision, collaborator, input);
+	task.collaborationUpdates.push(update);
+	saveAnsteelTeamState(projectDirectory, state);
+	return update;
+}
+
+export function getAnsteelTeamTaskFinalVerificationReadiness(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+): AnsteelTeamFinalVerificationReadiness {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertTaskId(taskId);
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+	const blockers: string[] = [];
+	if (task.status !== "submitted") {
+		blockers.push(`task status is ${task.status}, not submitted`);
+	}
+	const submission = task.submissions.at(-1);
+	if (!submission || submission.revision !== task.revision) {
+		blockers.push("latest immutable evidence package is missing");
+	} else {
+		if (submission.test.isError) blockers.push("latest immutable task test did not succeed");
+		if (collectTaskDiff(projectDirectory, task) !== submission.diff) {
+			blockers.push("current claimed-file diff differs from the immutable evidence package");
+		}
+	}
+	for (const collaborator of getTaskCollaborationRoles(task)) {
+		if (
+			!task.collaborationUpdates.some(
+				(update) => update.revision === task.revision && update.collaborator === collaborator,
+			)
+		) {
+			blockers.push(`missing continuous collaboration update from ${collaborator}`);
+		}
+	}
+	for (const issue of getOpenBlockingProcessIssuesForTasks(state, new Set([task.id]))) {
+		blockers.push(`open ${issue.severity} process issue ${issue.id}`);
+	}
+	return { ready: blockers.length === 0, blockers };
+}
+
+export function returnAnsteelTeamTaskForCollaboration(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+	reason: string,
+): AnsteelTeamTask {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertTaskId(taskId);
+	if (typeof reason !== "string" || reason.trim().length === 0) {
+		throw new AnsteelTeamStateError("Ansteel team task collaboration return requires a reason");
+	}
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+	if (task.status !== "submitted") {
+		throw new AnsteelTeamStateError(
+			`Ansteel team task ${taskId} is ${task.status}; it cannot be returned for collaboration`,
+		);
+	}
+	task.status = "revision-required";
+	task.testEvidence = [];
+	reconcileAnsteelTeamTaskDependencies(state);
+	saveAnsteelTeamState(projectDirectory, state);
+	return task;
+}
+
+export function beginAnsteelTeamTaskFinalVerification(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+): AnsteelTeamTaskSubmission {
+	const projectDirectory = assertProjectDirectory(cwd);
+	const readiness = getAnsteelTeamTaskFinalVerificationReadiness(projectDirectory, state, taskId);
+	if (!readiness.ready) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team task ${taskId} cannot begin final verification: ${readiness.blockers.join("; ")}`,
+		);
+	}
+	const task = state.tasks.find((item) => item.id === taskId)!;
+	const submission = task.submissions.at(-1)!;
+	task.status = "final-verification";
+	saveAnsteelTeamState(projectDirectory, state);
+	return submission;
+}
+
 export function getAnsteelTeamTaskProgressFingerprint(cwd: string, state: AnsteelTeamState, taskId: string): string {
 	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
@@ -2230,6 +2588,7 @@ export function getAnsteelTeamTaskProgressFingerprint(cwd: string, state: Anstee
 				revision: task.revision,
 				testEvidence: task.testEvidence.length,
 				submissions: task.submissions.length,
+				collaborationUpdates: task.collaborationUpdates.length,
 				reviews: task.reviews.length,
 				diffHash,
 			}),
@@ -2288,8 +2647,8 @@ export function reviewAnsteelTeamTask(
 	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
 	if (task.owner === reviewer)
 		throw new AnsteelTeamStateError(`Ansteel team task ${taskId} owner cannot review its own change`);
-	if (task.status !== "submitted" && task.status !== "revision-required") {
-		throw new AnsteelTeamStateError(`Ansteel team task ${taskId} has no submitted change to review`);
+	if (task.status !== "final-verification") {
+		throw new AnsteelTeamStateError(`Ansteel team task ${taskId} is not in final verification`);
 	}
 	if (input.verdict !== "approve" && input.verdict !== "reject") {
 		throw new AnsteelTeamStateError("Ansteel team task review requires approve or reject");
@@ -2497,7 +2856,7 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 	if (state.version === 8) {
 		state = {
 			...state,
-			version: ANSTEEL_TEAM_STATE_VERSION,
+			version: 9,
 			tasks: Array.isArray(state.tasks)
 				? state.tasks.map((task) =>
 						isRecord(task) && typeof task.owner === "string" && ANSTEEL_ROLES.includes(task.owner as AnsteelRole)
@@ -2505,6 +2864,37 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 							: task,
 					)
 				: state.tasks,
+		};
+	}
+	if (state.version === 9) {
+		state = {
+			...state,
+			version: ANSTEEL_TEAM_STATE_VERSION,
+			tasks: Array.isArray(state.tasks)
+				? state.tasks.map((task) =>
+						isRecord(task)
+							? {
+									...task,
+									// v9 submitted work entered immediate peer review. Preserve that
+									// legacy interpretation instead of falsely claiming new
+									// continuous-collaboration evidence exists.
+									status: task.status === "submitted" ? "final-verification" : task.status,
+									collaborationUpdates: [],
+								}
+							: task,
+					)
+				: state.tasks,
+			milestones: Array.isArray(state.milestones)
+				? state.milestones.map((milestone) =>
+						isRecord(milestone)
+							? {
+									...milestone,
+									status: milestone.status === "submitted" ? "final-verification" : milestone.status,
+									collaborationUpdates: [],
+								}
+							: milestone,
+					)
+				: state.milestones,
 		};
 	}
 	return state;
@@ -2736,9 +3126,14 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "tasks-assigned" &&
 		event.type !== "task-claimed" &&
 		event.type !== "task-submitted" &&
+		event.type !== "task-collaboration" &&
+		event.type !== "task-collaboration-returned" &&
+		event.type !== "task-final-verification-requested" &&
 		event.type !== "task-review" &&
 		event.type !== "milestone-planned" &&
 		event.type !== "milestone-submitted" &&
+		event.type !== "milestone-collaboration" &&
+		event.type !== "milestone-final-verification-requested" &&
 		event.type !== "milestone-review" &&
 		event.type !== "work-checkpoint" &&
 		event.type !== "process-issue" &&
@@ -2755,9 +3150,16 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 	}
 	const isPublicCollaborationEvent = isAnsteelPublicCollaborationEventType(event.type);
 	if (event.role === "coordinator") {
-		if (event.type !== "task-assigned" && event.type !== "tasks-assigned" && event.type !== "runtime-recovery") {
+		if (
+			event.type !== "task-assigned" &&
+			event.type !== "tasks-assigned" &&
+			event.type !== "task-collaboration-returned" &&
+			event.type !== "task-final-verification-requested" &&
+			event.type !== "milestone-final-verification-requested" &&
+			event.type !== "runtime-recovery"
+		) {
 			throw new AnsteelTeamStateError(
-				"Ansteel team coordinator can only record task-assigned, tasks-assigned, or runtime-recovery events",
+				"Ansteel team coordinator can only record task assignment, final-verification, collaboration-return, or runtime-recovery events",
 			);
 		}
 	} else {
@@ -3214,6 +3616,25 @@ export function raiseAnsteelProcessIssue(
 		resolutions: [],
 		createdAt: new Date().toISOString(),
 	};
+	const targetTask = checkpoint.taskId === undefined ? undefined : state.tasks.find((task) => task.id === checkpoint.taskId);
+	if (
+		targetTask?.status === "final-verification" &&
+		(issue.severity === "blocking" || issue.severity === "critical")
+	) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team task ${targetTask.id} is in final verification; use ansteel_review_task to reject its immutable evidence package`,
+		);
+	}
+	if (
+		targetTask?.status === "submitted" &&
+		(issue.severity === "blocking" || issue.severity === "critical")
+	) {
+		// A structured blocking challenge is continuous collaboration, not a final
+		// review. It revokes the frozen work package before final verification.
+		targetTask.status = "revision-required";
+		targetTask.testEvidence = [];
+		reconcileAnsteelTeamTaskDependencies(state);
+	}
 	appendAnsteelTeamEvent(
 		cwd,
 		state,

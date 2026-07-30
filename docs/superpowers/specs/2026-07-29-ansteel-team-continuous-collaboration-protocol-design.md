@@ -1,6 +1,6 @@
 # 鞍钢宪法式三 AI 持续协作协议设计
 
-> 状态：待用户审核
+> 状态：第 8 步本地机械验收完成，待远端 GitHub Actions
 > 日期：2026-07-29
 > 适用主线：`pi-agent` 的 `/ansteel-team`
 > 核心决策：固定专业分工、对等质疑权、持续公开协作、风险分级阻断、哈希链审计、末端独立验收
@@ -35,7 +35,8 @@ Tech Lead、Staff Engineer 和 QA Engineer 保留固定的专业身份，但不�
 ```text
 owner 完成修改
   -> 提交测试与冻结 diff
-  -> 两名非 owner 分别审查证据包
+  -> 两名非 owner 分别发布公开协作更新
+  -> 协调器复核门禁后进入最终独立验证
   -> 批准或退回
 ```
 
@@ -923,7 +924,7 @@ unclassified-runtime-error
 | 5 | 把角色工具调用结果自动连接到公共事件、运行 span 和关联检查点。 | 已实现 | 提交 `5f2059f` 把真实 `beforeToolCall` 评估、`action-assessed` 公共事件、运行 span、精确检查点绑定和动作结果接入扩展；扩展 harness 与 CLI/RPC 确定性回归验证执行前顺序。当前证据使用确定性 provider，不是外部真实 provider 探针。 |
 | 6 | 引入绿色、黄色、红色风险分类和对应阻断规则。 | 已实现并完成远端验收 | 提交 `c09bca6`、`3e3a618`、`5f2059f` 分别建立机械分类、双同伴精确绑定确认和真实工具执行前门禁；提交 `d86ebc58f218f9ca82021f8e58070d3f106796b5` 完成可信根终态、文件原子身份与统一脱敏整改。最终规格与代码质量复审均批准；七文件串行回归为 `241 passed / 1 skipped`，构建与静态检查通过；对应 GitHub Actions `Ansteel governance gate` 运行 `30548808891` 结论为 `success`。动作门禁仍不证明最终交付正确。 |
 | 7 | 允许 TL、Staff、QA 分别拥有不同类型任务和不重叠文件。 | 已实现并通过本地机械验收，远端以对应提交 CI 为准 | 状态版本升级到 v9，任务持久化 `architecture`、`integration`、`implementation`、`verification` 类型；非默认角色必须公开 `assignmentReason`。协调器以单个 `tasks-assigned` 事件和 pending transaction 原子提交 2 至 3 个不同 owner、文件不重叠的任务；三个持久会话在 owner wave 中真实并行，所有 owner settle 后才依次进入每任务双独立复审。旧任务或里程碑按不可变 revision 进入全局跨角色复审队列，失败项保留并可从持久状态重建，只重试缺失 reviewer。当前七文件串行回归为 `248 passed / 1 skipped`，构建与静态检查通过；这些确定性证据不等于真实三提供商探针。 |
-| 8 | 把现有双评审改为持续协作后的最终独立验证，而不是主要协作机制。 | 未完成 | 当前任务/里程碑双独立评审仍是保留的末端门禁，风险动作的双确认已实现；尚未完成把主要协作机制全面迁移为持续协作、再以最终双独立验收收口的协议阶段。 |
+| 8 | 把现有双评审改为持续协作后的最终独立验证，而不是主要协作机制。 | 已实现，本地机械验收完成，待远端 Actions | 状态升级到 v10：任务和里程碑在 `submitted` 阶段先要求两名非 owner 的、带证据且按 revision 去重的公开协作更新；协调器检查冻结任务 diff、成功测试、未关闭 blocking/critical 问题后才转入 `final-verification`，再发起原有双独立 `approve/reject`。任务漂移或提交阶段的 blocking/critical 过程问题会退回 owner；旧 v9 `submitted` 迁移为遗留 `final-verification` 且不伪造协作历史。扩展、CLI/RPC、并行延迟队列与重启重建均按协作和最终验证两阶段处理。当前本地七文件串行回归为 `252 passed / 1 skipped`，`npm run build` 通过；这些仍是确定性证据，不等于真实三提供商探针。 |
 | 9 | 接入 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 三轴状态。 | 未完成 | 当前状态与报告不能替代三轴；不得从任务批准、动作确认或治理通过推导协作完成或交付通过。 |
 | 10 | 最后启用角色签名、日志段完整性校验和里程碑 Merkle Root 外部锚定。 | 未完成 | 本地事件/日志哈希链和索引校验已经实现，但角色签名、里程碑 Merkle Root 和外部锚定均未实现，不能用现有哈希链宣称本步骤完成。 |
 
