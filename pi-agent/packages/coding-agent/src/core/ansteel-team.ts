@@ -31,6 +31,36 @@ const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
 
 export type AnsteelTeamStatus = "active" | "stopped";
 
+export type AnsteelCollaborationStatus =
+	| "orienting"
+	| "active"
+	| "disputed"
+	| "resolving"
+	| "ready-for-verification"
+	| "collaboration-complete"
+	| "blocked";
+export type AnsteelGovernanceStatus = "not-required" | "pending" | "approved" | "rejected";
+export type AnsteelDeliveryStatus = "not-started" | "verifying" | "passed" | "failed";
+export type AnsteelWorkflowStatus = "in-progress" | "blocked" | "completed";
+
+/**
+ * Read-only, mechanically derived status axes. They deliberately remain
+ * separate from task approval: the current model has no trusted delivery
+ * evidence record, so it cannot derive delivery success from governance facts.
+ */
+export interface AnsteelTeamStatusAxes {
+	collaborationStatus: AnsteelCollaborationStatus;
+	governanceStatus: AnsteelGovernanceStatus;
+	deliveryStatus: AnsteelDeliveryStatus;
+	workflowStatus: AnsteelWorkflowStatus;
+	reasons: {
+		collaboration: string[];
+		governance: string[];
+		delivery: string[];
+		workflow: string[];
+	};
+}
+
 /**
  * Coordinator-assigned task categories make the intended division of labor
  * durable instead of relying on a role prompt or a human-readable description.
@@ -376,6 +406,7 @@ export interface AnsteelTeamSharedBoard {
 	teamId: string;
 	currentGoal: string;
 	teamStatus: AnsteelTeamStatus;
+	axes: AnsteelTeamStatusAxes;
 	roles: Record<
 		AnsteelRole,
 		{
@@ -3796,6 +3827,246 @@ function throwAnsteelStateProjectionMismatch(detail: string): never {
 	throw new AnsteelTeamStateError(`state-projection-mismatch: ${detail}`);
 }
 
+function hasCompletedTaskCollaboration(task: AnsteelTeamTask): boolean {
+	if (task.revision < 1 || !task.submissions.some((submission) => submission.revision === task.revision)) return false;
+	return ANSTEEL_ROLES.filter((role) => role !== task.owner).every((collaborator) =>
+		task.collaborationUpdates.some(
+			(update) => update.revision === task.revision && update.collaborator === collaborator,
+		),
+	);
+}
+
+function hasCompletedMilestoneCollaboration(milestone: AnsteelTeamMilestone): boolean {
+	if (milestone.revision < 1 || !milestone.submissions.some((submission) => submission.revision === milestone.revision)) {
+		return false;
+	}
+	return (["staff-engineer", "qa-engineer"] as const).every((collaborator) =>
+		milestone.collaborationUpdates.some(
+			(update) => update.revision === milestone.revision && update.collaborator === collaborator,
+		),
+	);
+}
+
+function hasRejectedTaskFinalVerification(task: AnsteelTeamTask): boolean {
+	return task.reviews.some((review) => review.revision === task.revision && review.verdict === "reject");
+}
+
+function hasRejectedMilestoneFinalVerification(milestone: AnsteelTeamMilestone): boolean {
+	return milestone.reviews.some((review) => review.revision === milestone.revision && review.verdict === "reject");
+}
+
+function getActiveNonGreenGovernedCheckpoints(state: AnsteelTeamState): AnsteelWorkCheckpoint[] {
+	return state.workCheckpoints.filter(
+		(checkpoint) =>
+			checkpoint.status === "active" &&
+			checkpoint.governedAction !== null &&
+			checkpoint.governedAction.effectiveRisk !== "green",
+	);
+}
+
+function getCheckpointActionReviews(state: AnsteelTeamState, checkpoint: AnsteelWorkCheckpoint): AnsteelActionReview[] {
+	if (checkpoint.governedAction === null) return [];
+	return state.actionReviews.filter(
+		(review) =>
+			review.checkpointId === checkpoint.id &&
+			review.action.kind === checkpoint.governedAction!.kind &&
+			review.action.target === checkpoint.governedAction!.target &&
+			review.action.version === checkpoint.governedAction!.version,
+	);
+}
+
+function getRecordedAnsteelDeliveryStatus(_state: AnsteelTeamState): AnsteelDeliveryStatus {
+	// Delivery verification is intentionally not inferred from task review, action
+	// confirmation, Git text, or provider prose. A later trusted record source can
+	// extend this function without changing the independent-axis contract.
+	return "not-started";
+}
+
+/**
+ * Computes the protocol's three independent axes from persisted facts only.
+ * In particular, delivery remains `not-started` until a later trusted delivery
+ * evidence mechanism exists; approval, action confirmation, and prose cannot
+ * manufacture a delivery result here.
+ */
+export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamStatusAxes {
+	assertState(state);
+	const openIssues = state.processIssues.filter((issue) => issue.status !== "closed");
+	const blockingIssues = openIssues.filter((issue) => issue.severity === "blocking" || issue.severity === "critical");
+	const escalatedIssues = openIssues.filter((issue) => issue.status === "escalated");
+	const failedRoles = ANSTEEL_ROLES.filter((role) => state.roles[role].status === "failed");
+	const tasksInFinalVerificationWithCollaboration = state.tasks.filter(
+		(task) => task.status === "final-verification" && hasCompletedTaskCollaboration(task),
+	);
+	const milestonesInFinalVerificationWithCollaboration = state.milestones.filter(
+		(milestone) => milestone.status === "final-verification" && hasCompletedMilestoneCollaboration(milestone),
+	);
+	const completedOrFinalItemsMissingCollaboration = [
+		...state.tasks
+			.filter(
+				(task) =>
+					(task.status === "approved" || task.status === "final-verification") && !hasCompletedTaskCollaboration(task),
+			)
+			.map((task) => `task ${task.id}`),
+		...state.milestones
+			.filter(
+				(milestone) =>
+					(milestone.status === "approved" || milestone.status === "final-verification") &&
+					!hasCompletedMilestoneCollaboration(milestone),
+			)
+			.map((milestone) => `milestone ${milestone.id}`),
+	];
+	const finalVerificationRejected =
+		state.tasks.some(hasRejectedTaskFinalVerification) || state.milestones.some(hasRejectedMilestoneFinalVerification);
+	const hasWork = state.tasks.length > 0 || state.milestones.length > 0;
+	const collaborationComplete =
+		hasWork &&
+		state.openChallenges.every((challenge) => challenge.status === "resolved") &&
+		openIssues.length === 0 &&
+		state.tasks.every((task) => task.status === "approved" && hasCompletedTaskCollaboration(task)) &&
+		state.milestones.every(
+			(milestone) => milestone.status === "approved" && hasCompletedMilestoneCollaboration(milestone),
+		);
+	const collaborationReasons: string[] = [];
+	let collaborationStatus: AnsteelCollaborationStatus;
+	// Safety and dispute facts take precedence over ordinary lifecycle phases. A
+	// stopped team, failed role, escalated issue, open challenge, or current
+	// final-review rejection must never be hidden by a later-looking status.
+	if (state.status === "stopped") {
+		collaborationStatus = "blocked";
+		collaborationReasons.push("team is stopped");
+	} else if (failedRoles.length > 0) {
+		collaborationStatus = "blocked";
+		collaborationReasons.push(`failed role sessions: ${failedRoles.join(", ")}`);
+	} else if (escalatedIssues.length > 0) {
+		collaborationStatus = "blocked";
+		collaborationReasons.push(`escalated process issues: ${escalatedIssues.map((issue) => issue.id).join(", ")}`);
+	} else if (
+		blockingIssues.length > 0 ||
+		state.openChallenges.some((challenge) => challenge.status === "open") ||
+		finalVerificationRejected
+	) {
+		collaborationStatus = "disputed";
+		if (blockingIssues.length > 0) {
+			collaborationReasons.push(`open blocking process issues: ${blockingIssues.map((issue) => issue.id).join(", ")}`);
+		}
+		const openChallenges = state.openChallenges.filter((challenge) => challenge.status === "open");
+		if (openChallenges.length > 0) {
+			collaborationReasons.push(`open role challenges: ${openChallenges.map((challenge) => challenge.id).join(", ")}`);
+		}
+		if (finalVerificationRejected) {
+			collaborationReasons.push("a current final verification recorded REJECT and requires a new revision");
+		}
+	} else if (openIssues.some((issue) => issue.status === "resolution-proposed")) {
+		collaborationStatus = "resolving";
+		collaborationReasons.push("a public process-resolution proposal awaits the issue author's review");
+	} else if (completedOrFinalItemsMissingCollaboration.length > 0) {
+		// v9 migration deliberately preserves final-review eligibility but supplies
+		// no invented collaboration updates. Keep that legacy work active and name
+		// the missing evidence instead of displaying a false ready/completed phase.
+		collaborationStatus = "active";
+		collaborationReasons.push(
+			`current final or approved items lack continuous collaboration evidence: ${completedOrFinalItemsMissingCollaboration.join(", ")}`,
+		);
+	} else if (
+		tasksInFinalVerificationWithCollaboration.length > 0 ||
+		milestonesInFinalVerificationWithCollaboration.length > 0
+	) {
+		collaborationStatus = "ready-for-verification";
+		collaborationReasons.push("public collaboration is complete for at least one current revision; final verification is pending");
+	} else if (collaborationComplete) {
+		collaborationStatus = "collaboration-complete";
+		collaborationReasons.push("every current task and milestone has required public collaboration evidence and final approval");
+	} else if (!hasWork && state.workCheckpoints.length === 0 && openIssues.length === 0) {
+		collaborationStatus = "orienting";
+		collaborationReasons.push("no governed task, milestone, checkpoint, or process issue exists yet");
+	} else {
+		collaborationStatus = "active";
+		collaborationReasons.push("governed work remains active without an unresolved high-severity dispute");
+	}
+
+	const nonGreenCheckpoints = getActiveNonGreenGovernedCheckpoints(state);
+	const actionReviewStates = nonGreenCheckpoints.map((checkpoint) => {
+		const reviews = getCheckpointActionReviews(state, checkpoint);
+		const requiredReviewers = ANSTEEL_ROLES.filter((role) => role !== checkpoint.actor);
+		return {
+			checkpoint,
+			rejected: reviews.some((review) => review.verdict === "reject"),
+			complete: requiredReviewers.every((role) => reviews.some((review) => review.reviewer === role && review.verdict === "approve")),
+		};
+	});
+	// Non-green actions may be recorded for a scope decision or a standalone
+	// operation, so their governance requirement is independent of task and
+	// milestone ownership. Empty task arrays are deliberately approved only
+	// after every currently active non-green action has its required peer review.
+	const hasGovernanceRequirement = hasWork || actionReviewStates.length > 0;
+	const allWorkApproved =
+		state.tasks.every((task) => task.status === "approved") && state.milestones.every((milestone) => milestone.status === "approved");
+	const governanceReasons: string[] = [];
+	let governanceStatus: AnsteelGovernanceStatus;
+	if (finalVerificationRejected || actionReviewStates.some((entry) => entry.rejected)) {
+		governanceStatus = "rejected";
+		if (finalVerificationRejected) governanceReasons.push("a current final verification recorded REJECT");
+		const rejectedActions = actionReviewStates.filter((entry) => entry.rejected).map((entry) => entry.checkpoint.id);
+		if (rejectedActions.length > 0) governanceReasons.push(`rejected governed actions: ${rejectedActions.join(", ")}`);
+	} else if (!hasGovernanceRequirement) {
+		governanceStatus = "not-required";
+		governanceReasons.push("no task, milestone, or active non-green action currently requires governance");
+	} else if (allWorkApproved && actionReviewStates.every((entry) => entry.complete)) {
+		governanceStatus = "approved";
+		governanceReasons.push("all current task and milestone final approvals and active non-green action confirmations are complete");
+	} else {
+		governanceStatus = "pending";
+		if (!allWorkApproved && hasWork) governanceReasons.push("at least one task or milestone has not received its final approval");
+		const pendingActions = actionReviewStates.filter((entry) => !entry.complete).map((entry) => entry.checkpoint.id);
+		if (pendingActions.length > 0) governanceReasons.push(`pending governed action confirmations: ${pendingActions.join(", ")}`);
+	}
+
+	const deliveryStatus = getRecordedAnsteelDeliveryStatus(state);
+	const deliveryReasons = [
+		"no trusted, replayable delivery-verification evidence is recorded; task, milestone, and action approval are not delivery evidence",
+	];
+	const workflowReasons: string[] = [];
+	let workflowStatus: AnsteelWorkflowStatus;
+	if (collaborationStatus === "blocked" || collaborationStatus === "disputed") {
+		workflowStatus = "blocked";
+		workflowReasons.push("collaboration is blocked or disputed by unresolved durable facts");
+		if (governanceStatus === "rejected") {
+			workflowReasons.push("governance also contains a durable rejection");
+		}
+	} else if (governanceStatus === "rejected") {
+		// A non-green action can be rejected even when no task-level disagreement
+		// exists. That durable governance veto must block the workflow instead of
+		// looking like ordinary work still in progress.
+		workflowStatus = "blocked";
+		workflowReasons.push("governance contains a durable rejection");
+	} else if (
+		collaborationStatus === "collaboration-complete" &&
+		(governanceStatus === "approved" || governanceStatus === "not-required") &&
+		deliveryStatus === "passed"
+	) {
+		workflowStatus = "completed";
+		workflowReasons.push("collaboration, governance, and trusted delivery verification are complete");
+	} else {
+		workflowStatus = "in-progress";
+		if (collaborationStatus !== "collaboration-complete") workflowReasons.push("collaboration is not complete");
+		if (governanceStatus !== "approved" && governanceStatus !== "not-required") workflowReasons.push("governance is not complete");
+		workflowReasons.push("delivery verification has not started");
+	}
+
+	return {
+		collaborationStatus,
+		governanceStatus,
+		deliveryStatus,
+		workflowStatus,
+		reasons: {
+			collaboration: collaborationReasons,
+			governance: governanceReasons,
+			delivery: deliveryReasons,
+			workflow: workflowReasons,
+		},
+	};
+}
+
 export function getAnsteelTeamSharedBoard(
 	state: AnsteelTeamState,
 	events: readonly AnsteelTeamEvent[],
@@ -3877,6 +4148,7 @@ export function getAnsteelTeamSharedBoard(
 		teamId: state.id,
 		currentGoal: state.topic,
 		teamStatus: state.status,
+		axes: getAnsteelTeamStatusAxes(state),
 		roles,
 		tasks: state.tasks.map((task) => ({
 			id: task.id,

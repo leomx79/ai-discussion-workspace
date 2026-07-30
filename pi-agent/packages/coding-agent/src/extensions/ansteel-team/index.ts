@@ -49,6 +49,7 @@ import {
 	getAnsteelTeamActionFileIdentity,
 	getAnsteelTeamMilestoneFinalVerificationReadiness,
 	getAnsteelTeamSharedBoard,
+	getAnsteelTeamStatusAxes,
 	getAnsteelTeamTaskFinalVerificationReadiness,
 	getAnsteelTeamTaskProgressFingerprint,
 	isAnsteelTeamGovernancePath,
@@ -1272,7 +1273,7 @@ function emitTimelineMessage(pi: ExtensionAPI, content: string): void {
 	);
 }
 
-function formatStatus(state: AnsteelTeamState): string {
+function formatStatus(state: AnsteelTeamState, axes = getAnsteelTeamStatusAxes(state)): string {
 	const roleLines = ANSTEEL_ROLES.map((role) => {
 		const member = state.roles[role];
 		return `- ${role}: ${member.status} (${member.model})`;
@@ -1290,6 +1291,11 @@ function formatStatus(state: AnsteelTeamState): string {
 	return [
 		`Ansteel team: ${state.status}`,
 		`Topic: ${state.topic}`,
+		"Three-axis status:",
+		`- collaboration: ${axes.collaborationStatus}; ${axes.reasons.collaboration.join("; ")}`,
+		`- governance: ${axes.governanceStatus}; ${axes.reasons.governance.join("; ")}`,
+		`- delivery: ${axes.deliveryStatus}; ${axes.reasons.delivery.join("; ")}`,
+		`- workflow: ${axes.workflowStatus}; ${axes.reasons.workflow.join("; ")}`,
 		"Roles:",
 		...roleLines,
 		`Open challenges: ${openChallenges.length}`,
@@ -1338,6 +1344,11 @@ export function formatSharedBoard(board: AnsteelTeamSharedBoard): string {
 	return [
 		`Goal: ${board.currentGoal}`,
 		`Team status: ${board.teamStatus}`,
+		"Three-axis status:",
+		`- collaboration: ${board.axes.collaborationStatus}; ${board.axes.reasons.collaboration.join("; ")}`,
+		`- governance: ${board.axes.governanceStatus}; ${board.axes.reasons.governance.join("; ")}`,
+		`- delivery: ${board.axes.deliveryStatus}; ${board.axes.reasons.delivery.join("; ")}`,
+		`- workflow: ${board.axes.workflowStatus}; ${board.axes.reasons.workflow.join("; ")}`,
 		"Role status and active checkpoint:",
 		...roleLines,
 		"Tasks:",
@@ -3286,15 +3297,19 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						return;
 					}
 					if (command === "status") {
-						const activeTeam = activeTeams.get(ctx.cwd);
-						const state = activeTeam?.state ?? loadAnsteelTeamState(ctx.cwd);
+						// Status is a durable diagnostic surface, not an in-memory progress
+						// hint. Reload it so a stale active session cannot hide persisted
+						// tampering, then use the board's replay gate for the same axes.
+						const state = loadAnsteelTeamState(ctx.cwd);
 						const teamId = state?.id ?? "ansteel-team-uninitialized";
 						await runObservedCommand(
 							ctx.cwd,
 							teamId,
 							`status${argument ? ` ${argument}` : ""}`,
 							async (logger) => {
-								const status = state ? formatStatus(state) : "No Ansteel team state exists for this project.";
+								const status = state
+									? formatStatus(state, getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(ctx.cwd)).axes)
+									: "No Ansteel team state exists for this project.";
 								if (argument.length === 0) {
 									emitTimelineMessage(pi, status);
 									return;

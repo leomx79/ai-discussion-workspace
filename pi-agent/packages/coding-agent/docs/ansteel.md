@@ -146,7 +146,13 @@ Use the read-only diagnostic commands from the host session:
 
 Redaction happens before hashing and writing. Runtime records and artifacts must not contain API keys, authorization headers, cookies, private keys, environment-variable secret values, raw provider request bodies, private provider payloads, or hidden chain-of-thought. Environment assignments are matched by the complete variable name and sensitive suffix, so both bare names such as `API_KEY`, `TOKEN`, `PASSWORD`, and `SECRET` and provider-prefixed names such as `OPENAI_API_KEY` and `ANSTEEL_TL_API_KEY`, including mixed case and quoted values, are redacted in messages, nested data, and artifacts. Public role updates remain project data in the separate collaboration ledger. Logs keep only the structured result, correlation metadata, output length, reason code, and redacted evidence needed to diagnose the run.
 
-本阶段已实现黄色/红色动作的动态执行前阻断。成功的自动恢复会写入公共审计事件；成功的历史运行索引重建会写入可由 `trace` 查询的协调器审计事实。只有恢复或索引重建成功才记录对应成功事实；活跃宿主、锁冲突、损坏日志链或其他失败不会伪造成功事件。这些门禁证明的是动作绑定、确认顺序和可追溯执行边界，不是最终交付正确性证明；持续协作后的最终双独立验收仍然保留。三轴 `collaborationStatus`/`governanceStatus`/`deliveryStatus`、保留自动化、角色签名、Merkle 外部锚定及完整持续协作迁移仍属后续阶段，当前也没有完成真实三提供商探针验证。
+本阶段已实现黄色/红色动作的动态执行前阻断。成功的自动恢复会写入公共审计事件；成功的历史运行索引重建会写入可由 `trace` 查询的协调器审计事实。只有恢复或索引重建成功才记录对应成功事实；活跃宿主、锁冲突、损坏日志链或其他失败不会伪造成功事件。这些门禁证明的是动作绑定、确认顺序和可追溯执行边界，不是最终交付正确性证明；持续协作后的最终双独立验收仍然保留。当前也没有完成真实三提供商探针验证。
+
+### 三轴状态（只读投影）
+
+`/ansteel-team status --explain` 和 `board` 都会从已校验的持久团队事实显示 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 与派生的 `workflowStatus`，并附上机械原因。它们不是角色可直接写入的状态字段。公开协作更新、当前 revision 的最终独立评审、过程问题、角色失败和非绿色动作会签分别影响协作或治理轴；`approved` 只表示治理要求已经满足，不能替代交付证据。
+
+当前运行时还没有受信任、可重放的交付验证记录，因此 `deliveryStatus` 会明确保持 `not-started`。任务或里程碑批准、黄色/红色动作会签、Git 提交以及 GitHub Actions 的文本均不能把它升级为 `passed`。只有未来引入经校验的交付证据记录后，`workflowStatus` 才可能同时满足协作完成、治理完成和交付通过而成为 `completed`；本投影不改变现有任务依赖释放语义。
 
 ## Interactive change gate
 

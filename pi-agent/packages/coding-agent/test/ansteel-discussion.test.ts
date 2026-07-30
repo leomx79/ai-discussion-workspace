@@ -3239,6 +3239,9 @@ describe("runAnsteelDiscussion", () => {
 		expect(disposed).toEqual(["tech-lead", "staff-engineer", "qa-engineer"]);
 	});
 
+	// The assertion below exercises a 20ms protocol timeout. Its outer allowance
+	// only covers TypeScript transform and Windows scheduler delay; it is not a
+	// relaxation of the stage-timeout behavior under test.
 	it("returns an auditable rejection when a project-stage prompt exceeds its timeout", async () => {
 		type TestModel = { provider: string; id: string };
 		const aborted: AnsteelRole[] = [];
@@ -3311,7 +3314,7 @@ describe("runAnsteelDiscussion", () => {
 			]),
 		);
 		await new Promise<void>((resolve) => setImmediate(resolve));
-	}, 1_000);
+	}, 10_000);
 
 	it("archives timeout and abort events that arrive asynchronously", async () => {
 		type TestModel = { provider: string; id: string };

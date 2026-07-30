@@ -28,6 +28,7 @@ import {
 	getAnsteelTeamEventPath,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatePath,
+	getAnsteelTeamStatusAxes,
 	getAnsteelTeamMilestoneFinalVerificationReadiness,
 	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamTaskFinalVerificationReadiness,
@@ -255,6 +256,107 @@ afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { force: true, recursive: true });
 	}
+});
+
+describe("Ansteel team status axes", () => {
+	it("starts without conflating an empty team with governance or delivery success", () => {
+		const axes = getAnsteelTeamStatusAxes(createTeam(createTemporaryProject()));
+
+		expect(axes).toMatchObject({
+			collaborationStatus: "orienting",
+			governanceStatus: "not-required",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
+		expect(axes.reasons.delivery).toEqual(
+			expect.arrayContaining([expect.stringContaining("no trusted, replayable delivery-verification evidence")]),
+		);
+	});
+
+	it("blocks collaboration when a durable role session has failed", () => {
+		const state = createTeam(createTemporaryProject());
+		state.roles["qa-engineer"].status = "failed";
+
+		expect(getAnsteelTeamStatusAxes(state)).toMatchObject({
+			collaborationStatus: "blocked",
+			governanceStatus: "not-required",
+			deliveryStatus: "not-started",
+			workflowStatus: "blocked",
+		});
+	});
+
+	it("approves governance for an action-only red checkpoint after both peer confirmations", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-AXIS-ACTION-ONLY-0001",
+			goal: "Replace a governed file after peer confirmation.",
+			currentUnderstanding: "The existing parser file requires a red overwrite confirmation.",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "write", target: "src/parser.ts", expectedResult: "The parser file is replaced" },
+			risk: "green",
+			confidence: "L2",
+		});
+		const action = {
+			kind: checkpoint.governedAction!.kind,
+			target: checkpoint.governedAction!.target,
+			version: checkpoint.governedAction!.version,
+		};
+		for (const reviewer of ["tech-lead", "qa-engineer"] as const) {
+			reviewAnsteelTeamAction(cwd, state, reviewer, {
+				checkpointId: checkpoint.id,
+				action,
+				verdict: "approve",
+				reason: `${reviewer} confirmed the exact action binding.`,
+			});
+		}
+
+		expect(getAnsteelTeamStatusAxes(state)).toMatchObject({
+			collaborationStatus: "active",
+			governanceStatus: "approved",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
+	});
+
+	it("blocks the workflow when an action-only red checkpoint is rejected", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-AXIS-ACTION-REJECT-0001",
+			goal: "Replace a governed file only after peer review.",
+			currentUnderstanding: "The existing parser file requires a red overwrite confirmation.",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "write", target: "src/parser.ts", expectedResult: "The parser file is replaced" },
+			risk: "green",
+			confidence: "L2",
+		});
+		reviewAnsteelTeamAction(cwd, state, "qa-engineer", {
+			checkpointId: checkpoint.id,
+			action: {
+				kind: checkpoint.governedAction!.kind,
+				target: checkpoint.governedAction!.target,
+				version: checkpoint.governedAction!.version,
+			},
+			verdict: "reject",
+			reason: "QA rejected the exact red overwrite binding.",
+		});
+
+		const axes = getAnsteelTeamStatusAxes(state);
+		expect(axes).toMatchObject({
+			collaborationStatus: "active",
+			governanceStatus: "rejected",
+			deliveryStatus: "not-started",
+			workflowStatus: "blocked",
+		});
+		expect(getAnsteelTeamSharedBoard(state, listAnsteelTeamEvents(cwd)).axes).toEqual(axes);
+	});
 });
 
 describe("public collaboration state", () => {
@@ -527,6 +629,12 @@ describe("public collaboration state", () => {
 			});
 		}
 		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", writeCall).blockReason).toBeUndefined();
+		expect(getAnsteelTeamStatusAxes(state)).toMatchObject({
+			collaborationStatus: "active",
+			governanceStatus: "pending",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
 	});
 
 	it("keeps blocking issues and target drift ahead of otherwise complete peer approval", () => {
@@ -1121,6 +1229,12 @@ describe("public collaboration state", () => {
 			evidenceRefs: ["diff:public-api"],
 		});
 		expect(state.processIssues[0].status).toBe("escalated");
+		expect(getAnsteelTeamStatusAxes(state)).toMatchObject({
+			collaborationStatus: "blocked",
+			governanceStatus: "pending",
+			deliveryStatus: "not-started",
+			workflowStatus: "blocked",
+		});
 
 		const path = getAnsteelTeamEventPath(cwd);
 		const lines = readFileSync(path, "utf8").trimEnd().split("\n");
@@ -2315,6 +2429,12 @@ describe("Ansteel team state", () => {
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
 		expect(task.status).toBe("approved");
+		expect(getAnsteelTeamStatusAxes(team)).toMatchObject({
+			collaborationStatus: "collaboration-complete",
+			governanceStatus: "approved",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
 	});
 
 	it("returns submitted work to the owner when continuous collaboration raises a blocking checkpoint issue", () => {
@@ -2358,6 +2478,12 @@ describe("Ansteel team state", () => {
 
 		expect(task).toMatchObject({ status: "revision-required", testEvidence: [] });
 		expect(() => beginAnsteelTeamTaskFinalVerification(cwd, team, task.id)).toThrow("not submitted");
+		expect(getAnsteelTeamStatusAxes(team)).toMatchObject({
+			collaborationStatus: "disputed",
+			governanceStatus: "pending",
+			deliveryStatus: "not-started",
+			workflowStatus: "blocked",
+		});
 	});
 
 	it("migrates a v9 submitted task into legacy final verification without inventing collaboration updates", () => {
@@ -2390,6 +2516,15 @@ describe("Ansteel team state", () => {
 			expect.arrayContaining([
 				expect.objectContaining({ id: task.id, status: "final-verification", collaborationUpdates: [] }),
 			]),
+		);
+		expect(getAnsteelTeamStatusAxes(migrated!)).toMatchObject({
+			collaborationStatus: "active",
+			governanceStatus: "pending",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
+		expect(getAnsteelTeamStatusAxes(migrated!).reasons.collaboration).toEqual(
+			expect.arrayContaining([expect.stringContaining("task TASK-V9-FINAL")]),
 		);
 	});
 
@@ -2440,6 +2575,54 @@ describe("Ansteel team state", () => {
 			expect.arrayContaining([
 				expect.objectContaining({ id: milestone.id, status: "final-verification", collaborationUpdates: [] }),
 			]),
+		);
+		expect(getAnsteelTeamStatusAxes(migrated!)).toMatchObject({
+			collaborationStatus: "active",
+			governanceStatus: "pending",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
+		expect(getAnsteelTeamStatusAxes(migrated!).reasons.collaboration).toEqual(
+			expect.arrayContaining([expect.stringContaining(`milestone ${milestone.id}`)]),
+		);
+	});
+
+	it("keeps a v9 approved task active when migration has no collaboration evidence", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-V9-APPROVED",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Preserve an old approval without fabricating continuous collaboration.",
+			acceptanceCriteria: "The historical approved package remains inspectable.",
+		});
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'legacy-v9-approved';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS legacy approved package",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, task.id);
+		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+		const raw = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
+		raw.version = 9;
+		const rawTask = (raw.tasks as Array<Record<string, unknown>>)[0]!;
+		delete rawTask.collaborationUpdates;
+		writePersistedTeamState(cwd, raw);
+
+		const migrated = loadAnsteelTeamState(cwd);
+		expect(getAnsteelTeamStatusAxes(migrated!)).toMatchObject({
+			collaborationStatus: "active",
+			governanceStatus: "approved",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
+		expect(getAnsteelTeamStatusAxes(migrated!).reasons.collaboration).toEqual(
+			expect.arrayContaining([expect.stringContaining("task TASK-V9-APPROVED")]),
 		);
 	});
 
@@ -2492,6 +2675,12 @@ describe("Ansteel team state", () => {
 			issue: "QA-1: empty input remains untested.",
 		});
 		expect(task.status).toBe("revision-required");
+		expect(getAnsteelTeamStatusAxes(team)).toMatchObject({
+			collaborationStatus: "disputed",
+			governanceStatus: "rejected",
+			deliveryStatus: "not-started",
+			workflowStatus: "blocked",
+		});
 
 		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'second';\n", "utf8");
 		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {

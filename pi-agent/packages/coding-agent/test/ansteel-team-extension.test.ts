@@ -192,7 +192,10 @@ afterEach(() => {
 	}
 });
 
-describe("Ansteel team extension", () => {
+// These tests exercise durable Git and runtime-record workflows rather than a
+// latency target. Keep the protocol's own timeouts unchanged, but allow the
+// complete serial integration group enough outer time on Windows hosts.
+describe("Ansteel team extension", { timeout: 20_000 }, () => {
 	it("registers guarded production mutation tools for default role sessions", async () => {
 		const cwd = createTemporaryProject();
 		const outside = createTemporaryProject();
@@ -609,7 +612,7 @@ describe("Ansteel team extension", () => {
 		expect(harness.sendMessage).toHaveBeenLastCalledWith(
 			expect.objectContaining({
 				content: expect.stringMatching(
-					/Goal:[\s\S]*Role status and active checkpoint[\s\S]*Active checkpoints: 1[\s\S]*Open process issues: 1[\s\S]*Blocking process issues: 1/,
+					/Goal:[\s\S]*Three-axis status:[\s\S]*collaboration: disputed[\s\S]*governance: not-required[\s\S]*delivery: not-started[\s\S]*workflow: blocked[\s\S]*Role status and active checkpoint[\s\S]*Active checkpoints: 1[\s\S]*Open process issues: 1[\s\S]*Blocking process issues: 1/,
 				),
 			}),
 			{ triggerTurn: false },
@@ -742,6 +745,17 @@ describe("Ansteel team extension", () => {
 			.join("\n");
 		expect(postMismatchMessages).toContain("Ansteel team command failed");
 		expect(postMismatchMessages).not.toContain("Health: healthy");
+
+		harness.sendMessage.mockClear();
+		await expect(command("status", harness.ctx)).rejects.toThrow("state-projection-mismatch");
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
+			{ triggerTurn: false },
+		);
+		expect(harness.sendMessage).not.toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Three-axis status") }),
+			expect.anything(),
+		);
 	});
 
 	it.each([
@@ -1037,7 +1051,9 @@ describe("Ansteel team extension", () => {
 		await command("status --explain", harness.ctx);
 		expect(harness.sendMessage).toHaveBeenLastCalledWith(
 			expect.objectContaining({
-				content: expect.stringMatching(new RegExp(`${capturedRun!.runId}.*provider-timeout`, "s")),
+				content: expect.stringMatching(
+					new RegExp(`Three-axis status:.*delivery: not-started.*${capturedRun!.runId}.*provider-timeout`, "s"),
+				),
 			}),
 			{ triggerTurn: false },
 		);
