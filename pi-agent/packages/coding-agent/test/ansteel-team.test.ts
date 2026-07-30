@@ -7,6 +7,7 @@ import {
 	type AnsteelWorkCheckpoint,
 	type AnsteelWorkCheckpointInput,
 	appendAnsteelTeamEvent,
+	assessAnsteelTeamAction,
 	claimAnsteelTeamTask,
 	classifyAnsteelTeamActionRisk,
 	createAnsteelTeamMilestone,
@@ -24,6 +25,7 @@ import {
 	recordAnsteelTeamTaskTestResult,
 	resolveAnsteelProcessIssue,
 	reviewAnsteelProcessResolution,
+	reviewAnsteelTeamAction,
 	reviewAnsteelTeamMilestone,
 	reviewAnsteelTeamTask,
 	runAnsteelTeamMilestoneTest,
@@ -282,6 +284,251 @@ describe("public collaboration state", () => {
 			computedRisk: "red",
 			effectiveRisk: "red",
 		});
+	});
+
+	it("blocks a yellow edit until both peers approve the exact action binding", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, state, {
+			id: "TASK-RISK-GATE",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Change the governed parser.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const editCall = { toolName: "edit", args: { path: "src/parser.ts", edits: [] } };
+
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", editCall).blockReason).toContain(
+			"active checkpoint",
+		);
+
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RISK-GATE-0001",
+			taskId: "TASK-RISK-GATE",
+			goal: "Change the governed parser",
+			currentUnderstanding: "The exact parser edit is ready for peer inspection",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const action = {
+			kind: checkpoint.governedAction!.kind,
+			target: checkpoint.governedAction!.target,
+			version: checkpoint.governedAction!.version,
+		};
+
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", editCall).blockReason).toContain(
+			"tech-lead, qa-engineer",
+		);
+		reviewAnsteelTeamAction(cwd, state, "tech-lead", {
+			checkpointId: checkpoint.id,
+			action,
+			verdict: "approve",
+			reason: "The edit is scoped to the claimed parser file.",
+		});
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", editCall).blockReason).toContain("qa-engineer");
+		reviewAnsteelTeamAction(cwd, state, "qa-engineer", {
+			checkpointId: checkpoint.id,
+			action,
+			verdict: "approve",
+			reason: "The parser boundary remains testable.",
+		});
+
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", editCall).blockReason).toBeUndefined();
+	});
+
+	it("rejects self approval, duplicate reviewers, mismatched bindings, and explicit peer rejection", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, state, {
+			id: "TASK-REVIEW-BINDING",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Change the governed parser.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-REVIEW-BINDING-0001",
+			taskId: "TASK-REVIEW-BINDING",
+			goal: "Change the governed parser",
+			currentUnderstanding: "The edit needs an exact peer binding",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const action = {
+			kind: checkpoint.governedAction!.kind,
+			target: checkpoint.governedAction!.target,
+			version: checkpoint.governedAction!.version,
+		};
+
+		expect(() =>
+			reviewAnsteelTeamAction(cwd, state, "staff-engineer", {
+				checkpointId: checkpoint.id,
+				action,
+				verdict: "approve",
+				reason: "Self approval must fail.",
+			}),
+		).toThrow("cannot review its own action");
+		expect(() =>
+			reviewAnsteelTeamAction(cwd, state, "tech-lead", {
+				checkpointId: checkpoint.id,
+				action: { ...action, version: `${action.version}-stale` },
+				verdict: "approve",
+				reason: "A stale version must fail.",
+			}),
+		).toThrow("does not match");
+
+		reviewAnsteelTeamAction(cwd, state, "tech-lead", {
+			checkpointId: checkpoint.id,
+			action,
+			verdict: "reject",
+			reason: "The compatibility evidence is missing.",
+		});
+		expect(() =>
+			reviewAnsteelTeamAction(cwd, state, "tech-lead", {
+				checkpointId: checkpoint.id,
+				action,
+				verdict: "approve",
+				reason: "A duplicate reviewer must fail.",
+			}),
+		).toThrow("already reviewed");
+		expect(
+			assessAnsteelTeamAction(cwd, state, "staff-engineer", {
+				toolName: "edit",
+				args: { path: "src/parser.ts", edits: [] },
+			}).blockReason,
+		).toContain("rejected");
+	});
+
+	it("upgrades an existing-file write to red and requires both explicit peer approvals", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, state, {
+			id: "TASK-RED-WRITE",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Replace the governed parser file.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RED-WRITE-0001",
+			taskId: "TASK-RED-WRITE",
+			goal: "Replace the governed parser file",
+			currentUnderstanding: "A full write overwrites the current file",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "write", target: "src/parser.ts", expectedResult: "The parser file is replaced" },
+			risk: "green",
+			confidence: "L2",
+		});
+		const action = {
+			kind: checkpoint.governedAction!.kind,
+			target: checkpoint.governedAction!.target,
+			version: checkpoint.governedAction!.version,
+		};
+		const writeCall = {
+			toolName: "write",
+			args: { path: "src/parser.ts", content: "export const parser = 'after';\n" },
+		};
+
+		expect(checkpoint.risk).toBe("red");
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", writeCall).blockReason).toContain(
+			"tech-lead, qa-engineer",
+		);
+		for (const reviewer of ["tech-lead", "qa-engineer"] as const) {
+			reviewAnsteelTeamAction(cwd, state, reviewer, {
+				checkpointId: checkpoint.id,
+				action,
+				verdict: "approve",
+				reason: `${reviewer} explicitly approved the red overwrite.`,
+			});
+		}
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", writeCall).blockReason).toBeUndefined();
+	});
+
+	it("keeps blocking issues and target drift ahead of otherwise complete peer approval", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, state, {
+			id: "TASK-RISK-DRIFT",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Change the governed parser.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RISK-DRIFT-0001",
+			taskId: "TASK-RISK-DRIFT",
+			goal: "Change the governed parser",
+			currentUnderstanding: "Both peers can inspect the current file version",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const action = {
+			kind: checkpoint.governedAction!.kind,
+			target: checkpoint.governedAction!.target,
+			version: checkpoint.governedAction!.version,
+		};
+		for (const reviewer of ["tech-lead", "qa-engineer"] as const) {
+			reviewAnsteelTeamAction(cwd, state, reviewer, {
+				checkpointId: checkpoint.id,
+				action,
+				verdict: "approve",
+				reason: `${reviewer} verified the exact action binding.`,
+			});
+		}
+		raiseAnsteelProcessIssue(cwd, state, "qa-engineer", {
+			id: "PI-RISK-DRIFT-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "blocking",
+			claim: "The compatibility evidence is incomplete.",
+			evidenceRefs: ["test:compatibility"],
+			suggestedCorrection: "Add the missing compatibility case.",
+		});
+		const editCall = { toolName: "edit", args: { path: "src/parser.ts", edits: [] } };
+
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", editCall).blockReason).toContain(
+			"blocking process issue",
+		);
+
+		state.processIssues[0].severity = "advisory";
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'drifted';\n", "utf8");
+		expect(assessAnsteelTeamAction(cwd, state, "staff-engineer", editCall).blockReason).toContain(
+			"target version drift",
+		);
+	});
+
+	it("allows green reads immediately without a checkpoint or peer review", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const state = createTeam(cwd);
+
+		const assessment = assessAnsteelTeamAction(cwd, state, "qa-engineer", {
+			toolName: "read",
+			args: { path: "src/parser.ts" },
+		});
+		expect(assessment).toMatchObject({
+			action: { computedRisk: "green", effectiveRisk: "green" },
+			requiredReviewers: [],
+			approvedReviewers: [],
+		});
+		expect(assessment.blockReason).toBeUndefined();
 	});
 
 	it("derives the shared board without trusting role-written counts", () => {

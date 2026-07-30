@@ -178,7 +178,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team.test.ts -t "migrates v7
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交并推送状态与分类基础**
+- [x] **Step 6: 提交并推送状态与分类基础**
 
 ```powershell
 git add -- pi-agent/packages/coding-agent/src/core/ansteel-team.ts pi-agent/packages/coding-agent/test/ansteel-team.test.ts docs/superpowers/plans/2026-07-30-ansteel-team-risk-gates.md
@@ -193,7 +193,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/core/ansteel-team.ts`
 - Test: `pi-agent/packages/coding-agent/test/ansteel-team.test.ts`
 
-- [ ] **Step 1: 写确认绑定和阻断 RED 测试**
+- [x] **Step 1: 写确认绑定和阻断 RED 测试**
 
 覆盖以下行为：
 
@@ -228,7 +228,7 @@ it("blocks a yellow edit until both peers approve the exact action binding", () 
 - 红色动作缺失、拒绝或超时确认均阻断；
 - 绿色只读动作不要求检查点或确认。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 Run:
 
@@ -238,7 +238,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team.test.ts -t "yellow edit
 
 Expected: FAIL，原因是动作评估和确认函数不存在。
 
-- [ ] **Step 3: 实现确认事件和状态重放**
+- [x] **Step 3: 实现确认事件和状态重放**
 
 扩展公共事件：
 
@@ -269,7 +269,7 @@ export function reviewAnsteelTeamAction(
 `action-assessed` 是只追加的公共工具事实，不改变确认状态；绿色动作也必须追加该事件，以满足“立即执行并
 广播”。`action-review` 才进入 `actionReviews` 投影。
 
-- [ ] **Step 4: 实现统一动作评估**
+- [x] **Step 4: 实现统一动作评估**
 
 新增：
 
@@ -301,7 +301,7 @@ export function assessAnsteelTeamAction(
 7. reviewer 拒绝或缺失；
 8. 允许执行。
 
-- [ ] **Step 5: 运行核心 GREEN 和事件篡改回归**
+- [x] **Step 5: 运行核心 GREEN 和事件篡改回归**
 
 Run:
 

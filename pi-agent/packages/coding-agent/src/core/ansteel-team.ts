@@ -40,7 +40,8 @@ export type AnsteelTeamEventType =
 	| "work-checkpoint"
 	| "process-issue"
 	| "process-resolution"
-	| "process-resolution-review";
+	| "process-resolution-review"
+	| "action-review";
 
 export type AnsteelTeamEventActor = AnsteelRole | "coordinator";
 
@@ -136,6 +137,16 @@ export interface AnsteelActionReview {
 	reviewedAt: string;
 }
 
+export type AnsteelActionReviewInput = Omit<AnsteelActionReview, "reviewer" | "reviewedAt">;
+
+export interface AnsteelActionAssessment {
+	action: AnsteelGovernedAction;
+	checkpointId?: string;
+	requiredReviewers: AnsteelRole[];
+	approvedReviewers: AnsteelRole[];
+	blockReason?: string;
+}
+
 export type AnsteelWorkCheckpointInput = Omit<
 	AnsteelWorkCheckpoint,
 	"actor" | "governedAction" | "status" | "createdAt"
@@ -162,7 +173,8 @@ export type AnsteelTeamPublicEventPayload =
 			issueId: string;
 			resolutionId: string;
 			review: NonNullable<AnsteelProcessResolution["review"]>;
-	  };
+	  }
+	| { kind: "action-review"; review: AnsteelActionReview };
 
 export interface AnsteelTeamTask {
 	id: string;
@@ -1008,10 +1020,53 @@ function assertAnsteelPublicCollaborationState(state: AnsteelTeamState): void {
 	if (!Array.isArray(state.actionReviews)) {
 		throw new AnsteelTeamStateError("Ansteel team state has invalid action reviews");
 	}
+	const actionReviewers = new Set<string>();
 	for (const review of state.actionReviews) {
 		if (!isRecord(review)) {
 			throw new AnsteelTeamStateError("Ansteel team state has invalid action review entries");
 		}
+		assertCheckpointId(review.checkpointId);
+		const checkpoint = state.workCheckpoints.find((item) => item.id === review.checkpointId);
+		if (!checkpoint) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team action review references unknown checkpoint ${review.checkpointId}`,
+			);
+		}
+		if (checkpoint.governedAction === null) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team action review cannot reference legacy checkpoint ${review.checkpointId}`,
+			);
+		}
+		assertRole(review.reviewer, `action review ${review.checkpointId} reviewer`);
+		if (review.reviewer === checkpoint.actor) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team checkpoint ${review.checkpointId} actor cannot review its own action`,
+			);
+		}
+		const reviewerKey = `${review.checkpointId}\0${review.reviewer}`;
+		if (actionReviewers.has(reviewerKey)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team ${review.reviewer} already reviewed checkpoint ${review.checkpointId}`,
+			);
+		}
+		actionReviewers.add(reviewerKey);
+		if (
+			!isRecord(review.action) ||
+			review.action.kind !== checkpoint.governedAction.kind ||
+			review.action.target !== checkpoint.governedAction.target ||
+			review.action.version !== checkpoint.governedAction.version
+		) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team action review for ${review.checkpointId} does not match its governed action`,
+			);
+		}
+		if (review.verdict !== "approve" && review.verdict !== "reject") {
+			throw new AnsteelTeamStateError(
+				`Ansteel team action review for ${review.checkpointId} has an invalid verdict`,
+			);
+		}
+		assertNonEmptyStateString(review.reason, `action review ${review.checkpointId} reason`);
+		assertStateTimestamp(review.reviewedAt, `action review ${review.checkpointId} time`);
 	}
 }
 
@@ -1226,6 +1281,198 @@ export function getAnsteelTeamWriteBlockReason(
 		return `Ansteel team task ${task.id} is ${task.status}; code is frozen until peer review returns it for revision`;
 	}
 	return undefined;
+}
+
+function getAnsteelToolActionKind(toolName: string, args: unknown): AnsteelActionKind {
+	const normalizedToolName = toolName.trim().toLowerCase();
+	if (
+		normalizedToolName === "read" ||
+		normalizedToolName === "grep" ||
+		normalizedToolName === "find" ||
+		normalizedToolName === "ls"
+	) {
+		return "read";
+	}
+	if (normalizedToolName === "edit") return "edit";
+	if (normalizedToolName === "write") return "write";
+	if (normalizedToolName === "commit") return "commit";
+	if (normalizedToolName === "push" || normalizedToolName === "publish" || normalizedToolName === "release") {
+		return "publish";
+	}
+	if (normalizedToolName === "bash") {
+		const command = isRecord(args) && typeof args.command === "string" ? args.command : "";
+		if (/(?:^|\s)git\s+commit(?:\s|$)/i.test(command)) return "commit";
+		if (/(?:^|\s)(?:git\s+push|npm\s+publish|(?:pnpm|yarn)\s+publish)(?:\s|$)/i.test(command)) {
+			return "publish";
+		}
+		return "experiment";
+	}
+	return "decision";
+}
+
+function getAnsteelToolActionTarget(cwd: string, toolName: string, args: unknown): string {
+	const kind = getAnsteelToolActionKind(toolName, args);
+	const target = getActionPath(args);
+	if (kind === "edit" || kind === "write") {
+		return normalizeTaskFilePath(cwd, target);
+	}
+	if (target !== undefined) {
+		const projectDirectory = assertProjectDirectory(cwd);
+		const relativeTarget = getCwdRelativePath(resolvePath(target, projectDirectory), projectDirectory);
+		return relativeTarget === undefined ? target : relativeTarget.replace(/\\/g, "/");
+	}
+	if (kind === "commit") return "git:commit";
+	if (kind === "publish") return "git:publish";
+	return toolName.trim().toLowerCase();
+}
+
+function getRequiredAnsteelActionReviewers(actor: AnsteelRole): AnsteelRole[] {
+	return ANSTEEL_ROLES.filter((role) => role !== actor);
+}
+
+export function assessAnsteelTeamAction(
+	cwd: string,
+	state: AnsteelTeamState,
+	role: AnsteelRole,
+	input: { toolName: string; args: unknown },
+): AnsteelActionAssessment {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertRole(role, "action actor");
+	const computedRisk = classifyAnsteelTeamActionRisk(projectDirectory, input);
+	const kind = getAnsteelToolActionKind(input.toolName, input.args);
+	const target = getAnsteelToolActionTarget(projectDirectory, input.toolName, input.args);
+	const immediateAction: AnsteelGovernedAction = {
+		kind,
+		target,
+		version: "immediate",
+		computedRisk,
+		effectiveRisk: computedRisk,
+	};
+	if (computedRisk === "green") {
+		return {
+			action: immediateAction,
+			requiredReviewers: [],
+			approvedReviewers: [],
+		};
+	}
+
+	if (kind === "edit" || kind === "write") {
+		const writeBlockReason = getAnsteelTeamWriteBlockReason(projectDirectory, state, role, target);
+		if (writeBlockReason !== undefined) {
+			return {
+				action: immediateAction,
+				requiredReviewers: getRequiredAnsteelActionReviewers(role),
+				approvedReviewers: [],
+				blockReason: writeBlockReason,
+			};
+		}
+	}
+
+	const requiredReviewers = getRequiredAnsteelActionReviewers(role);
+	const checkpoint = [...state.workCheckpoints]
+		.reverse()
+		.find(
+			(item) =>
+				item.actor === role &&
+				item.status === "active" &&
+				item.governedAction !== null &&
+				item.governedAction.kind === kind &&
+				item.governedAction.target === target,
+		);
+	if (!checkpoint?.governedAction) {
+		return {
+			action: immediateAction,
+			requiredReviewers,
+			approvedReviewers: [],
+			blockReason: `Ansteel team ${computedRisk} action ${kind} ${target} requires an active checkpoint with the exact action binding`,
+		};
+	}
+
+	const currentVersion = getCheckpointActionVersion(
+		projectDirectory,
+		state,
+		checkpoint.id,
+		checkpoint.taskId,
+		checkpoint.nextAction,
+	);
+	const action: AnsteelGovernedAction = {
+		kind,
+		target,
+		version: currentVersion,
+		computedRisk,
+		effectiveRisk: maxAnsteelActionRisk(computedRisk, checkpoint.risk),
+	};
+	const checkpointId = checkpoint.id;
+	if (checkpoint.governedAction.version !== currentVersion) {
+		return {
+			action,
+			checkpointId,
+			requiredReviewers,
+			approvedReviewers: [],
+			blockReason: `Ansteel team checkpoint ${checkpointId} target version drift requires a replacement checkpoint`,
+		};
+	}
+	if (ANSTEEL_ACTION_RISK_ORDER[checkpoint.governedAction.effectiveRisk] < ANSTEEL_ACTION_RISK_ORDER[computedRisk]) {
+		return {
+			action,
+			checkpointId,
+			requiredReviewers,
+			approvedReviewers: [],
+			blockReason: `Ansteel team checkpoint ${checkpointId} risk is lower than the mechanical ${computedRisk} classification`,
+		};
+	}
+	const blockingIssue = state.processIssues.find(
+		(issue) =>
+			issue.targetCheckpointId === checkpointId &&
+			issue.status !== "closed" &&
+			(issue.severity === "blocking" || issue.severity === "critical"),
+	);
+	if (blockingIssue) {
+		return {
+			action,
+			checkpointId,
+			requiredReviewers,
+			approvedReviewers: [],
+			blockReason: `Ansteel team ${blockingIssue.severity} process issue ${blockingIssue.id} blocks checkpoint ${checkpointId}`,
+		};
+	}
+	const matchingReviews = state.actionReviews.filter(
+		(review) =>
+			review.checkpointId === checkpointId &&
+			review.action.kind === checkpoint.governedAction!.kind &&
+			review.action.target === checkpoint.governedAction!.target &&
+			review.action.version === checkpoint.governedAction!.version,
+	);
+	const rejectedReview = matchingReviews.find((review) => review.verdict === "reject");
+	const approvedReviewers = matchingReviews
+		.filter((review) => review.verdict === "approve")
+		.map((review) => review.reviewer);
+	if (rejectedReview) {
+		return {
+			action,
+			checkpointId,
+			requiredReviewers,
+			approvedReviewers,
+			blockReason: `Ansteel team ${rejectedReview.reviewer} rejected checkpoint ${checkpointId}: ${rejectedReview.reason}`,
+		};
+	}
+	const missingReviewers = requiredReviewers.filter((reviewer) => !approvedReviewers.includes(reviewer));
+	if (missingReviewers.length > 0) {
+		return {
+			action,
+			checkpointId,
+			requiredReviewers,
+			approvedReviewers,
+			blockReason: `Ansteel team checkpoint ${checkpointId} requires peer action reviews from ${missingReviewers.join(", ")}`,
+		};
+	}
+	return {
+		action,
+		checkpointId,
+		requiredReviewers,
+		approvedReviewers,
+	};
 }
 
 export function isAnsteelTeamGovernancePath(cwd: string, file: unknown): boolean {
@@ -2009,7 +2256,8 @@ function isAnsteelPublicCollaborationEventType(type: AnsteelTeamEventType): bool
 		type === "work-checkpoint" ||
 		type === "process-issue" ||
 		type === "process-resolution" ||
-		type === "process-resolution-review"
+		type === "process-resolution-review" ||
+		type === "action-review"
 	);
 }
 
@@ -2030,6 +2278,18 @@ function assertAnsteelTeamPublicEventEnvelope(event: AnsteelTeamEvent): void {
 		}
 		if (event.payload.checkpoint.id !== event.checkpointId || event.payload.checkpoint.actor !== event.role) {
 			throw new AnsteelTeamStateError("Ansteel team work-checkpoint event identity does not match its payload");
+		}
+		return;
+	}
+	if (event.type === "action-review") {
+		assertCheckpointId(event.checkpointId);
+		if (
+			event.payload.kind !== "action-review" ||
+			!isRecord(event.payload.review) ||
+			event.payload.review.checkpointId !== event.checkpointId ||
+			event.payload.review.reviewer !== event.role
+		) {
+			throw new AnsteelTeamStateError("Ansteel team action-review event identity does not match its payload");
 		}
 		return;
 	}
@@ -2096,7 +2356,8 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "work-checkpoint" &&
 		event.type !== "process-issue" &&
 		event.type !== "process-resolution" &&
-		event.type !== "process-resolution-review"
+		event.type !== "process-resolution-review" &&
+		event.type !== "action-review"
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
 	}
@@ -2298,6 +2559,10 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 		state.processIssues.push(structuredClone(payload.issue));
 		return;
 	}
+	if (payload.kind === "action-review") {
+		state.actionReviews.push(structuredClone(payload.review));
+		return;
+	}
 	const issue = state.processIssues.find((item) => item.id === payload.issueId);
 	if (!issue) {
 		throw new AnsteelTeamStateError(`Ansteel team has no process issue ${payload.issueId}`);
@@ -2432,6 +2697,63 @@ export function publishAnsteelWorkCheckpoint(
 		persistence,
 	);
 	return state.workCheckpoints.find((item) => item.id === checkpoint.id)!;
+}
+
+export function reviewAnsteelTeamAction(
+	cwd: string,
+	state: AnsteelTeamState,
+	reviewer: AnsteelRole,
+	input: AnsteelActionReviewInput,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelActionReview {
+	assertRole(reviewer, "action reviewer");
+	const checkpoint = state.workCheckpoints.find((item) => item.id === input.checkpointId);
+	if (!checkpoint) {
+		throw new AnsteelTeamStateError(`Ansteel team action review references unknown checkpoint ${input.checkpointId}`);
+	}
+	if (checkpoint.status !== "active" || checkpoint.governedAction === null) {
+		throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} is not active for action review`);
+	}
+	if (checkpoint.actor === reviewer) {
+		throw new AnsteelTeamStateError(`Ansteel team checkpoint ${checkpoint.id} actor cannot review its own action`);
+	}
+	if (
+		input.action.kind !== checkpoint.governedAction.kind ||
+		input.action.target !== checkpoint.governedAction.target ||
+		input.action.version !== checkpoint.governedAction.version
+	) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team action review for ${checkpoint.id} does not match its governed action`,
+		);
+	}
+	if (state.actionReviews.some((review) => review.checkpointId === checkpoint.id && review.reviewer === reviewer)) {
+		throw new AnsteelTeamStateError(`Ansteel team ${reviewer} already reviewed checkpoint ${checkpoint.id}`);
+	}
+	if (typeof input.reason !== "string" || input.reason.trim().length === 0) {
+		throw new AnsteelTeamStateError("Ansteel team action review requires a reason");
+	}
+	const review: AnsteelActionReview = {
+		checkpointId: checkpoint.id,
+		reviewer,
+		action: structuredClone(input.action),
+		verdict: input.verdict,
+		reason: input.reason.trim(),
+		reviewedAt: new Date().toISOString(),
+	};
+	appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: "action-review",
+			role: reviewer,
+			checkpointId: checkpoint.id,
+			content: `Reviewed governed action for ${checkpoint.id}: ${review.verdict}`,
+			payload: { kind: "action-review", review },
+		},
+		persistence,
+	);
+	return state.actionReviews.find((item) => item.checkpointId === checkpoint.id && item.reviewer === reviewer)!;
 }
 
 export function raiseAnsteelProcessIssue(
@@ -2656,6 +2978,7 @@ export function getAnsteelTeamSharedBoard(
 	const replayedState = structuredClone(state);
 	replayedState.workCheckpoints = [];
 	replayedState.processIssues = [];
+	replayedState.actionReviews = [];
 	try {
 		for (const event of parsedEvents) {
 			if (event.schemaVersion === 2 && isAnsteelPublicCollaborationEventType(event.type)) {
@@ -2668,7 +2991,8 @@ export function getAnsteelTeamSharedBoard(
 	}
 	if (
 		!isDeepStrictEqual(replayedState.workCheckpoints, state.workCheckpoints) ||
-		!isDeepStrictEqual(replayedState.processIssues, state.processIssues)
+		!isDeepStrictEqual(replayedState.processIssues, state.processIssues) ||
+		!isDeepStrictEqual(replayedState.actionReviews, state.actionReviews)
 	) {
 		throwAnsteelStateProjectionMismatch("persisted collaboration state does not match event replay");
 	}
