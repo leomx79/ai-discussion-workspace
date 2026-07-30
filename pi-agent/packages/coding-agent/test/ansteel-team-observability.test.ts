@@ -232,7 +232,7 @@ describe("Ansteel team observability", () => {
 		first.close();
 	});
 
-	it("preserves an orphaned span cause while recording its recovered start hash", async () => {
+	it("returns structured chain evidence for a recovery audit while preserving the original cause", async () => {
 		const cwd = createTemporaryProject();
 		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
 		const logger = createAnsteelRuntimeLogger(cwd, context);
@@ -245,7 +245,12 @@ describe("Ansteel team observability", () => {
 		logger.close();
 		const start = readAnsteelRuntimeLogs(cwd, context.runId)[0]!;
 
-		await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).resolves.toBe(1);
+		await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).resolves.toMatchObject({
+			runId: context.runId,
+			abandonedSpanCount: 1,
+			previousHeadHash: start.hash,
+			recoveredHeadHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+		});
 
 		const abandoned = readAnsteelRuntimeLogs(cwd, context.runId).at(-1);
 		expect(abandoned).toMatchObject({
@@ -257,6 +262,354 @@ describe("Ansteel team observability", () => {
 				recoveredFromEventHash: start.hash,
 			},
 		});
+	});
+
+	it("persists a verifiable historical run index and locates every governed association after logger close", () => {
+		const cwd = createTemporaryProject();
+		const firstContext = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-HISTORY-1" });
+		const firstLogger = createAnsteelRuntimeLogger(cwd, firstContext);
+		firstLogger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-HISTORY-1",
+			checkpointId: "CP-HISTORY-1",
+			issueId: "ISSUE-HISTORY-1",
+			toolCallId: "TOOL-HISTORY-1",
+			providerRequestId: "PROVIDER-HISTORY-1",
+			processId: "PROCESS-HISTORY-1",
+			leaseId: "LEASE-HISTORY-1",
+			causeEventId: "EVENT-HISTORY-1",
+			message: "first historical event",
+			data: { stdout: "SECRET-STDOUT-MUST-NOT-ENTER-INDEX" },
+		});
+		firstLogger.close();
+
+		const secondContext = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-HISTORY-2" });
+		const secondLogger = createAnsteelRuntimeLogger(cwd, secondContext);
+		secondLogger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-HISTORY-2",
+			issueId: "ISSUE-HISTORY-2",
+			toolCallId: "TOOL-HISTORY-2",
+			message: "second historical event",
+			data: {},
+		});
+		secondLogger.close();
+
+		const indexPath = join(cwd, ".pi", "ansteel-team", "run-index.json");
+		expect(existsSync(indexPath)).toBe(true);
+		const persistedIndex = readFileSync(indexPath, "utf8");
+		expect(persistedIndex).not.toContain("SECRET-STDOUT-MUST-NOT-ENTER-INDEX");
+		expect(persistedIndex).not.toContain("TASK-HISTORY-1");
+		expect(persistedIndex).not.toContain("ISSUE-HISTORY-1");
+
+		for (const selector of [
+			firstContext.runId,
+			firstContext.traceId,
+			"TASK-HISTORY-1",
+			"CP-HISTORY-1",
+			"ISSUE-HISTORY-1",
+			"TOOL-HISTORY-1",
+			"PROVIDER-HISTORY-1",
+			"PROCESS-HISTORY-1",
+			"LEASE-HISTORY-1",
+			"EVENT-HISTORY-1",
+		]) {
+			expect(traceAnsteelTeamRuntime(cwd, selector).map((entry) => entry.runId)).toEqual([firstContext.runId]);
+		}
+		expect(listAnsteelRuntimeRuns(cwd).map((run) => run.runId)).toEqual([firstContext.runId, secondContext.runId]);
+	});
+
+	it("mechanically rebuilds a deleted historical run index and leaves a queryable audit record", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-REBUILD-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-REBUILD-1",
+			message: "historical event before index deletion",
+			data: {},
+		});
+		logger.close();
+		const indexPath = join(cwd, ".pi", "ansteel-team", "run-index.json");
+		rmSync(indexPath, { force: true });
+
+		expect(traceAnsteelTeamRuntime(cwd, "TASK-REBUILD-1")).toHaveLength(1);
+		expect(existsSync(indexPath)).toBe(true);
+		const auditEntries = listAnsteelRuntimeRuns(cwd)
+			.flatMap((run) => readAnsteelRuntimeLogs(cwd, run.runId))
+			.filter((entry) => entry.eventName === "runtime-index-rebuilt");
+		expect(auditEntries).toContainEqual(
+			expect.objectContaining({
+				level: "audit",
+				outcome: "succeeded",
+				role: "coordinator",
+				data: expect.objectContaining({
+					rebuildReason: "missing",
+					rebuiltAt: expect.any(String),
+				}),
+			}),
+		);
+		expect(traceAnsteelTeamRuntime(cwd, "runtime-index-rebuilt")).toEqual(auditEntries);
+	});
+
+	it("mechanically rebuilds a tampered historical run index without losing selector mappings", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-INDEX-TAMPER-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-INDEX-TAMPER-1",
+			message: "historical event before index tampering",
+			data: {},
+		});
+		logger.close();
+		const indexPath = join(cwd, ".pi", "ansteel-team", "run-index.json");
+		const index = JSON.parse(readFileSync(indexPath, "utf8")) as Record<string, unknown>;
+		index.associations = {};
+		writeFileSync(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+
+		expect(traceAnsteelTeamRuntime(cwd, "TASK-INDEX-TAMPER-1").map((entry) => entry.runId)).toEqual([context.runId]);
+		const auditEntries = listAnsteelRuntimeRuns(cwd)
+			.flatMap((run) => readAnsteelRuntimeLogs(cwd, run.runId))
+			.filter((entry) => entry.eventName === "runtime-index-rebuilt");
+		expect(auditEntries.at(-1)?.data).toMatchObject({
+			rebuildReason: "hash-invalid",
+			rebuiltAt: expect.any(String),
+		});
+	});
+
+	it("serializes concurrent historical run index updates without an old snapshot dropping another run", () => {
+		const cwd = createTemporaryProject();
+		const firstContext = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-CONCURRENT-1" });
+		const secondContext = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-CONCURRENT-2" });
+		const firstLogger = createAnsteelRuntimeLogger(cwd, firstContext);
+		const secondLogger = createAnsteelRuntimeLogger(cwd, secondContext);
+
+		firstLogger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-CONCURRENT-1",
+			message: "first interleaved write",
+			data: {},
+		});
+		secondLogger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-CONCURRENT-2",
+			message: "second interleaved write",
+			data: {},
+		});
+		firstLogger.write({
+			level: "info",
+			eventName: "task.progress",
+			outcome: "progress",
+			issueId: "ISSUE-CONCURRENT-1",
+			message: "first run continued",
+			data: {},
+		});
+		secondLogger.write({
+			level: "info",
+			eventName: "task.progress",
+			outcome: "progress",
+			issueId: "ISSUE-CONCURRENT-2",
+			message: "second run continued",
+			data: {},
+		});
+		firstLogger.close();
+		secondLogger.close();
+
+		expect(traceAnsteelTeamRuntime(cwd, "TASK-CONCURRENT-1").map((entry) => entry.runId)).toEqual([
+			firstContext.runId,
+		]);
+		expect(traceAnsteelTeamRuntime(cwd, "TASK-CONCURRENT-2").map((entry) => entry.runId)).toEqual([
+			secondContext.runId,
+		]);
+		expect(traceAnsteelTeamRuntime(cwd, "ISSUE-CONCURRENT-1").map((entry) => entry.runId)).toEqual([
+			firstContext.runId,
+		]);
+		expect(traceAnsteelTeamRuntime(cwd, "ISSUE-CONCURRENT-2").map((entry) => entry.runId)).toEqual([
+			secondContext.runId,
+		]);
+	});
+
+	it("rebuilds the historical run index across multiple durable log segments of the same run", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-SEGMENTED-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "task.started",
+			outcome: "started",
+			taskId: "TASK-SEGMENTED-1",
+			message: "first durable segment record",
+			data: {},
+		});
+		logger.write({
+			level: "info",
+			eventName: "task.progress",
+			outcome: "progress",
+			issueId: "ISSUE-SEGMENTED-1",
+			message: "second durable segment record",
+			data: {},
+		});
+		logger.close();
+
+		const firstSegmentPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const secondSegmentPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0002.jsonl`);
+		const lines = readFileSync(firstSegmentPath, "utf8").trim().split("\n");
+		expect(lines).toHaveLength(2);
+		writeFileSync(firstSegmentPath, `${lines[0]}\n`, "utf8");
+		writeFileSync(secondSegmentPath, `${lines[1]}\n`, "utf8");
+
+		const resumedLogger = createAnsteelRuntimeLogger(cwd, context);
+		resumedLogger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			toolCallId: "TOOL-SEGMENTED-1",
+			message: "continued in the last durable segment",
+			data: {},
+		});
+		resumedLogger.close();
+
+		expect(traceAnsteelTeamRuntime(cwd, "TASK-SEGMENTED-1").map((entry) => entry.sequence)).toEqual([1]);
+		expect(traceAnsteelTeamRuntime(cwd, "ISSUE-SEGMENTED-1").map((entry) => entry.sequence)).toEqual([2]);
+		expect(traceAnsteelTeamRuntime(cwd, "TOOL-SEGMENTED-1").map((entry) => entry.sequence)).toEqual([3]);
+		expect(readFileSync(secondSegmentPath, "utf8").trim().split("\n")).toHaveLength(2);
+		const persistedIndex = readFileSync(join(cwd, ".pi", "ansteel-team", "run-index.json"), "utf8");
+		expect(persistedIndex).toContain(`run-${context.runId}-0001.jsonl`);
+		expect(persistedIndex).toContain(`run-${context.runId}-0002.jsonl`);
+	});
+
+	it("rejects a runtime segment whose name is not covered by the historical index", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-UNINDEXED-SEGMENT-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "task.started",
+			outcome: "started",
+			taskId: "TASK-UNINDEXED-SEGMENT-1",
+			message: "indexed segment record",
+			data: {},
+		});
+		logger.write({
+			level: "info",
+			eventName: "task.progress",
+			outcome: "progress",
+			issueId: "ISSUE-UNINDEXED-SEGMENT-1",
+			message: "record moved outside the indexed segment namespace",
+			data: {},
+		});
+		logger.close();
+
+		const firstSegmentPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const unindexedSegmentPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-99999.jsonl`);
+		const lines = readFileSync(firstSegmentPath, "utf8").trim().split("\n");
+		writeFileSync(unindexedSegmentPath, `${lines.join("\n")}\n`, "utf8");
+		rmSync(firstSegmentPath, { force: true });
+		rmSync(join(cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
+
+		expect(() => traceAnsteelTeamRuntime(cwd, "ISSUE-UNINDEXED-SEGMENT-1")).toThrow(
+			expect.objectContaining({ reasonCode: "event-chain-invalid" }),
+		);
+	});
+
+	it("rejects an extra unindexed segment even while the trusted index still exists", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-EXTRA-SEGMENT-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "task.started",
+			outcome: "started",
+			taskId: "TASK-EXTRA-SEGMENT-1",
+			message: "first indexed record",
+			data: {},
+		});
+		logger.write({
+			level: "info",
+			eventName: "task.progress",
+			outcome: "progress",
+			issueId: "ISSUE-EXTRA-SEGMENT-1",
+			message: "record moved into an unindexed segment",
+			data: {},
+		});
+		logger.close();
+
+		const firstSegmentPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const unindexedSegmentPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-99999.jsonl`);
+		const lines = readFileSync(firstSegmentPath, "utf8").trim().split("\n");
+		writeFileSync(firstSegmentPath, `${lines[0]}\n`, "utf8");
+		writeFileSync(unindexedSegmentPath, `${lines[1]}\n`, "utf8");
+
+		expect(() => traceAnsteelTeamRuntime(cwd, "ISSUE-EXTRA-SEGMENT-1")).toThrow(
+			expect.objectContaining({ reasonCode: "event-chain-invalid" }),
+		);
+	});
+
+	it("rejects an invalid log chain instead of hiding history while rebuilding the historical run index", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-DAMAGED-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-DAMAGED-1",
+			message: "historical event before chain tampering",
+			data: {},
+		});
+		logger.close();
+		const logPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const damaged = JSON.parse(readFileSync(logPath, "utf8")) as Record<string, unknown>;
+		damaged.message = "tampered without rehashing";
+		writeFileSync(logPath, `${JSON.stringify(damaged)}\n`, "utf8");
+		rmSync(join(cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
+
+		expect(() => traceAnsteelTeamRuntime(cwd, "TASK-DAMAGED-1")).toThrow(
+			expect.objectContaining({ reasonCode: "event-chain-invalid" }),
+		);
+	});
+
+	it("rejects a valid-prefix truncation that removes the trusted historical run index head", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-history", command: "task TASK-TRUNCATED-1" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "info",
+			eventName: "task.started",
+			outcome: "started",
+			taskId: "TASK-TRUNCATED-1",
+			message: "trusted first record",
+			data: {},
+		});
+		logger.write({
+			level: "info",
+			eventName: "task.progress",
+			outcome: "progress",
+			issueId: "ISSUE-TRUNCATED-1",
+			message: "trusted chain head that will be removed",
+			data: {},
+		});
+		logger.close();
+		const logPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const firstLine = readFileSync(logPath, "utf8").trim().split("\n")[0]!;
+		writeFileSync(logPath, `${firstLine}\n`, "utf8");
+
+		expect(() => traceAnsteelTeamRuntime(cwd, "TASK-TRUNCATED-1")).toThrow(
+			expect.objectContaining({ reasonCode: "event-chain-invalid" }),
+		);
 	});
 
 	it("keeps a successful low-level runtime log without a root command span healthy", () => {

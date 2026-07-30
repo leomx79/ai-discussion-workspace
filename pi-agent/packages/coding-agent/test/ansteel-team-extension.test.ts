@@ -9,6 +9,7 @@ import {
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
 	diagnoseAnsteelTeamRun,
+	getAnsteelRuntimeLogDirectory,
 	listAnsteelRuntimeRuns,
 	readAnsteelRuntimeLogs,
 } from "../src/core/ansteel-team-observability.ts";
@@ -645,10 +646,48 @@ describe("Ansteel team extension", () => {
 		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "logs"), { force: true, recursive: true });
 
 		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
+		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
 		expect(harness.sendMessage).toHaveBeenLastCalledWith(
 			expect.objectContaining({ content: expect.stringContaining("Ansteel team command failed") }),
 			{ triggerTurn: false },
 		);
+	});
+
+	it("does not accept another team runtime as shared-board history", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		if (!state) throw new Error("Missing persisted Ansteel team state");
+
+		const unrelatedContext = createAnsteelRunContext({
+			teamId: "unrelated-team",
+			command: "task TASK-UNRELATED-BOARD-1",
+		});
+		const unrelatedLogger = createAnsteelRuntimeLogger(harness.ctx.cwd, unrelatedContext);
+		unrelatedLogger.write({
+			level: "info",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			taskId: "TASK-UNRELATED-BOARD-1",
+			message: "unrelated team tool fact",
+			data: {},
+		});
+		unrelatedLogger.close();
+
+		const currentTeamRunIds = listAnsteelRuntimeRuns(harness.ctx.cwd)
+			.filter((run) => run.teamId === state.id)
+			.map((run) => run.runId);
+		const logDirectory = getAnsteelRuntimeLogDirectory(harness.ctx.cwd);
+		for (const fileName of readdirSync(logDirectory)) {
+			if (currentTeamRunIds.some((runId) => fileName.startsWith(`run-${runId}-`))) {
+				rmSync(join(logDirectory, fileName), { force: true });
+			}
+		}
+		rmSync(join(harness.ctx.cwd, ".pi", "ansteel-team", "run-index.json"), { force: true });
+
+		await expect(command("board", harness.ctx)).rejects.toThrow("verifiable historical runtime run");
 	});
 
 	it("reports persistent status and disposes live sessions without deleting the team", async () => {
@@ -764,7 +803,7 @@ describe("Ansteel team extension", () => {
 		]);
 	});
 
-	it("finalizes and blocks an orphaned run before recovering an interrupted persisted team", async () => {
+	it("finalizes and blocks an orphaned run and records its public recovery audit before resuming", async () => {
 		const firstHost = setup();
 		const firstCommand = firstHost.commands.get("ansteel-team");
 		if (!firstCommand) throw new Error("Missing first-host ansteel-team command");
@@ -810,6 +849,25 @@ describe("Ansteel team extension", () => {
 				providerRequestId: "PROVIDER-RECOVERY-ORPHAN-1",
 			},
 		});
+		const recoveryEvents = listAnsteelTeamEvents(restartedHost.ctx.cwd).filter(
+			(event) => event.type === "runtime-recovery",
+		);
+		expect(recoveryEvents).toContainEqual(
+			expect.objectContaining({
+				type: "runtime-recovery",
+				role: "coordinator",
+				reasonCode: "process-orphaned",
+				payload: expect.objectContaining({
+					kind: "runtime-recovery",
+					runId: orphanContext.runId,
+					abandonedSpanCount: 1,
+					previousHeadHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+					recoveredHeadHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+					recoveredAt: expect.any(String),
+				}),
+			}),
+		);
+		expect(JSON.stringify(recoveryEvents)).not.toMatch(/stdout|authorization|api[_-]?key|secret/i);
 
 		await restartedCommand("start Review the parser", restartedHost.ctx);
 
@@ -819,7 +877,7 @@ describe("Ansteel team extension", () => {
 		);
 	});
 
-	it("does not recover a runtime run while its original host still owns the logger", async () => {
+	it("does not publish a successful recovery audit while the original host still owns the logger", async () => {
 		const firstHost = setup();
 		const firstCommand = firstHost.commands.get("ansteel-team");
 		if (!firstCommand) throw new Error("Missing first-host ansteel-team command");
@@ -846,6 +904,7 @@ describe("Ansteel team extension", () => {
 		expect(readAnsteelRuntimeLogs(firstHost.ctx.cwd, activeContext.runId).map((entry) => entry.outcome)).toEqual([
 			"started",
 		]);
+		expect(listAnsteelTeamEvents(firstHost.ctx.cwd).filter((event) => event.type === "runtime-recovery")).toEqual([]);
 
 		activeLogger.close();
 	});

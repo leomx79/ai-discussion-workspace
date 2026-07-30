@@ -42,7 +42,8 @@ export type AnsteelTeamEventType =
 	| "process-resolution"
 	| "process-resolution-review"
 	| "action-assessed"
-	| "action-review";
+	| "action-review"
+	| "runtime-recovery";
 
 export type AnsteelTeamEventActor = AnsteelRole | "coordinator";
 
@@ -176,7 +177,15 @@ export type AnsteelTeamPublicEventPayload =
 			review: NonNullable<AnsteelProcessResolution["review"]>;
 	  }
 	| { kind: "action-assessed"; assessment: AnsteelActionAssessment }
-	| { kind: "action-review"; review: AnsteelActionReview };
+	| { kind: "action-review"; review: AnsteelActionReview }
+	| {
+			kind: "runtime-recovery";
+			runId: string;
+			abandonedSpanCount: number;
+			previousHeadHash: string | null;
+			recoveredHeadHash: string;
+			recoveredAt: string;
+	  };
 
 export interface AnsteelTeamTask {
 	id: string;
@@ -335,6 +344,7 @@ export interface AnsteelTeamEventInput {
 	checkpointId?: string;
 	issueId?: string;
 	resolutionId?: string;
+	reasonCode?: "process-orphaned";
 	payload?: AnsteelTeamPublicEventPayload;
 	content: string;
 }
@@ -2294,7 +2304,8 @@ function isAnsteelPublicCollaborationEventType(type: AnsteelTeamEventType): bool
 		type === "process-resolution" ||
 		type === "process-resolution-review" ||
 		type === "action-assessed" ||
-		type === "action-review"
+		type === "action-review" ||
+		type === "runtime-recovery"
 	);
 }
 
@@ -2302,11 +2313,32 @@ function assertAnsteelTeamPublicEventEnvelope(event: AnsteelTeamEvent): void {
 	if (event.schemaVersion !== 2) {
 		throw new AnsteelTeamStateError("Ansteel team public collaboration events require schema version 2");
 	}
+	if (!isRecord(event.payload)) {
+		throw new AnsteelTeamStateError("Ansteel team public collaboration events require a structured payload");
+	}
+	if (event.type === "runtime-recovery") {
+		if (
+			event.role !== "coordinator" ||
+			event.reasonCode !== "process-orphaned" ||
+			event.payload.kind !== "runtime-recovery" ||
+			typeof event.payload.runId !== "string" ||
+			!/^RUN-[0-9a-f-]{36}$/i.test(event.payload.runId) ||
+			!Number.isSafeInteger(event.payload.abandonedSpanCount) ||
+			event.payload.abandonedSpanCount < 1 ||
+			typeof event.payload.recoveredAt !== "string" ||
+			Number.isNaN(Date.parse(event.payload.recoveredAt))
+		) {
+			throw new AnsteelTeamStateError("Ansteel team runtime-recovery event has an invalid payload");
+		}
+		assertLedgerHash(event.payload.previousHeadHash, "runtime recovery previous head hash", true);
+		assertLedgerHash(event.payload.recoveredHeadHash, "runtime recovery recovered head hash", false);
+		return;
+	}
 	if (event.role === "coordinator") {
 		throw new AnsteelTeamStateError("Ansteel team public collaboration events require a role actor");
 	}
-	if (!isRecord(event.payload)) {
-		throw new AnsteelTeamStateError("Ansteel team public collaboration events require a structured payload");
+	if (event.reasonCode !== undefined) {
+		throw new AnsteelTeamStateError("Ansteel team public collaboration events cannot claim a runtime reason code");
 	}
 	if (event.type === "work-checkpoint") {
 		assertCheckpointId(event.checkpointId);
@@ -2405,7 +2437,8 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "process-resolution" &&
 		event.type !== "process-resolution-review" &&
 		event.type !== "action-assessed" &&
-		event.type !== "action-review"
+		event.type !== "action-review" &&
+		event.type !== "runtime-recovery"
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
 	}
@@ -2414,8 +2447,10 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 	}
 	const isPublicCollaborationEvent = isAnsteelPublicCollaborationEventType(event.type);
 	if (event.role === "coordinator") {
-		if (event.type !== "task-assigned") {
-			throw new AnsteelTeamStateError("Ansteel team coordinator can only record task-assigned events");
+		if (event.type !== "task-assigned" && event.type !== "runtime-recovery") {
+			throw new AnsteelTeamStateError(
+				"Ansteel team coordinator can only record task-assigned or runtime-recovery events",
+			);
 		}
 	} else {
 		assertRole(event.role, "event role");
@@ -2444,6 +2479,7 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.checkpointId !== undefined ||
 		event.issueId !== undefined ||
 		event.resolutionId !== undefined ||
+		event.reasonCode !== undefined ||
 		event.payload !== undefined
 	) {
 		throw new AnsteelTeamStateError("Ansteel team schema version 2 is reserved for public collaboration events");
@@ -2458,6 +2494,7 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		...(event.checkpointId === undefined ? {} : { checkpointId: event.checkpointId }),
 		...(event.issueId === undefined ? {} : { issueId: event.issueId }),
 		...(event.resolutionId === undefined ? {} : { resolutionId: event.resolutionId }),
+		...(event.reasonCode === undefined ? {} : { reasonCode: event.reasonCode }),
 		...(event.payload === undefined ? {} : { payload: structuredClone(event.payload) }),
 		content: event.content,
 		createdAt: event.createdAt,
@@ -2475,6 +2512,29 @@ function parseAnsteelTeamEvent(value: unknown): AnsteelTeamEvent {
 }
 
 function hashAnsteelTeamEvent(event: Omit<AnsteelTeamEvent, "hash">): string {
+	if (event.schemaVersion === 2 && event.type === "runtime-recovery") {
+		return createHash("sha256")
+			.update(
+				JSON.stringify({
+					schemaVersion: event.schemaVersion,
+					sequence: event.sequence,
+					type: event.type,
+					role: event.role,
+					targetRole: event.targetRole ?? null,
+					challengeId: event.challengeId ?? null,
+					checkpointId: event.checkpointId ?? null,
+					issueId: event.issueId ?? null,
+					resolutionId: event.resolutionId ?? null,
+					reasonCode: event.reasonCode ?? null,
+					payload: event.payload ?? null,
+					content: event.content,
+					createdAt: event.createdAt,
+					previousHash: event.previousHash,
+				}),
+				"utf8",
+			)
+			.digest("hex");
+	}
 	if (event.schemaVersion === 2) {
 		return createHash("sha256")
 			.update(
@@ -2612,6 +2672,7 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 		return;
 	}
 	if (payload.kind === "action-assessed") return;
+	if (payload.kind === "runtime-recovery") return;
 	const issue = state.processIssues.find((item) => item.id === payload.issueId);
 	if (!issue) {
 		throw new AnsteelTeamStateError(`Ansteel team has no process issue ${payload.issueId}`);

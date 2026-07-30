@@ -1,5 +1,17 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, writeSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { type Span as OpenTelemetrySpan, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
@@ -12,6 +24,24 @@ import lockfile from "proper-lockfile";
 
 const ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS = 300_000;
 const ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS = 10_000;
+const ANSTEEL_RUNTIME_INDEX_LOCK_STALE_MS = 300_000;
+const ANSTEEL_RUNTIME_INDEX_LOCK_UPDATE_MS = 10_000;
+const ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION = 1;
+
+const ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS = [
+	"traceId",
+	"taskId",
+	"checkpointId",
+	"issueId",
+	"toolCallId",
+	"providerRequestId",
+	"processId",
+	"leaseId",
+	"causeEventId",
+	"eventName",
+] as const;
+
+type AnsteelRuntimeIndexSelectorField = (typeof ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS)[number];
 
 export const ANSTEEL_RUNTIME_REASON_CODES = [
 	"provider-timeout",
@@ -147,6 +177,51 @@ export interface AnsteelRuntimeLogger {
 	close(): void;
 }
 
+export interface AnsteelRuntimeRecoveryResult {
+	runId: string;
+	abandonedSpanCount: number;
+	previousHeadHash: string | null;
+	recoveredHeadHash: string | null;
+}
+
+interface AnsteelRuntimeIndexSegment {
+	fileName: string;
+	sha256: string;
+}
+
+interface AnsteelRuntimeIndexRun {
+	runId: string;
+	segments: AnsteelRuntimeIndexSegment[];
+	logChainHeadHash: string | null;
+}
+
+interface AnsteelRuntimeIndexUnsigned {
+	schemaVersion: typeof ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION;
+	runs: Record<string, AnsteelRuntimeIndexRun>;
+	associations: Record<string, string[]>;
+}
+
+interface AnsteelRuntimeIndex extends AnsteelRuntimeIndexUnsigned {
+	indexHash: string;
+}
+
+type AnsteelRuntimeIndexRebuildReason =
+	| "missing"
+	| "json-invalid"
+	| "schema-invalid"
+	| "hash-invalid"
+	| "log-state-mismatch";
+
+class AnsteelRuntimeIndexRebuildRequired extends Error {
+	readonly rebuildReason: AnsteelRuntimeIndexRebuildReason;
+
+	constructor(rebuildReason: AnsteelRuntimeIndexRebuildReason, message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "AnsteelRuntimeIndexRebuildRequired";
+		this.rebuildReason = rebuildReason;
+	}
+}
+
 export class AnsteelObservabilityError extends Error {
 	readonly reasonCode: AnsteelRuntimeReasonCode;
 
@@ -195,6 +270,10 @@ export function getAnsteelRuntimeLogDirectory(cwd: string): string {
 
 export function getAnsteelRuntimeArtifactDirectory(cwd: string): string {
 	return join(getAnsteelTeamRuntimeDirectory(cwd), "artifacts");
+}
+
+export function getAnsteelRuntimeIndexPath(cwd: string): string {
+	return join(getAnsteelTeamRuntimeDirectory(cwd), "run-index.json");
 }
 
 function assertRunId(runId: string): void {
@@ -300,10 +379,15 @@ export function readAnsteelRuntimeLogs(cwd: string, runId: string): AnsteelRunti
 	const directory = getAnsteelRuntimeLogDirectory(cwd);
 	if (!existsSync(directory)) return [];
 	const prefix = `run-${runId}-`;
-	const paths = readdirSync(directory)
-		.filter((name) => name.startsWith(prefix) && name.endsWith(".jsonl"))
-		.sort()
-		.map((name) => join(directory, name));
+	const candidateNames = readdirSync(directory).filter((name) => name.startsWith(prefix) && name.endsWith(".jsonl"));
+	const segmentNamePattern = new RegExp(`^run-${runId}-\\d{4}\\.jsonl$`, "i");
+	if (candidateNames.some((name) => !segmentNamePattern.test(name))) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime run ${runId} contains a log segment outside the indexed namespace`,
+		);
+	}
+	const paths = candidateNames.sort().map((name) => join(directory, name));
 	const entries: AnsteelRuntimeLogEntry[] = [];
 	let previousHash: string | null = null;
 	for (const path of paths) {
@@ -332,6 +416,499 @@ export function readAnsteelRuntimeLogs(cwd: string, runId: string): AnsteelRunti
 		}
 	}
 	return entries;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const actual = Object.keys(value).sort();
+	const expected = [...keys].sort();
+	return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function getRuntimeLogSegments(cwd: string): Map<string, string[]> {
+	const directory = getAnsteelRuntimeLogDirectory(cwd);
+	const segments = new Map<string, string[]>();
+	if (!existsSync(directory)) return segments;
+	for (const fileName of readdirSync(directory).sort()) {
+		const candidate = /^run-(RUN-[0-9a-f-]{36})-(.+)\.jsonl$/i.exec(fileName);
+		if (candidate?.[1] !== undefined && !/^\d{4}$/.test(candidate[2] ?? "")) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime run ${candidate[1]} contains a log segment outside the indexed namespace`,
+			);
+		}
+		const match = /^run-(RUN-[0-9a-f-]{36})-(\d{4})\.jsonl$/i.exec(fileName);
+		if (!match?.[1]) continue;
+		const path = join(directory, fileName);
+		// A logger creates its segment before the first record. Empty active
+		// segments are not historical runs and are indexed after their first fsync.
+		if (statSync(path).size === 0) continue;
+		const runSegments = segments.get(match[1]);
+		if (runSegments === undefined) segments.set(match[1], [fileName]);
+		else runSegments.push(fileName);
+	}
+	return segments;
+}
+
+function hashRuntimeIndexSelector(field: AnsteelRuntimeIndexSelectorField, value: string): string {
+	return createHash("sha256").update(`${field}\0${value}`, "utf8").digest("hex");
+}
+
+function getRuntimeEntrySelector(
+	entry: AnsteelRuntimeLogEntry,
+	field: AnsteelRuntimeIndexSelectorField,
+): string | undefined {
+	return field === "eventName" ? entry.eventName : entry[field];
+}
+
+function createRuntimeIndexRun(
+	cwd: string,
+	runId: string,
+	fileNames: readonly string[],
+): { run: AnsteelRuntimeIndexRun; entries: AnsteelRuntimeLogEntry[] } {
+	const entries = readAnsteelRuntimeLogs(cwd, runId);
+	if (entries.length === 0) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime run ${runId} has persisted segments without any valid records`,
+		);
+	}
+	const directory = getAnsteelRuntimeLogDirectory(cwd);
+	return {
+		run: {
+			runId,
+			segments: [...fileNames].sort().map((fileName) => ({
+				fileName,
+				sha256: createHash("sha256")
+					.update(readFileSync(join(directory, fileName)))
+					.digest("hex"),
+			})),
+			logChainHeadHash: entries.at(-1)?.hash ?? null,
+		},
+		entries,
+	};
+}
+
+function normalizeRuntimeIndexUnsigned(
+	runs: Record<string, AnsteelRuntimeIndexRun>,
+	associations: Record<string, string[]>,
+): AnsteelRuntimeIndexUnsigned {
+	const normalizedRuns: Record<string, AnsteelRuntimeIndexRun> = {};
+	for (const runId of Object.keys(runs).sort()) {
+		const run = runs[runId]!;
+		normalizedRuns[runId] = {
+			runId,
+			segments: [...run.segments]
+				.sort((left, right) => left.fileName.localeCompare(right.fileName))
+				.map((segment) => ({ fileName: segment.fileName, sha256: segment.sha256 })),
+			logChainHeadHash: run.logChainHeadHash,
+		};
+	}
+	const normalizedAssociations: Record<string, string[]> = {};
+	for (const selectorHash of Object.keys(associations).sort()) {
+		normalizedAssociations[selectorHash] = [...new Set(associations[selectorHash])].sort();
+	}
+	return {
+		schemaVersion: ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION,
+		runs: normalizedRuns,
+		associations: normalizedAssociations,
+	};
+}
+
+function signRuntimeIndex(unsigned: AnsteelRuntimeIndexUnsigned): AnsteelRuntimeIndex {
+	const normalized = normalizeRuntimeIndexUnsigned(unsigned.runs, unsigned.associations);
+	return {
+		...normalized,
+		indexHash: createHash("sha256").update(JSON.stringify(normalized), "utf8").digest("hex"),
+	};
+}
+
+function buildRuntimeIndex(cwd: string): AnsteelRuntimeIndex {
+	const runs: Record<string, AnsteelRuntimeIndexRun> = {};
+	const associationSets = new Map<string, Set<string>>();
+	for (const [runId, fileNames] of [...getRuntimeLogSegments(cwd).entries()].sort(([left], [right]) =>
+		left.localeCompare(right),
+	)) {
+		const indexedRun = createRuntimeIndexRun(cwd, runId, fileNames);
+		runs[runId] = indexedRun.run;
+		for (const entry of indexedRun.entries) {
+			for (const field of ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS) {
+				const value = getRuntimeEntrySelector(entry, field);
+				if (value === undefined) continue;
+				const selectorHash = hashRuntimeIndexSelector(field, value);
+				const runIds = associationSets.get(selectorHash);
+				if (runIds === undefined) associationSets.set(selectorHash, new Set([runId]));
+				else runIds.add(runId);
+			}
+		}
+	}
+	const associations = Object.fromEntries(
+		[...associationSets.entries()].map(([selectorHash, runIds]) => [selectorHash, [...runIds]]),
+	);
+	return signRuntimeIndex({
+		schemaVersion: ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION,
+		runs,
+		associations,
+	});
+}
+
+function parseRuntimeIndex(cwd: string): AnsteelRuntimeIndex {
+	const path = getAnsteelRuntimeIndexPath(cwd);
+	if (!existsSync(path)) {
+		throw new AnsteelRuntimeIndexRebuildRequired("missing", "Ansteel runtime index is missing");
+	}
+	let value: unknown;
+	try {
+		value = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		throw new AnsteelRuntimeIndexRebuildRequired("json-invalid", "Ansteel runtime index is not valid JSON", {
+			cause: error,
+		});
+	}
+	if (
+		!isRecord(value) ||
+		!hasExactKeys(value, ["schemaVersion", "runs", "associations", "indexHash"]) ||
+		value.schemaVersion !== ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION
+	) {
+		throw new AnsteelRuntimeIndexRebuildRequired("schema-invalid", "Ansteel runtime index has an unsupported schema");
+	}
+	if (
+		!isRecord(value.runs) ||
+		!isRecord(value.associations) ||
+		typeof value.indexHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(value.indexHash)
+	) {
+		throw new AnsteelRuntimeIndexRebuildRequired("schema-invalid", "Ansteel runtime index shape is invalid");
+	}
+	const runs: Record<string, AnsteelRuntimeIndexRun> = {};
+	for (const [runId, rawRun] of Object.entries(value.runs)) {
+		try {
+			assertRunId(runId);
+		} catch (error) {
+			throw new AnsteelRuntimeIndexRebuildRequired(
+				"schema-invalid",
+				"Ansteel runtime index contains an invalid run ID",
+				{ cause: error },
+			);
+		}
+		if (
+			!isRecord(rawRun) ||
+			!hasExactKeys(rawRun, ["runId", "segments", "logChainHeadHash"]) ||
+			rawRun.runId !== runId ||
+			!Array.isArray(rawRun.segments) ||
+			(rawRun.logChainHeadHash !== null &&
+				(typeof rawRun.logChainHeadHash !== "string" || !/^[0-9a-f]{64}$/.test(rawRun.logChainHeadHash)))
+		) {
+			throw new AnsteelRuntimeIndexRebuildRequired(
+				"schema-invalid",
+				"Ansteel runtime index contains an invalid run record",
+			);
+		}
+		const segments = rawRun.segments.map((rawSegment) => {
+			if (
+				!isRecord(rawSegment) ||
+				!hasExactKeys(rawSegment, ["fileName", "sha256"]) ||
+				typeof rawSegment.fileName !== "string" ||
+				!new RegExp(`^run-${runId}-\\d{4}\\.jsonl$`, "i").test(rawSegment.fileName) ||
+				typeof rawSegment.sha256 !== "string" ||
+				!/^[0-9a-f]{64}$/.test(rawSegment.sha256)
+			) {
+				throw new AnsteelRuntimeIndexRebuildRequired(
+					"schema-invalid",
+					"Ansteel runtime index contains an invalid segment record",
+				);
+			}
+			return { fileName: rawSegment.fileName, sha256: rawSegment.sha256 };
+		});
+		runs[runId] = {
+			runId,
+			segments,
+			logChainHeadHash: rawRun.logChainHeadHash as string | null,
+		};
+	}
+	const associations: Record<string, string[]> = {};
+	for (const [selectorHash, rawRunIds] of Object.entries(value.associations)) {
+		if (
+			!/^[0-9a-f]{64}$/.test(selectorHash) ||
+			!Array.isArray(rawRunIds) ||
+			rawRunIds.some((runId) => typeof runId !== "string" || runs[runId] === undefined)
+		) {
+			throw new AnsteelRuntimeIndexRebuildRequired(
+				"schema-invalid",
+				"Ansteel runtime index contains an invalid association",
+			);
+		}
+		associations[selectorHash] = rawRunIds as string[];
+	}
+	const signed = signRuntimeIndex({
+		schemaVersion: ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION,
+		runs,
+		associations,
+	});
+	if (signed.indexHash !== value.indexHash) {
+		throw new AnsteelRuntimeIndexRebuildRequired("hash-invalid", "Ansteel runtime index hash does not match");
+	}
+	return signed;
+}
+
+function writeRuntimeIndexAtomic(cwd: string, index: AnsteelRuntimeIndex): void {
+	const path = getAnsteelRuntimeIndexPath(cwd);
+	const directory = getAnsteelTeamRuntimeDirectory(cwd);
+	mkdirSync(directory, { recursive: true });
+	const temporaryPath = join(directory, `.run-index-${process.pid}-${randomUUID()}.tmp`);
+	try {
+		writeNewDurableFile(temporaryPath, `${JSON.stringify(index)}\n`);
+		renameSync(temporaryPath, path);
+	} catch (error) {
+		throw new AnsteelObservabilityError(
+			"event-fsync-failed",
+			"Ansteel runtime index could not be atomically replaced",
+			{ cause: error },
+		);
+	} finally {
+		if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+	}
+}
+
+interface PendingRuntimeIndexRebuildAudit {
+	runId: string;
+	traceId: string;
+	spanId: string;
+	rebuildReason: AnsteelRuntimeIndexRebuildReason;
+	rebuiltAt: string;
+	sourceRunCount: number;
+	startHash: string;
+}
+
+function startRuntimeIndexRebuildAudit(
+	cwd: string,
+	rebuildReason: AnsteelRuntimeIndexRebuildReason,
+	sourceRunCount: number,
+): PendingRuntimeIndexRebuildAudit {
+	const rebuiltAt = new Date().toISOString();
+	const runId = `RUN-${randomUUID()}`;
+	const traceId = randomBytes(16).toString("hex");
+	const spanId = randomBytes(8).toString("hex");
+	const unsigned = {
+		schemaVersion: 1 as const,
+		timestampUtc: rebuiltAt,
+		monotonicElapsedNs: "0",
+		sequence: 1,
+		level: "audit" as const,
+		eventName: "runtime-index-rebuilt",
+		outcome: "started" as const,
+		runId,
+		traceId,
+		spanId,
+		teamId: "ansteel-runtime-index",
+		role: "coordinator" as const,
+		message: "Ansteel runtime index rebuild started from verified runtime logs",
+		data: {
+			rebuildReason,
+			rebuiltAt,
+			sourceRunCount,
+		},
+		artifactRefs: [],
+		previousHash: null,
+	};
+	const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+	mkdirSync(getAnsteelRuntimeLogDirectory(cwd), { recursive: true });
+	try {
+		writeNewDurableFile(getAnsteelRuntimeLogPath(cwd, runId), `${JSON.stringify(entry)}\n`);
+	} catch (error) {
+		throw new AnsteelObservabilityError(
+			"event-fsync-failed",
+			"Ansteel runtime index rebuild audit could not be started",
+			{ cause: error },
+		);
+	}
+	return { runId, traceId, spanId, rebuildReason, rebuiltAt, sourceRunCount, startHash: entry.hash };
+}
+
+function completeRuntimeIndexRebuildAudit(
+	cwd: string,
+	audit: PendingRuntimeIndexRebuildAudit,
+	rebuiltIndexHash: string,
+): void {
+	const unsigned = {
+		schemaVersion: 1 as const,
+		timestampUtc: new Date().toISOString(),
+		monotonicElapsedNs: "0",
+		sequence: 2,
+		level: "audit" as const,
+		eventName: "runtime-index-rebuilt",
+		outcome: "succeeded" as const,
+		runId: audit.runId,
+		traceId: audit.traceId,
+		spanId: audit.spanId,
+		teamId: "ansteel-runtime-index",
+		role: "coordinator" as const,
+		message: "Ansteel runtime index was mechanically rebuilt from verified runtime logs",
+		data: {
+			rebuildReason: audit.rebuildReason,
+			rebuiltAt: audit.rebuiltAt,
+			sourceRunCount: audit.sourceRunCount,
+			rebuiltIndexHash,
+		},
+		artifactRefs: [],
+		previousHash: audit.startHash,
+	};
+	const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+	const path = getAnsteelRuntimeLogPath(cwd, audit.runId);
+	let fd: number | undefined;
+	try {
+		fd = openSync(path, "a");
+		writeBuffer(fd, Buffer.from(`${JSON.stringify(entry)}\n`, "utf8"));
+		fsyncSync(fd);
+	} catch (error) {
+		throw new AnsteelObservabilityError(
+			"event-fsync-failed",
+			"Ansteel runtime index rebuild audit could not be completed",
+			{ cause: error },
+		);
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+function assertRuntimeHistoryContainsIndexedHeads(cwd: string, index: AnsteelRuntimeIndex): void {
+	const actualSegments = getRuntimeLogSegments(cwd);
+	for (const run of Object.values(index.runs)) {
+		if (actualSegments.get(run.runId) === undefined) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`No verifiable historical runtime run exists because every indexed segment for ${run.runId} is missing`,
+			);
+		}
+		if (run.logChainHeadHash === null) continue;
+		const entries = readAnsteelRuntimeLogs(cwd, run.runId);
+		if (!entries.some((entry) => entry.hash === run.logChainHeadHash)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime history for ${run.runId} no longer contains its indexed chain head`,
+			);
+		}
+	}
+}
+
+function validateRuntimeIndexAgainstLogs(cwd: string, index: AnsteelRuntimeIndex): void {
+	const actual = buildRuntimeIndex(cwd);
+	if (actual.indexHash !== index.indexHash) {
+		assertRuntimeHistoryContainsIndexedHeads(cwd, index);
+		throw new AnsteelRuntimeIndexRebuildRequired(
+			"log-state-mismatch",
+			"Ansteel runtime index does not match the verified runtime logs",
+		);
+	}
+}
+
+function validateRuntimeIndexSegmentSet(cwd: string, index: AnsteelRuntimeIndex): void {
+	const actual = [...getRuntimeLogSegments(cwd).values()].flat().sort();
+	const indexed = Object.values(index.runs)
+		.flatMap((run) => run.segments.map((segment) => segment.fileName))
+		.sort();
+	if (JSON.stringify(actual) !== JSON.stringify(indexed)) {
+		assertRuntimeHistoryContainsIndexedHeads(cwd, index);
+		throw new AnsteelRuntimeIndexRebuildRequired(
+			"log-state-mismatch",
+			"Ansteel runtime log segment set does not match its index",
+		);
+	}
+	const directory = getAnsteelRuntimeLogDirectory(cwd);
+	for (const run of Object.values(index.runs)) {
+		for (const segment of run.segments) {
+			const actualHash = createHash("sha256")
+				.update(readFileSync(join(directory, segment.fileName)))
+				.digest("hex");
+			if (actualHash !== segment.sha256) {
+				assertRuntimeHistoryContainsIndexedHeads(cwd, index);
+				throw new AnsteelRuntimeIndexRebuildRequired(
+					"log-state-mismatch",
+					"Ansteel runtime log segment hash does not match its index",
+				);
+			}
+		}
+	}
+}
+
+function readOrRebuildRuntimeIndexLocked(cwd: string, fullValidation: boolean): AnsteelRuntimeIndex {
+	try {
+		const index = parseRuntimeIndex(cwd);
+		if (fullValidation) validateRuntimeIndexAgainstLogs(cwd, index);
+		else validateRuntimeIndexSegmentSet(cwd, index);
+		return index;
+	} catch (error) {
+		if (!(error instanceof AnsteelRuntimeIndexRebuildRequired)) throw error;
+		const rebuilt = buildRuntimeIndex(cwd);
+		if (error.rebuildReason === "missing" && Object.keys(rebuilt.runs).length === 0) {
+			writeRuntimeIndexAtomic(cwd, rebuilt);
+			return rebuilt;
+		}
+		const audit = startRuntimeIndexRebuildAudit(cwd, error.rebuildReason, Object.keys(rebuilt.runs).length);
+		const started = buildRuntimeIndex(cwd);
+		writeRuntimeIndexAtomic(cwd, started);
+		completeRuntimeIndexRebuildAudit(cwd, audit, started.indexHash);
+		const completed = buildRuntimeIndex(cwd);
+		writeRuntimeIndexAtomic(cwd, completed);
+		return completed;
+	}
+}
+
+function replaceRuntimeIndexRunLocked(cwd: string, index: AnsteelRuntimeIndex, runId: string): AnsteelRuntimeIndex {
+	const fileNames = getRuntimeLogSegments(cwd).get(runId);
+	if (fileNames === undefined) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime run ${runId} has no durable log segment after a write`,
+		);
+	}
+	const indexedRun = createRuntimeIndexRun(cwd, runId, fileNames);
+	const runs = { ...index.runs, [runId]: indexedRun.run };
+	const associations: Record<string, string[]> = {};
+	for (const [selectorHash, indexedRunIds] of Object.entries(index.associations)) {
+		const retainedRunIds = indexedRunIds.filter((indexedRunId) => indexedRunId !== runId);
+		if (retainedRunIds.length > 0) associations[selectorHash] = retainedRunIds;
+	}
+	for (const entry of indexedRun.entries) {
+		for (const field of ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS) {
+			const value = getRuntimeEntrySelector(entry, field);
+			if (value === undefined) continue;
+			const selectorHash = hashRuntimeIndexSelector(field, value);
+			const runIds = associations[selectorHash] ?? [];
+			if (!runIds.includes(runId)) runIds.push(runId);
+			associations[selectorHash] = runIds;
+		}
+	}
+	return signRuntimeIndex({
+		schemaVersion: ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION,
+		runs,
+		associations,
+	});
+}
+
+function withRuntimeIndexLock<T>(cwd: string, action: () => T): T {
+	const path = getAnsteelRuntimeIndexPath(cwd);
+	mkdirSync(getAnsteelTeamRuntimeDirectory(cwd), { recursive: true });
+	let releaseIndexLock: (() => void) | undefined;
+	try {
+		releaseIndexLock = lockfile.lockSync(path, {
+			realpath: false,
+			stale: ANSTEEL_RUNTIME_INDEX_LOCK_STALE_MS,
+			update: ANSTEEL_RUNTIME_INDEX_LOCK_UPDATE_MS,
+		});
+	} catch (error) {
+		throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime index lock could not be acquired", {
+			cause: error,
+		});
+	}
+	try {
+		return action();
+	} finally {
+		releaseIndexLock();
+	}
 }
 
 export interface AnsteelRuntimeDiagnosisIssue {
@@ -377,29 +954,28 @@ export interface AnsteelIncidentBundle {
 }
 
 export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] {
-	const directory = getAnsteelRuntimeLogDirectory(cwd);
-	if (!existsSync(directory)) return [];
-	const runIds = new Set<string>();
-	for (const name of readdirSync(directory)) {
-		const match = /^run-(RUN-[0-9a-f-]{36})-\d{4}\.jsonl$/i.exec(name);
-		if (match?.[1]) runIds.add(match[1]);
-	}
-	return [...runIds]
-		.map((runId) => {
-			const entries = readAnsteelRuntimeLogs(cwd, runId);
-			const first = entries[0];
-			const last = entries.at(-1);
-			return {
-				runId,
-				...(first?.traceId === undefined ? {} : { traceId: first.traceId }),
-				...(first?.teamId === undefined ? {} : { teamId: first.teamId }),
-				...(first?.timestampUtc === undefined ? {} : { startedAt: first.timestampUtc }),
-				...(last?.timestampUtc === undefined ? {} : { endedAt: last.timestampUtc }),
-				entryCount: entries.length,
-				...(last?.outcome === undefined ? {} : { lastOutcome: last.outcome }),
-			};
-		})
-		.sort((left, right) => (left.startedAt ?? "").localeCompare(right.startedAt ?? ""));
+	return withRuntimeIndexLock(cwd, () => {
+		const index = readOrRebuildRuntimeIndexLocked(cwd, true);
+		return Object.keys(index.runs)
+			.map((runId) => {
+				const entries = readAnsteelRuntimeLogs(cwd, runId);
+				const first = entries[0];
+				const last = entries.at(-1);
+				return {
+					runId,
+					...(first?.traceId === undefined ? {} : { traceId: first.traceId }),
+					...(first?.teamId === undefined ? {} : { teamId: first.teamId }),
+					...(first?.timestampUtc === undefined ? {} : { startedAt: first.timestampUtc }),
+					...(last?.timestampUtc === undefined ? {} : { endedAt: last.timestampUtc }),
+					entryCount: entries.length,
+					...(last?.outcome === undefined ? {} : { lastOutcome: last.outcome }),
+				};
+			})
+			.sort(
+				(left, right) =>
+					(left.startedAt ?? "").localeCompare(right.startedAt ?? "") || left.runId.localeCompare(right.runId),
+			);
+	});
 }
 
 export function traceAnsteelTeamRuntime(cwd: string, selector: string): AnsteelRuntimeLogEntry[] {
@@ -407,30 +983,39 @@ export function traceAnsteelTeamRuntime(cwd: string, selector: string): AnsteelR
 	if (normalized.length === 0) {
 		throw new AnsteelObservabilityError("unclassified-runtime-error", "Ansteel runtime trace selector is required");
 	}
-	const results: AnsteelRuntimeLogEntry[] = [];
-	for (const run of listAnsteelRuntimeRuns(cwd)) {
-		const entries = readAnsteelRuntimeLogs(cwd, run.runId);
-		if (run.runId === normalized || run.traceId === normalized) {
-			results.push(...entries);
-			continue;
+	return withRuntimeIndexLock(cwd, () => {
+		// The signed index and every referenced segment hash are verified first;
+		// only candidate runs are then parsed and chain-validated.
+		const index = readOrRebuildRuntimeIndexLocked(cwd, false);
+		const candidateRunIds = new Set<string>();
+		if (index.runs[normalized] !== undefined) candidateRunIds.add(normalized);
+		for (const field of ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS) {
+			for (const runId of index.associations[hashRuntimeIndexSelector(field, normalized)] ?? []) {
+				candidateRunIds.add(runId);
+			}
 		}
-		results.push(
-			...entries.filter(
-				(entry) =>
-					entry.taskId === normalized ||
-					entry.checkpointId === normalized ||
-					entry.issueId === normalized ||
-					entry.toolCallId === normalized ||
-					entry.providerRequestId === normalized ||
-					entry.processId === normalized ||
-					entry.leaseId === normalized ||
-					entry.causeEventId === normalized,
-			),
+		const results: AnsteelRuntimeLogEntry[] = [];
+		for (const runId of candidateRunIds) {
+			const entries = readAnsteelRuntimeLogs(cwd, runId);
+			if (runId === normalized || entries[0]?.traceId === normalized) {
+				results.push(...entries);
+				continue;
+			}
+			results.push(
+				...entries.filter((entry) =>
+					ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS.some(
+						(field) => getRuntimeEntrySelector(entry, field) === normalized,
+					),
+				),
+			);
+		}
+		return results.sort(
+			(left, right) =>
+				left.timestampUtc.localeCompare(right.timestampUtc) ||
+				left.runId.localeCompare(right.runId) ||
+				left.sequence - right.sequence,
 		);
-	}
-	return results.sort(
-		(left, right) => left.timestampUtc.localeCompare(right.timestampUtc) || left.sequence - right.sequence,
-	);
+	});
 }
 
 function getOrphanedRuntimeSpans(entries: readonly AnsteelRuntimeLogEntry[]): AnsteelRuntimeLogEntry[] {
@@ -455,9 +1040,17 @@ function getOrphanedRuntimeSpans(entries: readonly AnsteelRuntimeLogEntry[]): An
 	return [...openSpans.values()].flat();
 }
 
-export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string): Promise<number> {
+export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string): Promise<AnsteelRuntimeRecoveryResult> {
 	const observedEntries = readAnsteelRuntimeLogs(cwd, runId);
-	if (getOrphanedRuntimeSpans(observedEntries).length === 0) return 0;
+	const observedHeadHash = observedEntries.at(-1)?.hash ?? null;
+	if (getOrphanedRuntimeSpans(observedEntries).length === 0) {
+		return {
+			runId,
+			abandonedSpanCount: 0,
+			previousHeadHash: observedHeadHash,
+			recoveredHeadHash: observedHeadHash,
+		};
+	}
 	const first = observedEntries[0]!;
 	const logger = createAnsteelRuntimeLogger(cwd, {
 		runId,
@@ -467,14 +1060,26 @@ export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string):
 		startedAt: first.timestampUtc,
 	});
 	let abandonedSpanCount = 0;
+	let previousHeadHash = observedHeadHash;
+	let recoveredHeadHash = observedHeadHash;
 	try {
 		// The run lock is now held. Re-read the chain so recovery never appends
 		// from a stale sequence/hash snapshot.
-		const orphanedSpans = getOrphanedRuntimeSpans(readAnsteelRuntimeLogs(cwd, runId));
-		if (orphanedSpans.length === 0) return 0;
+		const lockedEntries = readAnsteelRuntimeLogs(cwd, runId);
+		previousHeadHash = lockedEntries.at(-1)?.hash ?? null;
+		const orphanedSpans = getOrphanedRuntimeSpans(lockedEntries);
+		if (orphanedSpans.length === 0) {
+			recoveredHeadHash = previousHeadHash;
+			return {
+				runId,
+				abandonedSpanCount: 0,
+				previousHeadHash,
+				recoveredHeadHash,
+			};
+		}
 		abandonedSpanCount = orphanedSpans.length;
 		for (const start of orphanedSpans) {
-			logger.write({
+			const recovered = logger.write({
 				level: "error",
 				eventName: start.eventName,
 				outcome: "abandoned",
@@ -499,12 +1104,18 @@ export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string):
 					recoveredFromEventHash: start.hash,
 				},
 			});
+			recoveredHeadHash = recovered.hash;
 		}
 		await logger.forceFlush();
 	} finally {
 		logger.close();
 	}
-	return abandonedSpanCount;
+	return {
+		runId,
+		abandonedSpanCount,
+		previousHeadHash,
+		recoveredHeadHash,
+	};
 }
 
 export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRuntimeDiagnosis {
@@ -677,10 +1288,10 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 	}
 	const directory = getAnsteelRuntimeLogDirectory(cwd);
 	mkdirSync(directory, { recursive: true });
-	const path = getAnsteelRuntimeLogPath(cwd, context.runId);
+	const runLockPath = getAnsteelRuntimeLogPath(cwd, context.runId);
 	let releaseRunLock: (() => void) | undefined;
 	try {
-		releaseRunLock = lockfile.lockSync(path, {
+		releaseRunLock = lockfile.lockSync(runLockPath, {
 			realpath: false,
 			stale: ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS,
 			update: ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS,
@@ -702,7 +1313,9 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 	let fd: number;
 	try {
 		existing = readAnsteelRuntimeLogs(cwd, context.runId);
-		fd = openSync(path, "a");
+		const lastSegment = getRuntimeLogSegments(cwd).get(context.runId)?.at(-1);
+		const appendPath = lastSegment === undefined ? runLockPath : join(directory, lastSegment);
+		fd = openSync(appendPath, "a");
 	} catch (error) {
 		releaseRunLock();
 		throw error;
@@ -737,16 +1350,25 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 			previousHash,
 		};
 		const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
-		try {
-			writeBuffer(fd, Buffer.from(`${JSON.stringify(entry)}\n`, "utf8"));
-			fsyncSync(fd);
-		} catch (error) {
-			throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime log could not be durably written", {
-				cause: error,
-			});
-		}
-		sequence++;
-		previousHash = entry.hash;
+		withRuntimeIndexLock(cwd, () => {
+			const index = readOrRebuildRuntimeIndexLocked(cwd, false);
+			try {
+				writeBuffer(fd, Buffer.from(`${JSON.stringify(entry)}\n`, "utf8"));
+				fsyncSync(fd);
+			} catch (error) {
+				throw new AnsteelObservabilityError(
+					"event-fsync-failed",
+					"Ansteel runtime log could not be durably written",
+					{ cause: error },
+				);
+			}
+			// The record is already durable. Advance the in-process chain even
+			// when the subsequent index replacement fails so a retry cannot
+			// duplicate its sequence or previousHash.
+			sequence++;
+			previousHash = entry.hash;
+			writeRuntimeIndexAtomic(cwd, replaceRuntimeIndexRunLocked(cwd, index, context.runId));
+		});
 		return entry;
 	};
 

@@ -1109,11 +1109,17 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		}
 		const context = createAnsteelRunContext({ teamId, command });
 		const logger = createAnsteelRuntimeLogger(cwd, context);
-		const root = logger.startSpan("run.started", {
-			role: "coordinator",
-			message: `Ansteel team command started: ${command}`,
-			data: { command },
-		});
+		let root: AnsteelRuntimeSpan;
+		try {
+			root = logger.startSpan("run.started", {
+				role: "coordinator",
+				message: `Ansteel team command started: ${command}`,
+				data: { command },
+			});
+		} catch (error) {
+			logger.close();
+			throw error;
+		}
 		const observation: ActiveAnsteelObservation = { logger, root };
 		activeObservations.set(cwd, observation);
 		try {
@@ -2141,7 +2147,37 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				if (orphanedRuns.length > 0) {
 					let abandonedSpanCount = 0;
 					for (const run of orphanedRuns) {
-						abandonedSpanCount += await abandonOrphanedAnsteelTeamRun(ctx.cwd, run.runId);
+						const recovery = await abandonOrphanedAnsteelTeamRun(ctx.cwd, run.runId);
+						abandonedSpanCount += recovery.abandonedSpanCount;
+						if (recovery.abandonedSpanCount > 0) {
+							if (recovery.recoveredHeadHash === null) {
+								throw new AnsteelObservabilityError(
+									"event-chain-invalid",
+									`Ansteel runtime recovery for ${recovery.runId} has no recovered chain head`,
+								);
+							}
+							const recoveredAt = new Date().toISOString();
+							appendAnsteelTeamEvent(
+								ctx.cwd,
+								state,
+								{
+									schemaVersion: 2,
+									type: "runtime-recovery",
+									role: "coordinator",
+									reasonCode: "process-orphaned",
+									payload: {
+										kind: "runtime-recovery",
+										runId: recovery.runId,
+										abandonedSpanCount: recovery.abandonedSpanCount,
+										previousHeadHash: recovery.previousHeadHash,
+										recoveredHeadHash: recovery.recoveredHeadHash,
+										recoveredAt,
+									},
+									content: `Coordinator recovered ${recovery.abandonedSpanCount} orphaned runtime span(s) from ${recovery.runId}.`,
+								},
+								getPersistenceContext(ctx.cwd),
+							);
+						}
 					}
 					throw new AnsteelObservabilityError(
 						"process-orphaned",
@@ -2281,7 +2317,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						await runObservedCommand(ctx.cwd, state.id, "board", async (logger) => {
 							const events = listAnsteelTeamEvents(ctx.cwd);
 							const runtimeEntries = listAnsteelRuntimeRuns(ctx.cwd)
-								.filter((run) => run.runId !== logger.context.runId)
+								.filter((run) => run.runId !== logger.context.runId && run.teamId === state.id)
 								.flatMap((run) => readAnsteelRuntimeLogs(ctx.cwd, run.runId));
 							if (runtimeEntries.length === 0) {
 								throw new Error("No verifiable historical runtime run exists for the shared board.");
@@ -2307,7 +2343,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								}
 								if (argument !== "--explain") throw new Error("Usage: /ansteel-team status [--explain]");
 								const latest = listAnsteelRuntimeRuns(ctx.cwd)
-									.filter((run) => run.runId !== logger.context.runId)
+									.filter(
+										(run) => run.runId !== logger.context.runId && run.teamId !== "ansteel-runtime-index",
+									)
 									.at(-1);
 								const explanation =
 									latest === undefined
@@ -2341,7 +2379,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								const runId =
 									argument ||
 									listAnsteelRuntimeRuns(ctx.cwd)
-										.filter((run) => run.runId !== logger.context.runId)
+										.filter(
+											(run) => run.runId !== logger.context.runId && run.teamId !== "ansteel-runtime-index",
+										)
 										.at(-1)?.runId;
 								if (!runId) throw new Error("No completed Ansteel runtime run exists to diagnose.");
 								const diagnosis = diagnoseAnsteelTeamRun(ctx.cwd, runId);
