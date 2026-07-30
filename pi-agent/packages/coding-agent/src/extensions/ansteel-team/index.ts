@@ -15,6 +15,9 @@ import {
 	loadAnsteelConfig,
 } from "../../core/ansteel-discussion.ts";
 import {
+	type AnsteelActionAssessment,
+	type AnsteelActionReview,
+	type AnsteelActionReviewInput,
 	type AnsteelProcessIssue,
 	type AnsteelProcessIssueInput,
 	type AnsteelProcessResolution,
@@ -33,19 +36,21 @@ import {
 	type AnsteelWorkCheckpoint,
 	type AnsteelWorkCheckpointInput,
 	appendAnsteelTeamEvent,
+	assessAnsteelTeamAction,
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamTaskProgressFingerprint,
-	getAnsteelTeamWriteBlockReason,
 	isAnsteelTeamGovernancePath,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
 	publishAnsteelWorkCheckpoint,
 	raiseAnsteelProcessIssue,
+	recordAnsteelTeamActionAssessment,
 	resolveAnsteelProcessIssue,
 	reviewAnsteelProcessResolution,
+	reviewAnsteelTeamAction,
 	reviewAnsteelTeamMilestone,
 	reviewAnsteelTeamTask,
 	runAnsteelTeamMilestoneTest,
@@ -96,12 +101,14 @@ const ANSTEEL_TEAM_TASK_TOOL_NAMES = [
 	"ansteel_raise_process_issue",
 	"ansteel_resolve_process_issue",
 	"ansteel_review_process_resolution",
+	"ansteel_review_action",
 ] as const;
 const ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS = [
 	"ansteel_publish_checkpoint",
 	"ansteel_raise_process_issue",
 	"ansteel_resolve_process_issue",
 	"ansteel_review_process_resolution",
+	"ansteel_review_action",
 ] as const;
 
 export interface AnsteelTeamTaskOperations {
@@ -122,6 +129,8 @@ export interface AnsteelTeamTaskOperations {
 		issueId: string,
 		input: AnsteelProcessResolutionReviewInput,
 	) => Promise<AnsteelProcessIssue>;
+	assessAction: (toolName: string, args: unknown) => Promise<AnsteelActionAssessment>;
+	reviewAction: (input: AnsteelActionReviewInput) => Promise<AnsteelActionReview>;
 }
 
 export interface AnsteelTeamRoleSession {
@@ -320,6 +329,7 @@ function buildRoleSystemPrompt(
 		"Responsibilities set your primary focus but never prevent you from questioning another role or proposing a better solution.",
 		"Do not expose private chain-of-thought. Public work reasoning is a concise engineering checkpoint with the goal, current understanding, evidence, assumptions, uncertainties, next action, expected result, risk, and confidence.",
 		"Use ansteel_publish_checkpoint when forming or changing a solution, before yellow or red actions, when a tool result is unexpected, when accepting or refuting a challenge, and before claiming acceptance evidence.",
+		"When the coordinator supplies an immutable action binding, use ansteel_review_action to approve or reject that exact checkpoint, action kind, target, and version. Never approve your own action or reuse an older approval.",
 		"Challenge a specific checkpoint with ansteel_raise_process_issue. Address the work and its evidence, never attack a role.",
 		"Resolve an issue with exactly ACCEPTED, REFUTED, EXPERIMENT_REQUIRED, or SCOPE_ESCALATION. Only the issue author may accept the resolution and close the issue.",
 		"Public prose cannot replace a structured checkpoint, issue, resolution, review, or tool event.",
@@ -355,6 +365,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 						Type.Literal("read"),
 						Type.Literal("experiment"),
 						Type.Literal("edit"),
+						Type.Literal("write"),
 						Type.Literal("test"),
 						Type.Literal("commit"),
 						Type.Literal("publish"),
@@ -377,6 +388,50 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 						},
 					],
 					details: { checkpointId: checkpoint.id, status: checkpoint.status },
+				};
+			},
+		}),
+		defineTool({
+			name: "ansteel_review_action",
+			label: "review governed action",
+			description:
+				"Approve or reject one exact checkpoint action binding. The checkpoint actor cannot review its own action.",
+			promptSnippet:
+				"Review the exact checkpoint, action kind, target, and version supplied by the coordinator; never reuse approval across actions.",
+			parameters: Type.Object({
+				checkpointId: Type.String(),
+				action: Type.Object({
+					kind: Type.Union([
+						Type.Literal("read"),
+						Type.Literal("experiment"),
+						Type.Literal("edit"),
+						Type.Literal("write"),
+						Type.Literal("test"),
+						Type.Literal("commit"),
+						Type.Literal("publish"),
+						Type.Literal("decision"),
+					]),
+					target: Type.String(),
+					version: Type.String(),
+				}),
+				verdict: Type.Union([Type.Literal("approve"), Type.Literal("reject")]),
+				reason: Type.String(),
+			}),
+			async execute(_toolCallId, input) {
+				const review = await taskOperations.reviewAction(input);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${review.reviewer} recorded ${review.verdict.toUpperCase()} for ${review.checkpointId} ${review.action.kind} ${review.action.target}.`,
+						},
+					],
+					details: {
+						checkpointId: review.checkpointId,
+						reviewer: review.reviewer,
+						verdict: review.verdict,
+						version: review.action.version,
+					},
 				};
 			},
 		}),
@@ -710,30 +765,24 @@ async function createDefaultRoleSession(
 		if (previousResult?.block) return previousResult;
 		const evidenceBlockReason = getAnsteelTeamEvidenceBlockReason(options.cwd, context.toolCall.name, context.args);
 		if (evidenceBlockReason !== undefined) return { block: true, reason: evidenceBlockReason };
-		if (context.toolCall.name === "edit" || context.toolCall.name === "write") {
-			const path =
-				typeof context.args === "object" && context.args !== null
-					? (context.args as { path?: unknown }).path
-					: undefined;
-			const reason = getAnsteelTeamWriteBlockReason(
-				options.cwd,
-				options.taskOperations.state,
-				options.role,
-				typeof path === "string" ? path : "",
-			);
-			return reason === undefined ? undefined : { block: true, reason };
-		}
 		if (context.toolCall.name === "bash") {
 			const reason = getReadOnlyBashBlockReason(context.args);
 			if (reason !== undefined) return { block: true, reason };
-			return consumeReadOnlyToolBudget();
 		}
 		if (
+			context.toolCall.name === "edit" ||
+			context.toolCall.name === "write" ||
+			context.toolCall.name === "bash" ||
 			context.toolCall.name === "read" ||
 			context.toolCall.name === "grep" ||
 			context.toolCall.name === "find" ||
 			context.toolCall.name === "ls"
 		) {
+			const assessment = await options.taskOperations.assessAction(context.toolCall.name, context.args);
+			if (assessment.blockReason !== undefined) {
+				return { block: true, reason: assessment.blockReason };
+			}
+			if (context.toolCall.name === "edit" || context.toolCall.name === "write") return undefined;
 			return consumeReadOnlyToolBudget();
 		}
 		return undefined;
@@ -797,6 +846,32 @@ function buildTaskReviewPrompt(
 		submission.diff,
 		"```",
 		"Return a concise public review update after recording the verdict with the tool.",
+	].join("\n\n");
+}
+
+function buildActionReviewPrompt(checkpoint: AnsteelWorkCheckpoint): string {
+	if (checkpoint.governedAction === null) {
+		throw new Error(`Ansteel team checkpoint ${checkpoint.id} has no governed action to review`);
+	}
+	const binding = {
+		checkpointId: checkpoint.id,
+		action: {
+			kind: checkpoint.governedAction.kind,
+			target: checkpoint.governedAction.target,
+			version: checkpoint.governedAction.version,
+		},
+		risk: checkpoint.governedAction.effectiveRisk,
+		evidenceRefs: checkpoint.evidenceRefs,
+	};
+	return [
+		"You are an independent peer reviewer for one immutable governed action binding.",
+		"Do not rely on another reviewer's response. Inspect the current project with read-only tools when needed.",
+		"Call ansteel_review_action exactly once with this exact binding. If you identify a blocking or critical concern, first call ansteel_raise_process_issue against this checkpoint, then reject the action.",
+		"Immutable binding:",
+		"```json",
+		JSON.stringify(binding),
+		"```",
+		"Public prose cannot approve, reject, or execute the action.",
 	].join("\n\n");
 }
 
@@ -1267,7 +1342,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 
 		const publishCollaborationTimeline = (
 			ctx: ExtensionCommandContext,
-			expectedType: "work-checkpoint" | "process-issue" | "process-resolution" | "process-resolution-review",
+			expectedType:
+				| "work-checkpoint"
+				| "process-issue"
+				| "process-resolution"
+				| "process-resolution-review"
+				| "action-assessed"
+				| "action-review",
 			content: string,
 		): void => {
 			const event = listAnsteelTeamEvents(ctx.cwd).at(-1);
@@ -1331,6 +1412,77 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							getPersistenceContext(ctx.cwd),
 						);
 						emitTimelineMessage(pi, `## ${reviewer} task review failure [${event.sequence}]\n\n${content}`);
+					}
+				}),
+			);
+		};
+
+		const requestPendingActionReviews = async (
+			activeTeam: ActiveAnsteelTeam,
+			ctx: ExtensionCommandContext,
+			task: AnsteelTeamTask,
+		): Promise<void> => {
+			const checkpoint = [...activeTeam.state.workCheckpoints]
+				.reverse()
+				.find(
+					(item) =>
+						item.taskId === task.id &&
+						item.actor === task.owner &&
+						item.status === "active" &&
+						item.governedAction !== null &&
+						(item.governedAction.effectiveRisk === "yellow" || item.governedAction.effectiveRisk === "red"),
+				);
+			if (!checkpoint?.governedAction) return;
+
+			const existingReviews = activeTeam.state.actionReviews.filter(
+				(review) =>
+					review.checkpointId === checkpoint.id &&
+					review.action.kind === checkpoint.governedAction!.kind &&
+					review.action.target === checkpoint.governedAction!.target &&
+					review.action.version === checkpoint.governedAction!.version,
+			);
+			if (existingReviews.some((review) => review.verdict === "reject")) return;
+			const reviewers = ANSTEEL_ROLES.filter(
+				(role) => role !== task.owner && !existingReviews.some((review) => review.reviewer === role),
+			);
+			if (reviewers.length === 0) return;
+			const prompt = buildActionReviewPrompt(checkpoint);
+
+			await Promise.all(
+				reviewers.map(async (reviewer) => {
+					const session = activeTeam.sessions.get(reviewer);
+					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
+					activeTeam.state.roles[reviewer].status = "working";
+					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					try {
+						const response = await promptObservedRole(
+							ctx.cwd,
+							reviewer,
+							session,
+							prompt,
+							activeTeam.stageTimeoutMs,
+							{ taskId: task.id, checkpointId: checkpoint.id },
+						);
+						activeTeam.state.roles[reviewer].status = "idle";
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{ type: "role-report", role: reviewer, content: response.trim() },
+							getPersistenceContext(ctx.cwd),
+						);
+						emitTimelineMessage(pi, `## ${reviewer} action review [${event.sequence}]\n\n${event.content}`);
+					} catch (error) {
+						activeTeam.state.roles[reviewer].status = "failed";
+						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						const content = error instanceof Error ? error.message : String(error);
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							activeTeam.state,
+							{ type: "role-failure", role: reviewer, content },
+							getPersistenceContext(ctx.cwd),
+						);
+						emitTimelineMessage(pi, `## ${reviewer} action review failure [${event.sequence}]\n\n${content}`);
 					}
 				}),
 			);
@@ -1401,6 +1553,52 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			allowedTaskOwners: readonly AnsteelRole[],
 		): AnsteelTeamTaskOperations => ({
 			state: activeTeam.state,
+			assessAction: async (toolName, args) => {
+				return await runObservedOperation(ctx.cwd, "action.assess", { role, data: { toolName } }, async () => {
+					const assessment = assessAnsteelTeamAction(ctx.cwd, activeTeam.state, role, { toolName, args });
+					recordAnsteelTeamActionAssessment(
+						ctx.cwd,
+						activeTeam.state,
+						role,
+						assessment,
+						getPersistenceContext(ctx.cwd),
+					);
+					publishCollaborationTimeline(
+						ctx,
+						"action-assessed",
+						`${assessment.action.effectiveRisk} ${assessment.action.kind} ${assessment.action.target} assessed for ${role}\n\nCheckpoint: ${assessment.checkpointId ?? "none"}\n\nResult: ${
+							assessment.blockReason === undefined ? "allowed" : `blocked: ${assessment.blockReason}`
+						}`,
+					);
+					return assessment;
+				});
+			},
+			reviewAction: async (input) => {
+				return await runObservedOperation(
+					ctx.cwd,
+					"action.review",
+					{
+						role,
+						checkpointId: input.checkpointId,
+						data: { verdict: input.verdict, actionKind: input.action.kind, target: input.action.target },
+					},
+					async () => {
+						const review = reviewAnsteelTeamAction(
+							ctx.cwd,
+							activeTeam.state,
+							role,
+							input,
+							getPersistenceContext(ctx.cwd),
+						);
+						publishCollaborationTimeline(
+							ctx,
+							"action-review",
+							`${review.reviewer} ${review.verdict.toUpperCase()} ${review.checkpointId}\n\nAction: ${review.action.kind} ${review.action.target}\n\nVersion: ${review.action.version}\n\nReason: ${review.reason}`,
+						);
+						return review;
+					},
+				);
+			},
 			publishCheckpoint: async (input) => {
 				return await runObservedOperation(
 					ctx.cwd,
@@ -1777,6 +1975,9 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					);
 				}
 
+				task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
+				if (task.status === "approved") return;
+				await requestPendingActionReviews(activeTeam, ctx, task);
 				task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 				if (task.status === "approved") return;
 				const after = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);

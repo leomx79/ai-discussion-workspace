@@ -234,6 +234,7 @@ describe("public collaboration state", () => {
 		["edit", { path: "src/parser.ts", edits: [] }, "yellow"],
 		["write", { path: "src/new.ts", content: "export {};\n" }, "yellow"],
 		["write", { path: "src/parser.ts", content: "export {};\n" }, "red"],
+		["bash", { command: "git status --short" }, "green"],
 		["bash", { command: "git commit -m governed" }, "red"],
 		["bash", { command: "git push origin main" }, "red"],
 	])("mechanically classifies %s as %s", (toolName, args, expectedRisk) => {

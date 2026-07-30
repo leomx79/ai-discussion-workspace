@@ -41,6 +41,7 @@ export type AnsteelTeamEventType =
 	| "process-issue"
 	| "process-resolution"
 	| "process-resolution-review"
+	| "action-assessed"
 	| "action-review";
 
 export type AnsteelTeamEventActor = AnsteelRole | "coordinator";
@@ -174,6 +175,7 @@ export type AnsteelTeamPublicEventPayload =
 			resolutionId: string;
 			review: NonNullable<AnsteelProcessResolution["review"]>;
 	  }
+	| { kind: "action-assessed"; assessment: AnsteelActionAssessment }
 	| { kind: "action-review"; review: AnsteelActionReview };
 
 export interface AnsteelTeamTask {
@@ -1180,13 +1182,22 @@ export function classifyAnsteelTeamActionRisk(
 		return existsSync(resolvePath(target, cwd)) ? "red" : "yellow";
 	}
 	if (toolName === "bash") {
-		const command = isRecord(action.args) && typeof action.args.command === "string" ? action.args.command : "";
+		const command =
+			isRecord(action.args) && typeof action.args.command === "string" ? action.args.command.trim() : "";
 		if (
 			/(?:^|[;&|]\s*|\s)(?:git\s+(?:commit|push|tag)|rm(?:\s|$)|del(?:\s|$)|remove-item(?:\s|$)|move-item(?:\s|$)|chmod(?:\s|$)|chown(?:\s|$)|npm\s+publish|(?:pnpm|yarn)\s+publish)(?:\s|$)/i.test(
 				command,
 			)
 		) {
 			return "red";
+		}
+		if (
+			!/[\r\n;&|><`$()]/.test(command) &&
+			/^(?:git (?:diff|status|log|show|rev-parse|ls-files)\b|rg\b|grep\b|find\b|ls\b|pwd$|cat\b|head\b|tail\b|sed -n\b)/.test(
+				command,
+			)
+		) {
+			return "green";
 		}
 		return "yellow";
 	}
@@ -1473,6 +1484,31 @@ export function assessAnsteelTeamAction(
 		requiredReviewers,
 		approvedReviewers,
 	};
+}
+
+export function recordAnsteelTeamActionAssessment(
+	cwd: string,
+	state: AnsteelTeamState,
+	actor: AnsteelRole,
+	assessment: AnsteelActionAssessment,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamEvent {
+	assertRole(actor, "action assessment actor");
+	return appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: "action-assessed",
+			role: actor,
+			...(assessment.checkpointId === undefined ? {} : { checkpointId: assessment.checkpointId }),
+			content: `Assessed ${assessment.action.effectiveRisk} action ${assessment.action.kind} ${assessment.action.target}: ${
+				assessment.blockReason === undefined ? "allowed" : "blocked"
+			}`,
+			payload: { kind: "action-assessed", assessment: structuredClone(assessment) },
+		},
+		persistence,
+	);
 }
 
 export function isAnsteelTeamGovernancePath(cwd: string, file: unknown): boolean {
@@ -2257,6 +2293,7 @@ function isAnsteelPublicCollaborationEventType(type: AnsteelTeamEventType): bool
 		type === "process-issue" ||
 		type === "process-resolution" ||
 		type === "process-resolution-review" ||
+		type === "action-assessed" ||
 		type === "action-review"
 	);
 }
@@ -2278,6 +2315,16 @@ function assertAnsteelTeamPublicEventEnvelope(event: AnsteelTeamEvent): void {
 		}
 		if (event.payload.checkpoint.id !== event.checkpointId || event.payload.checkpoint.actor !== event.role) {
 			throw new AnsteelTeamStateError("Ansteel team work-checkpoint event identity does not match its payload");
+		}
+		return;
+	}
+	if (event.type === "action-assessed") {
+		if (
+			event.payload.kind !== "action-assessed" ||
+			!isRecord(event.payload.assessment) ||
+			event.payload.assessment.checkpointId !== event.checkpointId
+		) {
+			throw new AnsteelTeamStateError("Ansteel team action-assessed event identity does not match its payload");
 		}
 		return;
 	}
@@ -2357,6 +2404,7 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "process-issue" &&
 		event.type !== "process-resolution" &&
 		event.type !== "process-resolution-review" &&
+		event.type !== "action-assessed" &&
 		event.type !== "action-review"
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
@@ -2563,6 +2611,7 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 		state.actionReviews.push(structuredClone(payload.review));
 		return;
 	}
+	if (payload.kind === "action-assessed") return;
 	const issue = state.processIssues.find((item) => item.id === payload.issueId);
 	if (!issue) {
 		throw new AnsteelTeamStateError(`Ansteel team has no process issue ${payload.issueId}`);

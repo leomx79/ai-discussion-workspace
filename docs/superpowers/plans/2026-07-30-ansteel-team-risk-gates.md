@@ -311,7 +311,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team.test.ts
 
 Expected: 全部 PASS；篡改 `action-review` 的 checkpoint、target、version 或 reviewer 后，加载或重放必须失败关闭。
 
-- [ ] **Step 6: 提交并推送核心门禁**
+- [x] **Step 6: 提交并推送核心门禁**
 
 ```powershell
 git add -- pi-agent/packages/coding-agent/src/core/ansteel-team.ts pi-agent/packages/coding-agent/test/ansteel-team.test.ts
@@ -326,7 +326,7 @@ git push origin main
 - Modify: `pi-agent/packages/coding-agent/src/extensions/ansteel-team/index.ts`
 - Test: `pi-agent/packages/coding-agent/test/ansteel-team-extension.test.ts`
 
-- [ ] **Step 1: 写扩展执行前 RED 测试**
+- [x] **Step 1: 写扩展执行前 RED 测试**
 
 导出并测试角色工具门禁入口 `getAnsteelTeamRoleToolBlockReason`，该函数是默认角色 session
 `beforeToolCall` 唯一调用的风险判定入口：
@@ -347,7 +347,7 @@ expect(
 - 工具执行失败不能生成成功动作结果；
 - host session 现有绕过阻断不回归。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 Run:
 
@@ -357,7 +357,7 @@ npx vitest --run --no-file-parallelism test/ansteel-team-extension.test.ts -t "r
 
 Expected: FAIL；当前 `beforeToolCall` 只调用 `getAnsteelTeamWriteBlockReason`。
 
-- [ ] **Step 3: 暴露 `ansteel_review_action`**
+- [x] **Step 3: 暴露 `ansteel_review_action`**
 
 给 `AnsteelTeamTaskOperations` 增加：
 
@@ -375,7 +375,7 @@ ansteel_review_action
 
 工具参数必须包含 `checkpointId`、`action.kind`、`action.target`、`action.version`、`verdict` 和 `reason`。核心函数校验这些值，工具层不得自动修正错误绑定。
 
-- [ ] **Step 4: 在 `beforeToolCall` 调用统一门禁**
+- [x] **Step 4: 在 `beforeToolCall` 调用统一门禁**
 
 把现有 `edit`/`write` 分支改为：
 
@@ -393,7 +393,7 @@ if (assessment.blockReason !== undefined) {
 
 `getAnsteelTeamWriteBlockReason` 的任务所有权和冻结 revision 规则不能删除；它作为机械评估的一部分继续执行。`read`/`grep`/`find`/`ls` 和只读 bash 也经过分类，但绿色无需同行确认。
 
-- [ ] **Step 5: 广播评估与动作结果**
+- [x] **Step 5: 广播评估与动作结果**
 
 工具开始前写 `action.assessed` 运行记录和 `action-assessed` 公共事件，包含 risk、checkpoint、target 和
 version；允许执行后由既有工具事件写 `action.started`/`action.result`。公开时间线只展示结构化摘要，
@@ -401,7 +401,7 @@ version；允许执行后由既有工具事件写 `action.started`/`action.resul
 
 被阻断动作写 `tool-policy-denied`，并携带 `traceId`、`checkpointId` 和稳定原因；不能只返回一段模型可改写文本。
 
-- [ ] **Step 6: 运行扩展 GREEN**
+- [x] **Step 6: 运行扩展 GREEN**
 
 Run:
 

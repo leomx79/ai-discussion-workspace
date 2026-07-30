@@ -1,4 +1,5 @@
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -95,6 +96,15 @@ export default function (pi) {
 		fauxAssistantMessage("Tech Lead completed independent investigation."),
 		fauxAssistantMessage("Tech Lead completed cross-examination."),
 		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_action", {
+				checkpointId: "CP-TASK-STAFF-EDIT-0001",
+				action: { kind: "edit", target: "src/staff.ts", version: "TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__" },
+				verdict: "approve",
+				reason: "The bounded Staff edit has a reproducible baseline and test target.",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Tech Lead approved the exact Staff edit action."),
+		fauxAssistantMessage([
 			fauxToolCall("ansteel_review_task", {
 				taskId: "TASK-STAFF",
 				verdict: "approve",
@@ -113,9 +123,33 @@ export default function (pi) {
 			fauxToolCall("read", { path: "package.json" }),
 		], { stopReason: "toolUse" }),
 		fauxAssistantMessage([
-			fauxToolCall("write", {
+			fauxToolCall("ansteel_publish_checkpoint", {
+				id: "CP-TASK-STAFF-EDIT-0001",
+				taskId: "TASK-STAFF",
+				goal: "Implement the Staff fixture",
+				currentUnderstanding: "The baseline intentionally exports NOT_IMPLEMENTED.",
+				assumptions: ["The governed file remains at the committed baseline"],
+				evidenceRefs: ["file:src/staff.ts", "test:staff.test.mjs"],
+				uncertainties: [],
+				nextAction: {
+					kind: "edit",
+					target: "src/staff.ts",
+					expectedResult: "The implementation marker satisfies the Staff test.",
+				},
+				risk: "yellow",
+				confidence: "L1",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("Staff published the governed edit checkpoint."),
+		fauxAssistantMessage([
+			fauxToolCall("edit", {
 				path: "src/staff.ts",
-				content: "export const staff = 'implemented';\\n",
+				edits: [
+					{
+						oldText: "export const staff = 'NOT_IMPLEMENTED';\\n",
+						newText: "export const staff = 'implemented';\\n",
+					},
+				],
 			}),
 		], { stopReason: "toolUse" }),
 		fauxAssistantMessage([
@@ -129,6 +163,15 @@ export default function (pi) {
 	register(pi, "deterministic-team-qa", "qa", [
 		fauxAssistantMessage("QA Engineer completed independent investigation."),
 		fauxAssistantMessage("QA Engineer completed cross-examination."),
+		fauxAssistantMessage([
+			fauxToolCall("ansteel_review_action", {
+				checkpointId: "CP-TASK-STAFF-EDIT-0001",
+				action: { kind: "edit", target: "src/staff.ts", version: "TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__" },
+				verdict: "approve",
+				reason: "The exact edit is testable and does not expand the governed scope.",
+			}),
+		], { stopReason: "toolUse" }),
+		fauxAssistantMessage("QA approved the exact Staff edit action."),
 		fauxAssistantMessage([
 			fauxToolCall("ansteel_review_task", {
 				taskId: "TASK-STAFF",
@@ -289,6 +332,131 @@ export default function (pi) {
 `;
 }
 
+type ActionGateFailureScenario = "missing-qa" | "stale-qa" | "blocking-issue" | "overwrite";
+
+function createDeterministicActionGateFailureExtension(scenario: ActionGateFailureScenario): string {
+	const exactAction =
+		'action: { kind: "edit", target: "src/staff.ts", version: "TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__" }';
+	const qaReview =
+		scenario === "missing-qa"
+			? `
+				fauxAssistantMessage("QA withheld the structured action confirmation."),
+				fauxAssistantMessage("QA still has not recorded an action confirmation.")
+			`
+			: scenario === "stale-qa"
+				? `
+					fauxAssistantMessage([
+						fauxToolCall("ansteel_review_action", {
+							checkpointId: "CP-ACTION-GATE-FAIL-0001",
+							action: {
+								kind: "edit",
+								target: "src/staff.ts",
+								version: "TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__-stale",
+							},
+							verdict: "approve",
+							reason: "This stale binding must not authorize the edit.",
+						}),
+					], { stopReason: "toolUse" }),
+					fauxAssistantMessage("QA claimed the stale approval was sufficient."),
+					fauxAssistantMessage("QA did not replace the stale approval.")
+				`
+				: scenario === "blocking-issue"
+					? `
+						fauxAssistantMessage([
+							fauxToolCall("ansteel_review_action", {
+								checkpointId: "CP-ACTION-GATE-FAIL-0001",
+								${exactAction},
+								verdict: "approve",
+								reason: "The exact edit binding is reproducible.",
+							}),
+						], { stopReason: "toolUse" }),
+						fauxAssistantMessage([
+							fauxToolCall("ansteel_raise_process_issue", {
+								id: "PI-ACTION-GATE-BLOCK-0001",
+								targetCheckpointId: "CP-ACTION-GATE-FAIL-0001",
+								severity: "blocking",
+								claim: "The acceptance evidence omits the compatibility boundary.",
+								evidenceRefs: ["test:compatibility-missing"],
+								suggestedCorrection: "Add the missing compatibility case before editing.",
+							}),
+						], { stopReason: "toolUse" }),
+						fauxAssistantMessage("QA recorded the blocking issue after reviewing the exact binding.")
+					`
+					: `
+						fauxAssistantMessage([
+							fauxToolCall("ansteel_review_action", {
+								checkpointId: "CP-ACTION-GATE-FAIL-0001",
+								${exactAction},
+								verdict: "approve",
+								reason: "The yellow edit binding is reproducible.",
+							}),
+						], { stopReason: "toolUse" }),
+						fauxAssistantMessage("QA approved only the exact yellow edit binding.")
+					`;
+	const ownerAction =
+		scenario === "overwrite"
+			? `
+				fauxToolCall("write", {
+					path: "src/staff.ts",
+					content: "export const staff = 'implemented';\\n",
+				})
+			`
+			: `
+				fauxToolCall("edit", {
+					path: "src/staff.ts",
+					edits: [{
+						oldText: "export const staff = 'NOT_IMPLEMENTED';\\n",
+						newText: "export const staff = 'implemented';\\n",
+					}],
+				})
+			`;
+	return createDeterministicFailureProviderExtension({
+		techLead: `
+			fauxAssistantMessage("Tech Lead completed independent investigation."),
+			fauxAssistantMessage("Tech Lead completed cross-examination."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_review_action", {
+					checkpointId: "CP-ACTION-GATE-FAIL-0001",
+					${exactAction},
+					verdict: "approve",
+					reason: "The exact edit stays inside the assigned file.",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Tech Lead approved the exact edit binding.")
+		`,
+		staffEngineer: `
+			fauxAssistantMessage("Staff completed independent investigation."),
+			fauxAssistantMessage("Staff completed cross-examination."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_publish_checkpoint", {
+					id: "CP-ACTION-GATE-FAIL-0001",
+					taskId: "TASK-STAFF",
+					goal: "Exercise the real RPC action gate",
+					currentUnderstanding: "The tracked file is still at the committed baseline.",
+					assumptions: ["Only the exact yellow edit has been proposed"],
+					evidenceRefs: ["file:src/staff.ts", "test:staff.test.mjs"],
+					uncertainties: [],
+					nextAction: {
+						kind: "edit",
+						target: "src/staff.ts",
+						expectedResult: "The implementation marker changes.",
+					},
+					risk: "yellow",
+					confidence: "L1",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Staff published the yellow edit checkpoint."),
+			fauxAssistantMessage([${ownerAction}], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Staff claimed the file was implemented despite the blocked tool call.")
+		`,
+		qaEngineer: `
+			fauxAssistantMessage("QA completed independent investigation."),
+			fauxAssistantMessage("QA completed cross-examination."),
+			${qaReview}
+		`,
+	});
+}
+
 const DETERMINISTIC_TASK_OWNER_COLLABORATION_FAILURE_EXTENSION = createDeterministicFailureProviderExtension({
 	techLead: `
 		fauxAssistantMessage("Tech Lead completed independent investigation."),
@@ -367,7 +535,18 @@ const DETERMINISTIC_TASK_REVIEW_COLLABORATION_FAILURE_EXTENSION = createDetermin
 		fauxAssistantMessage("Staff completed independent investigation."),
 		fauxAssistantMessage("Staff completed cross-examination."),
 		fauxAssistantMessage([
-			fauxToolCall("write", { path: "src/staff.ts", content: "export const staff = 'implemented';\\n" }),
+			fauxToolCall("ansteel_publish_checkpoint", {
+				id: "CP-TASK-REVIEW-FAIL-0001",
+				taskId: "TASK-STAFF",
+				goal: "Exercise peer process issue failure propagation",
+				currentUnderstanding: "The baseline requires one bounded edit.",
+				assumptions: [],
+				evidenceRefs: ["file:src/staff.ts"],
+				uncertainties: [],
+				nextAction: { kind: "edit", target: "src/staff.ts", expectedResult: "The Staff test passes" },
+				risk: "yellow",
+				confidence: "L1",
+			}),
 		], { stopReason: "toolUse" }),
 		fauxAssistantMessage([
 			fauxToolCall("ansteel_submit_change", {
@@ -392,6 +571,15 @@ const DETERMINISTIC_MILESTONE_REVIEW_COLLABORATION_FAILURE_EXTENSION = createDet
 			fauxAssistantMessage("Tech Lead completed independent investigation."),
 			fauxAssistantMessage("Tech Lead completed cross-examination."),
 			fauxAssistantMessage([
+				fauxToolCall("ansteel_review_action", {
+					checkpointId: "CP-MILESTONE-TASK-0001",
+					action: { kind: "edit", target: "src/staff.ts", version: "TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__" },
+					verdict: "approve",
+					reason: "The bounded task edit is ready for delivery review.",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Tech Lead approved the task action."),
+			fauxAssistantMessage([
 				fauxToolCall("ansteel_review_task", { taskId: "TASK-STAFF", verdict: "approve" }),
 			], { stopReason: "toolUse" }),
 			fauxAssistantMessage("Tech Lead approved TASK-STAFF."),
@@ -415,7 +603,25 @@ const DETERMINISTIC_MILESTONE_REVIEW_COLLABORATION_FAILURE_EXTENSION = createDet
 			fauxAssistantMessage("Staff completed independent investigation."),
 			fauxAssistantMessage("Staff completed cross-examination."),
 			fauxAssistantMessage([
-				fauxToolCall("write", { path: "src/staff.ts", content: "export const staff = 'implemented';\\n" }),
+				fauxToolCall("ansteel_publish_checkpoint", {
+					id: "CP-MILESTONE-TASK-0001",
+					taskId: "TASK-STAFF",
+					goal: "Prepare milestone input",
+					currentUnderstanding: "The baseline requires one bounded edit.",
+					assumptions: [],
+					evidenceRefs: ["file:src/staff.ts"],
+					uncertainties: [],
+					nextAction: { kind: "edit", target: "src/staff.ts", expectedResult: "The Staff test passes" },
+					risk: "yellow",
+					confidence: "L1",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Staff published the milestone task action."),
+			fauxAssistantMessage([
+				fauxToolCall("edit", {
+					path: "src/staff.ts",
+					edits: [{ oldText: "export const staff = 'NOT_IMPLEMENTED';\\n", newText: "export const staff = 'implemented';\\n" }],
+				}),
 			], { stopReason: "toolUse" }),
 			fauxAssistantMessage([
 				fauxToolCall("ansteel_submit_change", {
@@ -440,6 +646,15 @@ const DETERMINISTIC_MILESTONE_REVIEW_COLLABORATION_FAILURE_EXTENSION = createDet
 	qaEngineer: `
 			fauxAssistantMessage("QA completed independent investigation."),
 			fauxAssistantMessage("QA completed cross-examination."),
+			fauxAssistantMessage([
+				fauxToolCall("ansteel_review_action", {
+					checkpointId: "CP-MILESTONE-TASK-0001",
+					action: { kind: "edit", target: "src/staff.ts", version: "TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__" },
+					verdict: "approve",
+					reason: "The bounded task edit is testable.",
+				}),
+			], { stopReason: "toolUse" }),
+			fauxAssistantMessage("QA approved the task action."),
 			fauxAssistantMessage([
 				fauxToolCall("ansteel_review_task", { taskId: "TASK-STAFF", verdict: "approve" }),
 			], { stopReason: "toolUse" }),
@@ -539,6 +754,15 @@ function initializeTaskDeliveryProject(projectDir: string): void {
 	execFileSync("git", ["config", "user.name", "Ansteel Test"], { cwd: projectDir, stdio: "ignore" });
 	execFileSync("git", ["add", "src/staff.ts", "test/staff.test.mjs"], { cwd: projectDir, stdio: "ignore" });
 	execFileSync("git", ["commit", "-m", "baseline"], { cwd: projectDir, stdio: "ignore" });
+	const baselineVersion = `TASK-STAFF@0;src/staff.ts@sha256:${createHash("sha256")
+		.update(readFileSync(join(projectDir, "src", "staff.ts")))
+		.digest("hex")}`;
+	const providerPath = join(projectDir, ".pi", "extensions", "deterministic-team-provider.ts");
+	writeFileSync(
+		providerPath,
+		readFileSync(providerPath, "utf8").replaceAll("TASK-STAFF@0;git-head:__TASK_STAFF_HEAD__", baselineVersion),
+		"utf8",
+	);
 }
 
 function startRpcCli(projectDir: string, agentDir: string): RpcCliProcess {
@@ -729,6 +953,12 @@ describe("Ansteel team CLI", () => {
 			const teamDirectory = join(projectDir, ".pi", "ansteel-team");
 			const state = JSON.parse(readFileSync(join(teamDirectory, "team.json"), "utf8")) as {
 				roles: { "staff-engineer": { sessionFile: string } };
+				actionReviews: Array<{
+					checkpointId: string;
+					reviewer: string;
+					verdict: string;
+					action: { kind: string; target: string; version: string };
+				}>;
 				tasks: Array<{
 					id: string;
 					owner: string;
@@ -741,7 +971,9 @@ describe("Ansteel team CLI", () => {
 			const events = readFileSync(join(teamDirectory, "events.jsonl"), "utf8")
 				.trim()
 				.split("\n")
-				.map((line) => JSON.parse(line) as { type: string; role: string; targetRole?: string });
+				.map(
+					(line) => JSON.parse(line) as { type: string; role: string; targetRole?: string; checkpointId?: string },
+				);
 			expect(state.tasks).toEqual([
 				expect.objectContaining({
 					id: "TASK-STAFF",
@@ -775,6 +1007,44 @@ describe("Ansteel team CLI", () => {
 					expect.objectContaining({ type: "task-review", role: "qa-engineer" }),
 				]),
 			);
+			expect(state.actionReviews).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						checkpointId: "CP-TASK-STAFF-EDIT-0001",
+						reviewer: "tech-lead",
+						verdict: "approve",
+						action: {
+							kind: "edit",
+							target: "src/staff.ts",
+							version: `TASK-STAFF@0;src/staff.ts@sha256:${createHash("sha256")
+								.update("export const staff = 'NOT_IMPLEMENTED';\n")
+								.digest("hex")}`,
+						},
+					}),
+					expect.objectContaining({
+						checkpointId: "CP-TASK-STAFF-EDIT-0001",
+						reviewer: "qa-engineer",
+						verdict: "approve",
+						action: {
+							kind: "edit",
+							target: "src/staff.ts",
+							version: `TASK-STAFF@0;src/staff.ts@sha256:${createHash("sha256")
+								.update("export const staff = 'NOT_IMPLEMENTED';\n")
+								.digest("hex")}`,
+						},
+					}),
+				]),
+			);
+			const assessedIndex = events.findIndex(
+				(event) => event.type === "action-assessed" && event.checkpointId === "CP-TASK-STAFF-EDIT-0001",
+			);
+			const reviewIndex = events.findIndex(
+				(event) => event.type === "action-review" && event.checkpointId === "CP-TASK-STAFF-EDIT-0001",
+			);
+			const submissionIndex = events.findIndex((event) => event.type === "task-submitted");
+			expect(assessedIndex).toBeGreaterThanOrEqual(0);
+			expect(assessedIndex).toBeGreaterThan(reviewIndex);
+			expect(submissionIndex).toBeGreaterThan(assessedIndex);
 			expect(readFileSync(join(projectDir, "src", "staff.ts"), "utf8")).toContain("implemented");
 			expect(readFileSync(state.roles["staff-engineer"].sessionFile, "utf8")).toContain(
 				"read-only tool budget exhausted after 4 calls",
@@ -783,6 +1053,138 @@ describe("Ansteel team CLI", () => {
 			await rpc.stop();
 		}
 	}, 30_000);
+
+	it.each([
+		{
+			name: "one peer action confirmation is missing",
+			scenario: "missing-qa" as const,
+			expectedReviewers: ["tech-lead"],
+			expectedComputedRisk: "yellow",
+			expectedBlockReason: "qa-engineer",
+			expectedOpenIssues: 0,
+			expectedRpcSuccess: true,
+		},
+		{
+			name: "a stale checkpoint version is reused",
+			scenario: "stale-qa" as const,
+			expectedReviewers: ["tech-lead"],
+			expectedComputedRisk: "yellow",
+			expectedBlockReason: "qa-engineer",
+			expectedOpenIssues: 0,
+			expectedRpcSuccess: false,
+		},
+		{
+			name: "two approvals coexist with an open blocking issue",
+			scenario: "blocking-issue" as const,
+			expectedReviewers: ["tech-lead", "qa-engineer"],
+			expectedComputedRisk: "yellow",
+			expectedBlockReason: "blocking process issue",
+			expectedOpenIssues: 1,
+			expectedRpcSuccess: true,
+		},
+		{
+			name: "yellow edit confirmations are reused for an existing-file overwrite",
+			scenario: "overwrite" as const,
+			expectedReviewers: ["tech-lead", "qa-engineer"],
+			expectedComputedRisk: "red",
+			expectedBlockReason: "active checkpoint with the exact action binding",
+			expectedOpenIssues: 0,
+			expectedRpcSuccess: true,
+		},
+	])(
+		"keeps the real RPC action confirmation gate closed when $name",
+		async (testCase) => {
+			const { agentDir, projectDir } = createTemporaryProject(
+				createDeterministicActionGateFailureExtension(testCase.scenario),
+			);
+			initializeTaskDeliveryProject(projectDir);
+			const rpc = startRpcCli(projectDir, agentDir);
+			try {
+				const commands = await rpc.send({ id: "commands", type: "get_commands" });
+				const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+					command.name.startsWith("ansteel-team"),
+				)?.name;
+				expect(teamCommand).toBeDefined();
+				expect(
+					await rpc.send({
+						id: "start",
+						type: "prompt",
+						message: `/${teamCommand} start Exercise the ${testCase.scenario} action gate`,
+					}),
+				).toMatchObject({ success: true, command: "prompt" });
+
+				const taskResponse = await rpc.send({
+					id: "task",
+					type: "prompt",
+					message: `/${teamCommand} task {"id":"TASK-STAFF","owner":"staff-engineer","files":["src/staff.ts"],"description":"Exercise the real RPC action gate","acceptanceCriteria":"A blocked action cannot change the tracked file","dependsOn":[]}`,
+				});
+				expect(taskResponse).toMatchObject({
+					success: testCase.expectedRpcSuccess,
+					command: "prompt",
+				});
+				if (!testCase.expectedRpcSuccess) {
+					expect(taskResponse.error).toContain("ansteel_review_action");
+				}
+
+				const teamDirectory = join(projectDir, ".pi", "ansteel-team");
+				const state = JSON.parse(readFileSync(join(teamDirectory, "team.json"), "utf8")) as {
+					actionReviews: Array<{ reviewer: string; verdict: string }>;
+					processIssues: Array<{ status: string; severity: string }>;
+					tasks: Array<{ id: string; status: string; submissions: unknown[] }>;
+				};
+				const events = readFileSync(join(teamDirectory, "events.jsonl"), "utf8")
+					.trim()
+					.split("\n")
+					.map(
+						(line) =>
+							JSON.parse(line) as {
+								type: string;
+								content: string;
+								payload?: {
+									kind?: string;
+									assessment?: {
+										action?: { computedRisk?: string };
+										blockReason?: string;
+									};
+								};
+							},
+					);
+				const blockedAssessment = events.find(
+					(event) =>
+						event.type === "action-assessed" &&
+						event.payload?.kind === "action-assessed" &&
+						event.payload.assessment?.blockReason !== undefined,
+				);
+
+				expect(readFileSync(join(projectDir, "src", "staff.ts"), "utf8")).toBe(
+					"export const staff = 'NOT_IMPLEMENTED';\n",
+				);
+				expect(state.tasks).toEqual([
+					expect.objectContaining({ id: "TASK-STAFF", status: "claimed", submissions: [] }),
+				]);
+				expect(state.actionReviews.map((review) => review.reviewer).sort()).toEqual(
+					[...testCase.expectedReviewers].sort(),
+				);
+				expect(state.actionReviews.every((review) => review.verdict === "approve")).toBe(true);
+				expect(state.processIssues.filter((issue) => issue.status !== "closed")).toHaveLength(
+					testCase.expectedOpenIssues,
+				);
+				expect(blockedAssessment?.payload?.assessment).toMatchObject({
+					action: { computedRisk: testCase.expectedComputedRisk },
+					blockReason: expect.stringContaining(testCase.expectedBlockReason),
+				});
+				expect(events).toContainEqual(
+					expect.objectContaining({
+						type: "role-report",
+						content: expect.stringContaining("claimed the file was implemented despite the blocked tool call"),
+					}),
+				);
+			} finally {
+				await rpc.stop();
+			}
+		},
+		30_000,
+	);
 
 	it("fails a task RPC when the owner public checkpoint mutation is rejected", async () => {
 		const { agentDir, projectDir } = createTemporaryProject(DETERMINISTIC_TASK_OWNER_COLLABORATION_FAILURE_EXTENSION);

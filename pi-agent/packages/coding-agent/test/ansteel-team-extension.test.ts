@@ -285,6 +285,78 @@ describe("Ansteel team extension", () => {
 		).toMatchObject({ issueId: "PI-TOOLS-0001", role: "qa-engineer" });
 	});
 
+	it("records mechanical action assessments and exposes exact peer action reviews", async () => {
+		const harness = setup();
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const staff = harness.roleSessionOptions.find((entry) => entry.role === "staff-engineer");
+		const techLead = harness.roleSessionOptions.find((entry) => entry.role === "tech-lead");
+		const qa = harness.roleSessionOptions.find((entry) => entry.role === "qa-engineer");
+		if (!staff || !techLead || !qa) throw new Error("Missing role operations");
+		await staff.taskOperations.claimTask({
+			id: "TASK-ACTION-GATE",
+			files: ["src/parser.ts"],
+			description: "Change the governed parser.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+
+		const withoutCheckpoint = await staff.taskOperations.assessAction("edit", {
+			path: "src/parser.ts",
+			edits: [],
+		});
+		expect(withoutCheckpoint.blockReason).toContain("active checkpoint");
+
+		const checkpoint = await staff.taskOperations.publishCheckpoint({
+			id: "CP-ACTION-GATE-0001",
+			taskId: "TASK-ACTION-GATE",
+			goal: "Change the governed parser",
+			currentUnderstanding: "The exact edit is ready for peer inspection",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+			risk: "yellow",
+			confidence: "L2",
+		});
+		const action = {
+			kind: checkpoint.governedAction!.kind,
+			target: checkpoint.governedAction!.target,
+			version: checkpoint.governedAction!.version,
+		};
+		await techLead.taskOperations.reviewAction({
+			checkpointId: checkpoint.id,
+			action,
+			verdict: "approve",
+			reason: "The change stays inside the task lease.",
+		});
+		expect(
+			(await staff.taskOperations.assessAction("edit", { path: "src/parser.ts", edits: [] })).blockReason,
+		).toContain("qa-engineer");
+		await qa.taskOperations.reviewAction({
+			checkpointId: checkpoint.id,
+			action,
+			verdict: "approve",
+			reason: "The parser boundary remains testable.",
+		});
+
+		expect(
+			(await staff.taskOperations.assessAction("edit", { path: "src/parser.ts", edits: [] })).blockReason,
+		).toBeUndefined();
+		expect((await qa.taskOperations.assessAction("read", { path: "src/parser.ts" })).action.effectiveRisk).toBe(
+			"green",
+		);
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).map((event) => event.type)).toEqual(
+			expect.arrayContaining(["action-assessed", "action-review"]),
+		);
+		const timeline = harness.sendMessage.mock.calls
+			.map(([message]) => ("content" in message ? message.content : ""))
+			.join("\n");
+		expect(timeline).toContain("action-assessed");
+		expect(timeline).toContain("action-review");
+	});
+
 	it("reports scope escalation as requiring a user decision instead of issue-author review", async () => {
 		const harness = setup();
 		const command = harness.commands.get("ansteel-team");
