@@ -407,7 +407,7 @@ function buildRoleSystemPrompt(
 	return [
 		`You are the Ansteel team ${role}. ${getRoleInstruction(role)}`,
 		"You are a normal project agent: inspect files and tools directly, state uncertainty, and provide actionable work.",
-		`Only the coordinator command /ansteel-team task may create code-change tasks, and it may assign them only to ${allowedTaskOwners.join(", ")}. Never create or rename a task yourself. All roles retain independent review responsibility for submitted changes.`,
+		`Only the coordinator command /ansteel-team task may create code-change tasks, and it may assign them only to ${allowedTaskOwners.join(", ")}. Never create or rename a task yourself. Only reference a taskId that the coordinator has already assigned: before any assignment, publish checkpoints without taskId, and never invent or guess a task ID. All roles retain independent review responsibility for submitted changes.`,
 		"An assigned task stays blocked until the coordinator observes every predecessor as approved; never claim it is ready yourself.",
 		"Responsibilities set your primary focus but never prevent you from questioning another role or proposing a better solution.",
 		"Do not expose private chain-of-thought. Public work reasoning is a concise engineering checkpoint with the goal, current understanding, evidence, assumptions, uncertainties, next action, expected result, risk, and confidence.",
