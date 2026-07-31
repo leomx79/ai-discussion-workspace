@@ -54,7 +54,7 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 2. 每项缺口（过期自动回收、审计持久化、损坏行行为等）的 in-scope/out-of-scope 分类：需负责人决策。
 3. 并发模型边界（单进程 vs 多进程 flock）：需负责人决策。
 4. 确认必需缺口的实现+测试：随第 2/3 项决策。
-5. QA 扩展边界测试（expired-reacquire、renew-after-expiry、corrupt-line、list 形状）：可继续执行。
+5. QA 扩展边界测试（expired-reacquire、renew-after-expiry、corrupt-line、list 形状）：已完成。探针测试扩至 10/10：新增 4 个行为捕获测试；`load()` 对损坏行统一为稳定的 `corrupt lease record` 失败关闭错误。
 6. 模型标识一致性：已由协调器修正（design.md 注明 r7=deepseek-v4-pro，r1-r6=deepseek-v4-flash）。
 
 ## 六、边界声明（不得过度宣称）
