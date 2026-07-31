@@ -115,6 +115,7 @@ import { createWriteToolDefinition } from "../../core/tools/write.ts";
 const MAX_LEDGER_EVENTS_IN_PROMPT = 24;
 const DEFAULT_ANSTEEL_TEAM_STAGE_TIMEOUT_MS = 120_000;
 const ANSTEEL_TEAM_ABORT_GRACE_MS = 1_000;
+const ANSTEEL_TEAM_STAGE_RETRY_LIMIT = 3;
 const DEFAULT_ANSTEEL_TEAM_TASK_MAX_EPOCHS = 8;
 const DEFAULT_ANSTEEL_TEAM_TASK_MAX_NO_PROGRESS_EPOCHS = 2;
 const ANSTEEL_TEAM_TASK_TOOL_NAMES = [
@@ -1490,20 +1491,32 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			message: `${role} provider request started`,
 		});
 		const getFailedCollaborationToolError = (): Error | undefined => {
-			// The audit is authoritative even when the provider aborts before returning public prose.
-			const failedCollaborationTool = session
-				.getLastStageAudit?.()
-				.events.find(
-					(event) =>
-						event.type === "tool-execution-end" &&
-						event.isError === true &&
-						ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS.some((toolName) => toolName === event.toolName),
-				)?.toolName;
-			if (failedCollaborationTool === undefined) return undefined;
-			observation.failClosedCollaborationError ??= new Error(
-				`Ansteel team role stage failed: ${failedCollaborationTool} returned an error`,
+			// Governed tool input errors are retryable inside the stage: the agent loop
+			// returns them to the model as error tool results, so a corrected retry may
+			// succeed. The stage still fails closed when the final governed-tool attempt
+			// in the stage is an error, or when governed-tool input errors repeat beyond
+			// the bounded per-stage retry limit even though a later attempt succeeded.
+			const failClosedEvents = (session.getLastStageAudit?.()?.events ?? []).filter(
+				(event) =>
+					event.type === "tool-execution-end" &&
+					ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS.some((toolName) => toolName === event.toolName),
 			);
-			return observation.failClosedCollaborationError;
+			if (failClosedEvents.length === 0) return undefined;
+			const lastEvent = failClosedEvents[failClosedEvents.length - 1];
+			if (lastEvent.isError === true) {
+				observation.failClosedCollaborationError ??= new Error(
+					`Ansteel team role stage failed: ${lastEvent.toolName} returned an error without a successful retry`,
+				);
+				return observation.failClosedCollaborationError;
+			}
+			const errorCount = failClosedEvents.filter((event) => event.isError === true).length;
+			if (errorCount >= ANSTEEL_TEAM_STAGE_RETRY_LIMIT) {
+				observation.failClosedCollaborationError ??= new Error(
+					`Ansteel team role stage failed: ${lastEvent.toolName} exceeded the stage retry limit (${errorCount} tool input errors)`,
+				);
+				return observation.failClosedCollaborationError;
+			}
+			return undefined;
 		};
 		try {
 			const response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);

@@ -82,6 +82,7 @@ function setup(
 	config = createConfig(),
 	rolePrompt?: (role: string, prompt: string) => Promise<string>,
 	cwd = createTemporaryProject(),
+	roleStageAudit?: (role: string) => Array<{ type: string; toolName?: string; isError?: boolean }>,
 ) {
 	const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
 	const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
@@ -152,6 +153,7 @@ function setup(
 					return response;
 				}),
 				abort: vi.fn(),
+				getLastStageAudit: () => ({ events: roleStageAudit ? roleStageAudit(role) : [] }),
 			};
 			roleSessions.push({ role, session });
 			return session;
@@ -300,6 +302,61 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 			expect.objectContaining({ customType: "ansteel-team-event", display: true }),
 			{ triggerTurn: false },
 		);
+	});
+
+	it("allows an in-stage retry after a governed tool input error succeeds", async () => {
+		const harness = setup(createConfig(), undefined, createTemporaryProject(), (role) =>
+			role === "tech-lead"
+				? [
+						{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: true },
+						{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: false },
+					]
+				: [],
+		);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		const failure = listAnsteelTeamEvents(harness.ctx.cwd).find((event) => event.type === "role-failure");
+		expect(failure).toBeUndefined();
+	});
+
+	it("fails the stage when the final governed tool attempt is an error", async () => {
+		const harness = setup(createConfig(), undefined, createTemporaryProject(), (role) =>
+			role === "tech-lead"
+				? [{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: true }]
+				: [],
+		);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		const error = await command("start Review the parser", harness.ctx).then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("without a successful retry");
+		const failure = listAnsteelTeamEvents(harness.ctx.cwd).find((event) => event.type === "role-failure");
+		expect(failure?.role).toBe("tech-lead");
+	});
+
+	it("fails the stage when governed tool input errors exceed the retry limit", async () => {
+		const harness = setup(createConfig(), undefined, createTemporaryProject(), (role) =>
+			role === "tech-lead"
+				? [
+						{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: true },
+						{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: true },
+						{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: true },
+						{ type: "tool-execution-end", toolName: "ansteel_publish_checkpoint", isError: false },
+					]
+				: [],
+		);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		const error = await command("start Review the parser", harness.ctx).then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("exceeded the stage retry limit");
 	});
 
 	it("redacts provider failures before writing the public ledger or UI timeline", async () => {
