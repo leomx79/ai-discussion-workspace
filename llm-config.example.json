@@ -1,0 +1,62 @@
+{
+    "_comment": "鞍钢讨论 — 角色/模型/API 配置模板（无密钥，可提交）",
+    "_usage": "复制为 llm-config.json（gitignored）并按需填写，或用环境变量提供 API Key：ANSTEEL_TL_API_KEY / ANSTEEL_SE_API_KEY / ANSTEEL_QA_API_KEY",
+    "default": {
+        "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "api_key": "your-qwen-token-plan-key",
+        "model": "qwen3.8-max-preview",
+        "temperature": 0.2,
+        "max_tokens": 8192,
+        "max_tool_rounds": 30,
+        "ssl_verify": true
+    },
+    "roles": {
+        "tech-lead": {
+            "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            "api_key": "your-ansteel-tl-key",
+            "model": "glm-5.2",
+            "temperature": 0.1,
+            "tools": [
+                "read_file",
+                "list_dir",
+                "grep_code",
+                "run_command",
+                "read_memory",
+                "save_memory",
+                "search_history"
+            ],
+            "_comment": "TL 可以读代码、跑命令验证"
+        },
+        "staff-engineer": {
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "your-ansteel-se-key",
+            "model": "deepseek-v4-flash",
+            "temperature": 0.3,
+            "tools": [
+                "read_file",
+                "list_dir",
+                "grep_code",
+                "run_command",
+                "read_memory",
+                "save_memory",
+                "search_history"
+            ],
+            "_comment": "SE 可以读代码、跑命令、搜索代码"
+        },
+        "qa-engineer": {
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+            "api_key": "your-ansteel-qa-key",
+            "model": "doubao-seed-2.1-turbo",
+            "temperature": 0.5,
+            "tools": [
+                "read_file",
+                "list_dir",
+                "grep_code",
+                "read_memory",
+                "save_memory",
+                "search_history"
+            ],
+            "_comment": "QA 可以读代码、搜索，但不能跑命令（安全考虑）"
+        }
+    }
+}

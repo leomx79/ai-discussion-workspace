@@ -238,6 +238,7 @@ TL 架构 v0
 | `AGENTS.md` | 本文件，Codex 项目指令（自动加载） |
 | `ansteel_agents.py` | **主脚本**：多智能体讨论系统（基于 OpenAI Agents SDK） |
 | `llm-config.json` | 角色/模型/API 配置 |
+| `llm-config.example.json` | 无密钥配置模板：缺失 llm-config.json 时自动回退；API Key 用角色级环境变量或复制后填写 |
 | `agent-llm.py` | 旧版单智能体脚本（保留备用） |
 | `ask-llm.ps1` | 旧版一次性问答脚本（保留备用） |
 | `docs/legacy/solutions/` | 历史讨论记录归档；旧脚本的新运行产物写入 `artifacts/runtime/legacy-solutions/` |

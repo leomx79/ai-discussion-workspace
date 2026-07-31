@@ -17,7 +17,7 @@ ansteel_agents.py — 鞍钢宪法多智能体讨论系统（基于 OpenAI Agent
   python ansteel_agents.py "快速问一下：STM32的HAL库和LL库区别" --quick
 
 依赖: pip install openai-agents
-配置: llm-config.json（已有，填上 API Key 即可）
+配置: llm-config.json（本地、gitignored）；缺失时回退 llm-config.example.json；API Key 可用角色级环境变量 ANSTEEL_TL/SE/QA_API_KEY 提供
 """
 
 import argparse
@@ -64,8 +64,20 @@ DEFAULT_CONFIG = SCRIPT_DIR / "llm-config.json"
 # ============================================================
 
 def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
-    """读取 llm-config.json，合并 default + role 配置"""
-    with open(config_path, "r", encoding="utf-8-sig") as f:
+    """读取 llm-config.json；缺失时回退到无密钥模板 llm-config.example.json"""
+    path = Path(config_path)
+    if not path.is_file():
+        example = SCRIPT_DIR / "llm-config.example.json"
+        if example.is_file():
+            print(
+                f"[INFO] 未找到 {path.name}，已使用模板 {example.name}；"
+                "请复制为 llm-config.json 并填写 API Key，或设置角色级环境变量",
+                file=sys.stderr,
+            )
+            path = example
+        else:
+            raise FileNotFoundError(f"缺少配置文件：{path}（可参考 llm-config.example.json 创建）")
+    with open(path, "r", encoding="utf-8-sig") as f:
         cfg = json.load(f)
     return cfg
 
@@ -79,19 +91,39 @@ def get_role_config(cfg: dict, role: str) -> dict:
         val = role_cfg.get(key)
         merged[key] = val if val is not None else default.get(key)
     merged["tools"] = role_cfg.get("tools", default.get("tools", ["read_file", "list_dir", "grep_code", "read_memory", "save_memory", "search_history"]))
+
+    # 角色级环境变量覆盖（AGENTS.md 约定）：优先级 角色env > 配置文件角色key > 通用ANSTEEL_API_KEY
+    role_api_key_env = {
+        "tech-lead": "ANSTEEL_TL_API_KEY",
+        "staff-engineer": "ANSTEEL_SE_API_KEY",
+        "qa-engineer": "ANSTEEL_QA_API_KEY",
+    }.get(role)
+    env_key = os.environ.get(role_api_key_env) if role_api_key_env else None
+    if env_key:
+        merged["api_key"] = env_key
+
     return merged
 
 
-def make_model(role_cfg: dict) -> OpenAIChatCompletionsModel:
+def make_model(role_cfg: dict, role: str = "default") -> OpenAIChatCompletionsModel:
     """根据角色配置创建模型实例（支持任意 OpenAI 兼容 API）"""
     base_url = role_cfg["base_url"]
     api_key = role_cfg["api_key"]
+    role_api_key_env = {
+        "tech-lead": "ANSTEEL_TL_API_KEY",
+        "staff-engineer": "ANSTEEL_SE_API_KEY",
+        "qa-engineer": "ANSTEEL_QA_API_KEY",
+    }.get(role)
 
-    # 通用 fallback
+    # 通用 fallback（角色级 env 覆盖已在 get_role_config 中完成）
     if not api_key or api_key.startswith("your-"):
         api_key = os.environ.get("ANSTEEL_API_KEY", api_key)
     if not api_key or api_key.startswith("your-"):
-        print(f"[ERROR] 请配置 API Key！编辑 llm-config.json 或设置环境变量 ANSTEEL_API_KEY", file=sys.stderr)
+        if role_api_key_env:
+            hint = f"编辑 llm-config.json 中 roles.{role}.api_key 或设置环境变量 {role_api_key_env}"
+        else:
+            hint = "编辑 llm-config.json 中 default.api_key 或设置环境变量 ANSTEEL_API_KEY"
+        print(f"[ERROR] 角色 {role} 缺少 API Key！请{hint}", file=sys.stderr)
         sys.exit(1)
 
     # SSL 验证：代理服务可能证书过期，配置 "ssl_verify": false 可跳过
@@ -633,7 +665,7 @@ def auto_build_project_profile(workdir: str) -> dict:
 def create_agent(role: str, cfg: dict) -> Agent:
     """根据角色和配置创建一个 Agent 实例"""
     role_cfg = get_role_config(cfg, role)
-    model = make_model(role_cfg)
+    model = make_model(role_cfg, role)
 
     # 根据配置选择工具
     tool_names = role_cfg.get("tools", ["read_file", "list_dir", "grep_code"])
