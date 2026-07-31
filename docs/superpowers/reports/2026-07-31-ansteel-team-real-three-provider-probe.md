@@ -79,6 +79,7 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 | r10 | 失败（重试语义正确判死） | 错误信息升级为 without a successful retry；TL 交叉质询 checkpoint 报错后未重试 |
 | r11 | 失败（无任务时误调任务工具） | Staff 在 investigation 轮调用 ansteel_publish_task_collaboration（无已分配任务）→ 正确判死 |
 | **r12** | **成功（start 返回 success=true）** | **investigation + 交叉质询两轮三角色全部完成**：6 份角色报告、4 个合规 checkpoint、零角色失败、零未决问题 |
+| r13 | 终态：任务未交付（正确 fail-closed） | **三角色并行任务迁移真实运行**：3 个并行任务全部认领（TL 架构/Staff 实现/QA 验证，文件互不重叠）；424 事件、44 checkpoint、10 process-issue、18 次动作评审、11 次角色失败；QA 测试编辑被 TL/Staff 以 critical（PI-STF-TEST-BUGS：writeFileSync 未导入、空白 owner 语义不符）否决，任务 8 轮 epoch 上限停止（submissions=0） |
 
 全部轮次均产生签名账本（Ed25519 manifest + 事件链）、team.json（checkpoint/问题台账）、运行日志（精确原因码）、角色会话文件；无 Oracle/协调器私有状态访问。
 
@@ -94,7 +95,7 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 
 ### 7.3 边界与设计观察（诚实声明）
 
-- 持久化团队 `start` 流程（investigation + 交叉质询两个轮次）已在 r12 **完整跑通**：三角色全部完成、零角色失败。修订/验证/共识/会签等后续轮次由任务驱动（`/ansteel-team task` 分配任务后的 epoch 流程），超出只读评审探针范围，需任务型运行另行验证。`--ansteel` 评审管线已取得 APPROVED 共识（见第五节），二者是不同执行路径。
+- 持久化团队 `start` 流程（investigation + 交叉质询）已在 r12 **完整跑通**；三角色并行任务迁移已在 r13 **真实运行**（认领/checkpoint/黄色动作 peer 评审/process-issue/epoch 上限全部按设计工作），但任务未交付——peer 以行级证据抓出测试真实缺陷并正确 fail-closed。2026-08-01 已修复该两处缺陷（writeFileSync 导入、owner/name trim 语义），43 个测试通过，等待重跑交付。`--ansteel` 评审管线已取得 APPROVED 共识（见第五节），二者是不同执行路径。
 - 设计观察（待负责人决策）：工具入参 schema 校验错误当前直接杀死整个角色阶段（模型看不到错误、无法重试）；而"可修复的入参遗漏"与"治理违规"在语义上不同。是否让工具入参错误在当前阶段内可重试（作为工具结果返回给模型），同时保留治理违规 fail-closed，是协议语义决策，需用户拍板。
 - 恢复语义：`start` 对已存在团队只恢复会话不重跑轮次；续跑用 `ask`，且 `ask` 只在账本存在未决义务时产出新事件（r4 后 openChallenges=0 时空跑属正常）。
 
