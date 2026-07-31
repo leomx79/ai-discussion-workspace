@@ -75,6 +75,10 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 | r4 | 失败（交叉质询 TL 300s 超时） | **investigation 三角色全部完成（3 份独立报告）**；QA 交叉质询完成；TL 交叉质询超时 fail-closed |
 | r7 | 失败（checkpoint 漏必填 risk/confidence） | investigation TL/QA 完成；Staff 第二次 checkpoint 漏字段 → 校验失败 |
 | r8 | 失败（同 r7 模式，交叉质询 Staff） | **investigation 三角色完成（3 报告 + 4 checkpoint）**；交叉质询 TL/QA 完成，QA 发布 CP-QA-CROSS-EXAM-FINDINGS 并产生 1 个 process-issue；Staff 交叉质询 checkpoint 漏必填字段 → fail-closed |
+| r9 | 失败（交叉质询 TL checkpoint supersedes 未知） | investigation 三角色完成；TL 交叉质询 checkpoint 报错（supersedes 未知）后未重试即收尾 → fail-closed（新语义生效） |
+| r10 | 失败（重试语义正确判死） | 错误信息升级为 without a successful retry；TL 交叉质询 checkpoint 报错后未重试 |
+| r11 | 失败（无任务时误调任务工具） | Staff 在 investigation 轮调用 ansteel_publish_task_collaboration（无已分配任务）→ 正确判死 |
+| **r12** | **成功（start 返回 success=true）** | **investigation + 交叉质询两轮三角色全部完成**：6 份角色报告、4 个合规 checkpoint、零角色失败、零未决问题 |
 
 全部轮次均产生签名账本（Ed25519 manifest + 事件链）、team.json（checkpoint/问题台账）、运行日志（精确原因码）、角色会话文件；无 Oracle/协调器私有状态访问。
 
@@ -84,10 +88,13 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 2. `e7921df`：结构化 ID 格式（CP/PI/PR/TASK-<UPPERCASE-ID>）写入提示词与工具说明（r3 根因）
 3. `78371b7`：investigation 阶段不得用 bash 跑测试（r3 根因）
 4. `e33cc73`：checkpoint 工具说明显式列出全部必填字段（r7 根因；r8 表明 deepseek-v4-pro 在交叉质询仍可能漏 risk/confidence）
+5. `3645bd4`：**治理工具入参错误阶段内可重试（核心语义修复）**——agent-loop 本就返回工具错误给模型，扩展层 fail-closed 检查改为"最后一次仍失败或累计超 3 次才判死"；新增 3 个回归用例；docs/ansteel.md 记录语义
+6. `64393f4`：提示词要求治理工具报错必须修正重试，不得带错收尾
+7. `b54242c`：未分配任务前禁止调用任务/里程碑工具
 
 ### 7.3 边界与设计观察（诚实声明）
 
-- 持久化团队完整多轮终态（交叉质询→修订→验证→共识/会签）在无头 RPC 模式下尚未取得：每次都被真实模型的工具契约合规问题 fail-closed 打断（每轮修复后都会出现新的漏字段变体）。`--ansteel` 评审管线已取得 APPROVED 共识（见第五节），二者是不同执行路径。
+- 持久化团队 `start` 流程（investigation + 交叉质询两个轮次）已在 r12 **完整跑通**：三角色全部完成、零角色失败。修订/验证/共识/会签等后续轮次由任务驱动（`/ansteel-team task` 分配任务后的 epoch 流程），超出只读评审探针范围，需任务型运行另行验证。`--ansteel` 评审管线已取得 APPROVED 共识（见第五节），二者是不同执行路径。
 - 设计观察（待负责人决策）：工具入参 schema 校验错误当前直接杀死整个角色阶段（模型看不到错误、无法重试）；而"可修复的入参遗漏"与"治理违规"在语义上不同。是否让工具入参错误在当前阶段内可重试（作为工具结果返回给模型），同时保留治理违规 fail-closed，是协议语义决策，需用户拍板。
 - 恢复语义：`start` 对已存在团队只恢复会话不重跑轮次；续跑用 `ask`，且 `ask` 只在账本存在未决义务时产出新事件（r4 后 openChallenges=0 时空跑属正常）。
 
