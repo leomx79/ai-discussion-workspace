@@ -435,7 +435,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			description:
 				"Publish concise public work reasoning before a significant decision or action. This is not private chain-of-thought. id must match the CP-<UPPERCASE-ID> form (uppercase letters, digits, and hyphens only) and must be a new, unique id for this checkpoint.",
 			promptSnippet:
-				"Publish a structured checkpoint when understanding changes, before yellow or red work, after unexpected tool results, or before acceptance.",
+				"Publish a structured checkpoint when understanding changes, before yellow or red work, after unexpected tool results, or before acceptance. The checkpoint must include every required field: id (CP-<UPPERCASE-ID>, unique), goal, currentUnderstanding, assumptions, evidenceRefs, uncertainties, nextAction (kind/target/expectedResult), risk (green/yellow/red), and confidence (L1/L2/L3/L4). Never omit risk or confidence.",
 			parameters: Type.Object({
 				id: Type.String(),
 				taskId: Type.Optional(Type.String()),
