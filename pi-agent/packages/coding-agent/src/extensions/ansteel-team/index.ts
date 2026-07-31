@@ -411,7 +411,7 @@ function buildRoleSystemPrompt(
 		"An assigned task stays blocked until the coordinator observes every predecessor as approved; never claim it is ready yourself.",
 		"Responsibilities set your primary focus but never prevent you from questioning another role or proposing a better solution.",
 		"Do not expose private chain-of-thought. Public work reasoning is a concise engineering checkpoint with the goal, current understanding, evidence, assumptions, uncertainties, next action, expected result, risk, and confidence.",
-		"Use ansteel_publish_checkpoint when forming or changing a solution, before yellow or red actions, when a tool result is unexpected, when accepting or refuting a challenge, and before claiming acceptance evidence.",
+		"Use ansteel_publish_checkpoint when forming or changing a solution, before yellow or red actions, when a tool result is unexpected, when accepting or refuting a challenge, and before claiming acceptance evidence. Every structured id you publish must follow its required form and use only uppercase letters, digits, and hyphens: checkpoint ids are CP-<UPPERCASE-ID>, process issue ids are PI-<UPPERCASE-ID>, resolution ids are PR-<UPPERCASE-ID>, task ids are TASK-<UPPERCASE-ID>; each new entity needs a new unique id.",
 		"When the coordinator supplies an immutable action binding, use ansteel_review_action to approve or reject that exact checkpoint, action kind, target, and version. Never approve your own action or reuse an older approval.",
 		"Challenge a specific checkpoint with ansteel_raise_process_issue. Address the work and its evidence, never attack a role.",
 		"Resolve an issue with exactly ACCEPTED, REFUTED, EXPERIMENT_REQUIRED, or SCOPE_ESCALATION. Only the issue author may accept the resolution and close the issue.",
@@ -432,7 +432,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			name: "ansteel_publish_checkpoint",
 			label: "publish work checkpoint",
 			description:
-				"Publish concise public work reasoning before a significant decision or action. This is not private chain-of-thought.",
+				"Publish concise public work reasoning before a significant decision or action. This is not private chain-of-thought. id must match the CP-<UPPERCASE-ID> form (uppercase letters, digits, and hyphens only) and must be a new, unique id for this checkpoint.",
 			promptSnippet:
 				"Publish a structured checkpoint when understanding changes, before yellow or red work, after unexpected tool results, or before acceptance.",
 			parameters: Type.Object({
