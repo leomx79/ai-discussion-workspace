@@ -62,3 +62,32 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 - 本次运行使用 `pi --ansteel` 非交互证据优先评审路径；`/ansteel-team` 持久化交互团队流程（start/ask/task/status/anchor）仍需在交互式 Pi 中单独运行验证。
 - 治理结果：r7 `APPROVED`（双会签）；交付结果：`NOT_DELIVERED`（评审不实现任务）。APPROVED 表示规定角色完成规定检查并达成共识，不表示代码已正确交付。
 - 跨模型 L1 证据已升级：三个真实 provider/model 在评审管线中完成完整持续协作循环并获得 APPROVED 共识与会签（r7）。
+
+
+## 七、持久化团队 /ansteel-team 真实三提供商验证（RPC 无头驱动 r2-r8）
+
+### 7.1 运行记录
+
+| 轮次 | 结果 | 关键事件 |
+|---|---|---|
+| r2 | 失败（checkpoint 引用未分配任务 ID） | TL/Staff 读取正常；模型发明 TASK-SE-LEASE-REVIEW → checkpoint 校验失败 → role-failure fail-closed |
+| r3 | 失败（ID 格式 / bash 跑测试） | TL 首个 checkpoint 成功、第二个违反 CP-<UPPERCASE-ID>；Staff 三次尝试 bash 跑测试被工具策略拒绝 |
+| r4 | 失败（交叉质询 TL 300s 超时） | **investigation 三角色全部完成（3 份独立报告）**；QA 交叉质询完成；TL 交叉质询超时 fail-closed |
+| r7 | 失败（checkpoint 漏必填 risk/confidence） | investigation TL/QA 完成；Staff 第二次 checkpoint 漏字段 → 校验失败 |
+| r8 | 失败（同 r7 模式，交叉质询 Staff） | **investigation 三角色完成（3 报告 + 4 checkpoint）**；交叉质询 TL/QA 完成，QA 发布 CP-QA-CROSS-EXAM-FINDINGS 并产生 1 个 process-issue；Staff 交叉质询 checkpoint 漏必填字段 → fail-closed |
+
+全部轮次均产生签名账本（Ed25519 manifest + 事件链）、team.json（checkpoint/问题台账）、运行日志（精确原因码）、角色会话文件；无 Oracle/协调器私有状态访问。
+
+### 7.2 已修复的四个真实根因（均有 153 项回归 + 治理门禁）
+
+1. `34aab2d`：角色提示词约束不得引用未分配任务 ID（r2 根因）
+2. `e7921df`：结构化 ID 格式（CP/PI/PR/TASK-<UPPERCASE-ID>）写入提示词与工具说明（r3 根因）
+3. `78371b7`：investigation 阶段不得用 bash 跑测试（r3 根因）
+4. `e33cc73`：checkpoint 工具说明显式列出全部必填字段（r7 根因；r8 表明 deepseek-v4-pro 在交叉质询仍可能漏 risk/confidence）
+
+### 7.3 边界与设计观察（诚实声明）
+
+- 持久化团队完整多轮终态（交叉质询→修订→验证→共识/会签）在无头 RPC 模式下尚未取得：每次都被真实模型的工具契约合规问题 fail-closed 打断（每轮修复后都会出现新的漏字段变体）。`--ansteel` 评审管线已取得 APPROVED 共识（见第五节），二者是不同执行路径。
+- 设计观察（待负责人决策）：工具入参 schema 校验错误当前直接杀死整个角色阶段（模型看不到错误、无法重试）；而"可修复的入参遗漏"与"治理违规"在语义上不同。是否让工具入参错误在当前阶段内可重试（作为工具结果返回给模型），同时保留治理违规 fail-closed，是协议语义决策，需用户拍板。
+- 恢复语义：`start` 对已存在团队只恢复会话不重跑轮次；续跑用 `ask`，且 `ask` 只在账本存在未决义务时产出新事件（r4 后 openChallenges=0 时空跑属正常）。
+
