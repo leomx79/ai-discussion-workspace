@@ -12,7 +12,7 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { type Span as OpenTelemetrySpan, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
 	BasicTracerProvider,
@@ -21,6 +21,7 @@ import {
 	type SpanExporter,
 } from "@opentelemetry/sdk-trace-base";
 import lockfile from "proper-lockfile";
+import { canonicalizeAnsteelAuditValue, hashAnsteelAuditValue } from "./ansteel-team-integrity.ts";
 
 const ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS = 300_000;
 const ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS = 10_000;
@@ -205,6 +206,36 @@ interface AnsteelRuntimeIndex extends AnsteelRuntimeIndexUnsigned {
 	indexHash: string;
 }
 
+/**
+ * A strict verification result. Unlike list/trace, this path never rebuilds a
+ * damaged index: callers use it before creating an external audit anchor.
+ */
+export interface AnsteelRuntimeLogIntegrity {
+	indexHash: string;
+	runCount: number;
+	segmentCount: number;
+}
+
+/** A content-addressed snapshot receipt for runtime evidence at anchor time. */
+export interface AnsteelRuntimeAnchorSnapshotReceipt {
+	indexHash: string;
+	snapshotHash: string;
+}
+
+interface AnsteelRuntimeAnchorSnapshotUnsigned {
+	schemaVersion: 1;
+	runtimeLogIndexHash: string;
+	indexContent: string;
+	segmentByteLengths: Array<{
+		fileName: string;
+		byteLength: number;
+	}>;
+}
+
+interface AnsteelRuntimeAnchorSnapshot extends AnsteelRuntimeAnchorSnapshotUnsigned {
+	snapshotHash: string;
+}
+
 type AnsteelRuntimeIndexRebuildReason =
 	| "missing"
 	| "json-invalid"
@@ -274,6 +305,17 @@ export function getAnsteelRuntimeArtifactDirectory(cwd: string): string {
 
 export function getAnsteelRuntimeIndexPath(cwd: string): string {
 	return join(getAnsteelTeamRuntimeDirectory(cwd), "run-index.json");
+}
+
+/** Stored outside mutable index rotation paths under its own content hash. */
+export function getAnsteelRuntimeAnchorSnapshotPath(cwd: string, snapshotHash: string): string {
+	if (!/^[0-9a-f]{64}$/i.test(snapshotHash)) {
+		throw new AnsteelObservabilityError(
+			"unclassified-runtime-error",
+			"Ansteel runtime anchor snapshot hash is invalid",
+		);
+	}
+	return join(getAnsteelTeamRuntimeDirectory(cwd), "anchor-index-snapshots", `${snapshotHash.toLowerCase()}.json`);
 }
 
 function assertRunId(runId: string): void {
@@ -864,6 +906,313 @@ function readOrRebuildRuntimeIndexLocked(cwd: string, fullValidation: boolean): 
 		writeRuntimeIndexAtomic(cwd, completed);
 		return completed;
 	}
+}
+
+/**
+ * Verify every indexed segment and every in-segment hash chain without the
+ * normal recovery behavior. A missing, altered, or stale index is evidence of
+ * an integrity failure here, not an invitation to silently regenerate it.
+ */
+export function verifyAnsteelRuntimeLogIntegrity(cwd: string): AnsteelRuntimeLogIntegrity {
+	return withRuntimeIndexLock(cwd, () => {
+		try {
+			const index = parseRuntimeIndex(cwd);
+			validateRuntimeIndexAgainstLogs(cwd, index);
+			return {
+				indexHash: index.indexHash,
+				runCount: Object.keys(index.runs).length,
+				segmentCount: Object.values(index.runs).reduce((count, run) => count + run.segments.length, 0),
+			};
+		} catch (error) {
+			if (error instanceof AnsteelRuntimeIndexRebuildRequired) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					`Ansteel runtime log integrity verification failed: ${error.message}`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
+	});
+}
+
+interface AnsteelRuntimeAnchorSnapshotSegment {
+	runId: string;
+	fileName: string;
+	sha256: string;
+	logChainHeadHash: string | null;
+}
+
+function throwRuntimeAnchorSnapshotError(message: string): never {
+	throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime anchor snapshot ${message}`);
+}
+
+function parseRuntimeAnchorSnapshotIndex(
+	indexContent: string,
+	expectedIndexHash: string,
+): AnsteelRuntimeAnchorSnapshotSegment[] {
+	let value: unknown;
+	try {
+		value = JSON.parse(indexContent);
+	} catch {
+		return throwRuntimeAnchorSnapshotError("contains invalid indexed runtime evidence");
+	}
+	if (
+		!isRecord(value) ||
+		!hasExactKeys(value, ["schemaVersion", "runs", "associations", "indexHash"]) ||
+		value.schemaVersion !== ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION ||
+		value.indexHash !== expectedIndexHash ||
+		!isRecord(value.runs) ||
+		!isRecord(value.associations)
+	) {
+		return throwRuntimeAnchorSnapshotError("does not match the anchored runtime index");
+	}
+	const segments: AnsteelRuntimeAnchorSnapshotSegment[] = [];
+	for (const [runId, rawRun] of Object.entries(value.runs)) {
+		try {
+			assertRunId(runId);
+		} catch {
+			return throwRuntimeAnchorSnapshotError("contains an invalid runtime run");
+		}
+		if (
+			!isRecord(rawRun) ||
+			!hasExactKeys(rawRun, ["runId", "segments", "logChainHeadHash"]) ||
+			rawRun.runId !== runId ||
+			!Array.isArray(rawRun.segments) ||
+			(rawRun.logChainHeadHash !== null &&
+				(typeof rawRun.logChainHeadHash !== "string" || !/^[0-9a-f]{64}$/i.test(rawRun.logChainHeadHash)))
+		) {
+			return throwRuntimeAnchorSnapshotError("contains an invalid indexed runtime run");
+		}
+		for (const rawSegment of rawRun.segments) {
+			if (
+				!isRecord(rawSegment) ||
+				!hasExactKeys(rawSegment, ["fileName", "sha256"]) ||
+				typeof rawSegment.fileName !== "string" ||
+				!new RegExp(`^run-${runId}-\\d{4}\\.jsonl$`, "i").test(rawSegment.fileName) ||
+				typeof rawSegment.sha256 !== "string" ||
+				!/^[0-9a-f]{64}$/i.test(rawSegment.sha256)
+			) {
+				return throwRuntimeAnchorSnapshotError("contains an invalid indexed runtime segment");
+			}
+			segments.push({
+				runId,
+				fileName: rawSegment.fileName,
+				sha256: rawSegment.sha256,
+				logChainHeadHash: rawRun.logChainHeadHash,
+			});
+		}
+	}
+	return segments.sort((left, right) => left.fileName.localeCompare(right.fileName));
+}
+
+function parseRuntimeAnchorSnapshot(
+	content: string,
+	expectedIndexHash: string,
+	expectedSnapshotHash?: string,
+): { snapshot: AnsteelRuntimeAnchorSnapshot; segments: AnsteelRuntimeAnchorSnapshotSegment[] } {
+	let value: unknown;
+	try {
+		value = JSON.parse(content);
+	} catch {
+		return throwRuntimeAnchorSnapshotError("file is not valid JSON");
+	}
+	if (
+		!isRecord(value) ||
+		!hasExactKeys(value, [
+			"schemaVersion",
+			"runtimeLogIndexHash",
+			"indexContent",
+			"segmentByteLengths",
+			"snapshotHash",
+		]) ||
+		value.schemaVersion !== 1 ||
+		value.runtimeLogIndexHash !== expectedIndexHash ||
+		typeof value.indexContent !== "string" ||
+		!Array.isArray(value.segmentByteLengths) ||
+		typeof value.snapshotHash !== "string" ||
+		!/^[0-9a-f]{64}$/i.test(value.snapshotHash)
+	) {
+		return throwRuntimeAnchorSnapshotError("has an invalid schema");
+	}
+	const segmentByteLengths = value.segmentByteLengths.map((entry) => {
+		if (
+			!isRecord(entry) ||
+			!hasExactKeys(entry, ["fileName", "byteLength"]) ||
+			typeof entry.fileName !== "string" ||
+			typeof entry.byteLength !== "number" ||
+			!Number.isSafeInteger(entry.byteLength) ||
+			entry.byteLength < 0
+		) {
+			return throwRuntimeAnchorSnapshotError("has an invalid segment boundary");
+		}
+		return { fileName: entry.fileName, byteLength: entry.byteLength };
+	});
+	const unsigned: AnsteelRuntimeAnchorSnapshotUnsigned = {
+		schemaVersion: 1,
+		runtimeLogIndexHash: expectedIndexHash,
+		indexContent: value.indexContent,
+		segmentByteLengths,
+	};
+	const computedSnapshotHash = hashAnsteelAuditValue(unsigned);
+	if (
+		computedSnapshotHash !== value.snapshotHash ||
+		(expectedSnapshotHash !== undefined && computedSnapshotHash !== expectedSnapshotHash)
+	) {
+		return throwRuntimeAnchorSnapshotError("hash does not match the anchored receipt");
+	}
+	const segments = parseRuntimeAnchorSnapshotIndex(value.indexContent, expectedIndexHash);
+	const expectedFiles = segments.map((segment) => segment.fileName);
+	const actualFiles = segmentByteLengths.map((segment) => segment.fileName).sort();
+	if (
+		new Set(actualFiles).size !== actualFiles.length ||
+		JSON.stringify(actualFiles) !== JSON.stringify([...expectedFiles].sort())
+	) {
+		return throwRuntimeAnchorSnapshotError("segment boundaries do not match the anchored index");
+	}
+	return {
+		snapshot: { ...unsigned, snapshotHash: computedSnapshotHash },
+		segments,
+	};
+}
+
+function validateRuntimeAnchorSnapshotHistory(
+	cwd: string,
+	snapshot: AnsteelRuntimeAnchorSnapshot,
+	segments: readonly AnsteelRuntimeAnchorSnapshotSegment[],
+): void {
+	const lengths = new Map(snapshot.segmentByteLengths.map((segment) => [segment.fileName, segment.byteLength]));
+	const directory = getAnsteelRuntimeLogDirectory(cwd);
+	for (const segment of segments) {
+		const path = join(directory, segment.fileName);
+		if (!existsSync(path)) throwRuntimeAnchorSnapshotError(`segment ${segment.fileName} is missing`);
+		const content = readFileSync(path);
+		const byteLength = lengths.get(segment.fileName)!;
+		if (content.length < byteLength) {
+			throwRuntimeAnchorSnapshotError(`segment ${segment.fileName} was truncated after anchoring`);
+		}
+		const prefixHash = createHash("sha256").update(content.subarray(0, byteLength)).digest("hex");
+		if (prefixHash !== segment.sha256) {
+			throwRuntimeAnchorSnapshotError(`segment ${segment.fileName} no longer has its anchored prefix`);
+		}
+	}
+	const segmentsByRun = new Map<string, AnsteelRuntimeAnchorSnapshotSegment[]>();
+	for (const segment of segments) {
+		const runSegments = segmentsByRun.get(segment.runId);
+		if (runSegments === undefined) segmentsByRun.set(segment.runId, [segment]);
+		else runSegments.push(segment);
+	}
+	for (const [runId, runSegments] of segmentsByRun) {
+		const head = runSegments[0]?.logChainHeadHash;
+		if (head === null || head === undefined) continue;
+		let entries: AnsteelRuntimeLogEntry[];
+		try {
+			entries = readAnsteelRuntimeLogs(cwd, runId);
+		} catch (error) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime anchor snapshot cannot verify ${runId}`,
+				{ cause: error },
+			);
+		}
+		if (!entries.some((entry) => entry.hash === head)) {
+			throwRuntimeAnchorSnapshotError(`run ${runId} no longer contains its anchored chain head`);
+		}
+	}
+}
+
+/**
+ * Captures the strict current runtime index into an immutable, content-addressed
+ * local snapshot. The returned hash is included in the remote anchor receipt.
+ */
+export function captureAnsteelRuntimeAnchorSnapshot(
+	cwd: string,
+	expectedIndexHash: string,
+): AnsteelRuntimeAnchorSnapshotReceipt {
+	if (!/^[0-9a-f]{64}$/i.test(expectedIndexHash)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime anchor index hash is invalid");
+	}
+	return withRuntimeIndexLock(cwd, () => {
+		let index: AnsteelRuntimeIndex;
+		try {
+			index = parseRuntimeIndex(cwd);
+			validateRuntimeIndexAgainstLogs(cwd, index);
+		} catch (error) {
+			if (error instanceof AnsteelRuntimeIndexRebuildRequired) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					`Ansteel runtime log integrity verification failed: ${error.message}`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
+		if (index.indexHash !== expectedIndexHash) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime index changed while creating an anchor snapshot",
+			);
+		}
+		const indexContent = readFileSync(getAnsteelRuntimeIndexPath(cwd), "utf8");
+		const segments = parseRuntimeAnchorSnapshotIndex(indexContent, expectedIndexHash);
+		const segmentByteLengths = segments.map((segment) => {
+			const content = readFileSync(join(getAnsteelRuntimeLogDirectory(cwd), segment.fileName));
+			if (createHash("sha256").update(content).digest("hex") !== segment.sha256) {
+				throwRuntimeAnchorSnapshotError(`segment ${segment.fileName} changed while creating the snapshot`);
+			}
+			return { fileName: segment.fileName, byteLength: content.length };
+		});
+		const unsigned: AnsteelRuntimeAnchorSnapshotUnsigned = {
+			schemaVersion: 1,
+			runtimeLogIndexHash: expectedIndexHash,
+			indexContent,
+			segmentByteLengths,
+		};
+		const snapshot: AnsteelRuntimeAnchorSnapshot = {
+			...unsigned,
+			snapshotHash: hashAnsteelAuditValue(unsigned),
+		};
+		const path = getAnsteelRuntimeAnchorSnapshotPath(cwd, snapshot.snapshotHash);
+		mkdirSync(dirname(path), { recursive: true });
+		const content = canonicalizeAnsteelAuditValue(snapshot);
+		if (!existsSync(path)) {
+			try {
+				writeNewDurableFile(path, content);
+			} catch (error) {
+				if (!existsSync(path)) {
+					throw new AnsteelObservabilityError(
+						"event-fsync-failed",
+						"Ansteel runtime anchor snapshot could not be persisted",
+						{ cause: error },
+					);
+				}
+			}
+		}
+		const persisted = parseRuntimeAnchorSnapshot(
+			readFileSync(path, "utf8"),
+			expectedIndexHash,
+			snapshot.snapshotHash,
+		);
+		validateRuntimeAnchorSnapshotHistory(cwd, persisted.snapshot, persisted.segments);
+		return { indexHash: expectedIndexHash, snapshotHash: snapshot.snapshotHash };
+	});
+}
+
+/** Replays the immutable runtime evidence captured by one remote anchor receipt. */
+export function verifyAnsteelRuntimeAnchorSnapshot(
+	cwd: string,
+	expectedIndexHash: string,
+	expectedSnapshotHash: string,
+): void {
+	if (!/^[0-9a-f]{64}$/i.test(expectedIndexHash) || !/^[0-9a-f]{64}$/i.test(expectedSnapshotHash)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime anchor receipt hashes are invalid");
+	}
+	withRuntimeIndexLock(cwd, () => {
+		const path = getAnsteelRuntimeAnchorSnapshotPath(cwd, expectedSnapshotHash);
+		if (!existsSync(path)) throwRuntimeAnchorSnapshotError("file is missing");
+		const parsed = parseRuntimeAnchorSnapshot(readFileSync(path, "utf8"), expectedIndexHash, expectedSnapshotHash);
+		validateRuntimeAnchorSnapshotHistory(cwd, parsed.snapshot, parsed.segments);
+	});
 }
 
 function replaceRuntimeIndexRunLocked(cwd: string, index: AnsteelRuntimeIndex, runId: string): AnsteelRuntimeIndex {

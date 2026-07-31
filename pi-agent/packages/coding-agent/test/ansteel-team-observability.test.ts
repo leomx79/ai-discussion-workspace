@@ -15,6 +15,7 @@ import {
 	listAnsteelRuntimeRuns,
 	readAnsteelRuntimeLogs,
 	traceAnsteelTeamRuntime,
+	verifyAnsteelRuntimeLogIntegrity,
 } from "../src/core/ansteel-team-observability.ts";
 
 const temporaryProjects: string[] = [];
@@ -659,6 +660,31 @@ describe("Ansteel team observability", () => {
 		writeFileSync(logPath, `${firstLine}\n`, "utf8");
 
 		expect(() => traceAnsteelTeamRuntime(cwd, "TASK-TRUNCATED-1")).toThrow(
+			expect.objectContaining({ reasonCode: "event-chain-invalid" }),
+		);
+	});
+
+	it("strictly rejects a changed log segment instead of rebuilding its index", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-integrity", command: "task TASK-STRICT-SEGMENT" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "audit",
+			eventName: "task.completed",
+			outcome: "succeeded",
+			taskId: "TASK-STRICT-SEGMENT",
+			message: "trusted runtime record",
+			data: {},
+		});
+		logger.close();
+		expect(verifyAnsteelRuntimeLogIntegrity(cwd)).toMatchObject({ runCount: 1, segmentCount: 1 });
+
+		const logPath = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const changed = JSON.parse(readFileSync(logPath, "utf8")) as Record<string, unknown>;
+		changed.message = "changed after the indexed segment hash was written";
+		writeFileSync(logPath, `${JSON.stringify(changed)}\n`, "utf8");
+
+		expect(() => verifyAnsteelRuntimeLogIntegrity(cwd)).toThrow(
 			expect.objectContaining({ reasonCode: "event-chain-invalid" }),
 		);
 	});

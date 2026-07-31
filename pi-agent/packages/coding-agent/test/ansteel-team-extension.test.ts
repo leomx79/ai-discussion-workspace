@@ -20,6 +20,7 @@ import {
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
 	diagnoseAnsteelTeamRun,
+	getAnsteelRuntimeIndexPath,
 	getAnsteelRuntimeLogDirectory,
 	listAnsteelRuntimeRuns,
 	readAnsteelRuntimeLogs,
@@ -131,7 +132,9 @@ function setup(
 								});
 							}
 						} else if (milestoneMatch) {
-							const milestone = options.taskOperations.state.milestones.find((item) => item.id === milestoneMatch[1]);
+							const milestone = options.taskOperations.state.milestones.find(
+								(item) => item.id === milestoneMatch[1],
+							);
 							if (
 								milestone?.status === "submitted" &&
 								!milestone.collaborationUpdates.some(
@@ -681,12 +684,11 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		writeFileSync(eventPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
 		harness.sendMessage.mockClear();
 
+		const runIdsBeforeDoctor = listAnsteelRuntimeRuns(harness.ctx.cwd).map((run) => run.runId);
 		await expect(command(`doctor ${healthyRun!.runId}`, harness.ctx)).rejects.toThrow();
-		const doctorRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
-		expect(doctorRun).toBeDefined();
-		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, doctorRun!.runId).rootCause).toMatchObject({
-			reasonCode: "event-chain-invalid",
-		});
+		// A strict integrity gate fails before it creates a diagnostic run. A new
+		// run here could rebuild the log index and overwrite the evidence being checked.
+		expect(listAnsteelRuntimeRuns(harness.ctx.cwd).map((run) => run.runId)).toEqual(runIdsBeforeDoctor);
 
 		await expect(command("board", harness.ctx)).rejects.toThrow();
 		const postTamperMessages = harness.sendMessage.mock.calls
@@ -734,12 +736,9 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 		harness.sendMessage.mockClear();
 
+		const runIdsBeforeDoctor = listAnsteelRuntimeRuns(harness.ctx.cwd).map((run) => run.runId);
 		await expect(command(`doctor ${healthyRun!.runId}`, harness.ctx)).rejects.toThrow();
-		const doctorRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
-		expect(doctorRun).toBeDefined();
-		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, doctorRun!.runId).rootCause).toMatchObject({
-			reasonCode: "state-projection-mismatch",
-		});
+		expect(listAnsteelRuntimeRuns(harness.ctx.cwd).map((run) => run.runId)).toEqual(runIdsBeforeDoctor);
 		const postMismatchMessages = harness.sendMessage.mock.calls
 			.map(([message]) => ("content" in message ? message.content : ""))
 			.join("\n");
@@ -756,6 +755,24 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 			expect.objectContaining({ content: expect.stringContaining("Three-axis status") }),
 			expect.anything(),
 		);
+	});
+
+	it("does not rebuild a missing runtime index before the doctor integrity preflight", async () => {
+		const harness = setup();
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		await command("board", harness.ctx);
+		const healthyRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		if (!healthyRun) throw new Error("Missing healthy runtime run");
+		const indexPath = getAnsteelRuntimeIndexPath(harness.ctx.cwd);
+		expect(existsSync(indexPath)).toBe(true);
+		rmSync(indexPath);
+
+		await expect(command(`doctor ${healthyRun.runId}`, harness.ctx)).rejects.toThrow("runtime-log integrity");
+		// The command must fail before runObservedCommand opens a writer, otherwise
+		// normal logger recovery would recreate the deleted index and hide tampering.
+		expect(existsSync(indexPath)).toBe(false);
 	});
 
 	it.each([
@@ -779,12 +796,9 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		mutateState(state);
 		writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 
+		const runIdsBeforeDoctor = listAnsteelRuntimeRuns(harness.ctx.cwd).map((run) => run.runId);
 		await expect(command(`doctor ${healthyRun!.runId}`, harness.ctx)).rejects.toThrow();
-		const doctorRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
-		expect(doctorRun).toBeDefined();
-		expect(diagnoseAnsteelTeamRun(harness.ctx.cwd, doctorRun!.runId).rootCause).toMatchObject({
-			reasonCode: "state-projection-mismatch",
-		});
+		expect(listAnsteelRuntimeRuns(harness.ctx.cwd).map((run) => run.runId)).toEqual(runIdsBeforeDoctor);
 	});
 
 	it("rejects an active-team board when the persisted team state is damaged", async () => {
@@ -1272,10 +1286,14 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		await staff.taskOperations.submitTask("TASK-1", "node --test test/parser.test.mjs");
 
 		expect(prompts).toHaveLength(10);
-		expect(prompts.filter((prompt) => prompt.includes("continuous collaborator for TASK-1 revision"))).toHaveLength(2);
+		expect(prompts.filter((prompt) => prompt.includes("continuous collaborator for TASK-1 revision"))).toHaveLength(
+			2,
+		);
 		expect(prompts.filter((prompt) => prompt.startsWith("You are the independent "))).toHaveLength(2);
 		const taskEventTypes = listAnsteelTeamEvents(ctx.cwd)
-			.filter((event) => ["task-collaboration", "task-final-verification-requested", "task-review"].includes(event.type))
+			.filter((event) =>
+				["task-collaboration", "task-final-verification-requested", "task-review"].includes(event.type),
+			)
 			.map((event) => event.type);
 		expect(taskEventTypes).toEqual([
 			"task-collaboration",

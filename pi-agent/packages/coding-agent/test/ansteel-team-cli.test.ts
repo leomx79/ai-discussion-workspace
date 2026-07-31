@@ -5,7 +5,27 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
-import { listAnsteelRuntimeRuns } from "../src/core/ansteel-team-observability.ts";
+import {
+	appendAnsteelTeamEvent,
+	beginAnsteelTeamMilestoneFinalVerification,
+	beginAnsteelTeamTaskFinalVerification,
+	claimAnsteelTeamTask,
+	createAnsteelTeamMilestone,
+	createAnsteelTeamState,
+	publishAnsteelTeamMilestoneCollaboration,
+	publishAnsteelTeamTaskCollaboration,
+	recordAnsteelTeamTaskTestResult,
+	reviewAnsteelTeamMilestone,
+	reviewAnsteelTeamTask,
+	runAnsteelTeamMilestoneTest,
+	submitAnsteelTeamMilestone,
+	submitAnsteelTeamTask,
+} from "../src/core/ansteel-team.ts";
+import {
+	createAnsteelRunContext,
+	createAnsteelRuntimeLogger,
+	listAnsteelRuntimeRuns,
+} from "../src/core/ansteel-team-observability.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const ansteelTeamExtensionPath = resolve(__dirname, "../src/extensions/ansteel-team/index.ts");
@@ -789,6 +809,119 @@ function createTaskStaffFileVersion(projectDir: string, content: string | Buffer
 	return `TASK-STAFF@0;src/staff.ts@file:${stats.dev}:${stats.ino};sha256:${hash}`;
 }
 
+/**
+ * Build the complete approved-task and approved-milestone history before the
+ * RPC process starts. The command under test still performs every Git anchor
+ * and verification operation through the registered extension command.
+ */
+function prepareAnchorRpcFixture(projectDir: string): {
+	taskId: string;
+	milestoneId: string;
+	remote: string;
+} {
+	initializeTaskDeliveryProject(projectDir);
+	writeFileSync(join(projectDir, ".gitignore"), ".pi/\n", "utf8");
+	execFileSync("git", ["add", ".gitignore"], { cwd: projectDir, stdio: "ignore" });
+	execFileSync("git", ["commit", "-m", "ignore local audit state"], { cwd: projectDir, stdio: "ignore" });
+
+	const state = createAnsteelTeamState({
+		cwd: projectDir,
+		topic: "Exercise RPC task and milestone anchors",
+		roleModels: {
+			"tech-lead": "deterministic-team-tl/tl",
+			"staff-engineer": "deterministic-team-staff/staff",
+			"qa-engineer": "deterministic-team-qa/qa",
+		},
+	});
+	const task = claimAnsteelTeamTask(projectDir, state, {
+		id: "TASK-RPC-ANCHOR",
+		owner: "staff-engineer",
+		files: ["src/staff.ts"],
+		description: "Produce a committed implementation before the RPC anchor command.",
+		acceptanceCriteria: "The deterministic staff test passes.",
+	});
+	const milestone = createAnsteelTeamMilestone(projectDir, state, {
+		id: "MILESTONE-RPC-ANCHOR",
+		taskIds: [task.id],
+		description: "Verify the task and milestone command routes against a real Git remote.",
+		acceptanceCriteria: "Both structured anchor receipts verify through RPC.",
+	});
+	writeFileSync(join(projectDir, "src", "staff.ts"), "export const staff = 'implemented';\n", "utf8");
+	recordAnsteelTeamTaskTestResult(projectDir, state, "staff-engineer", task.id, {
+		command: "node --test test/staff.test.mjs",
+		output: "PASS deterministic staff fixture",
+		isError: false,
+	});
+	submitAnsteelTeamTask(projectDir, state, "staff-engineer", task.id, "node --test test/staff.test.mjs");
+	for (const collaborator of ["tech-lead", "qa-engineer"] as const) {
+		publishAnsteelTeamTaskCollaboration(projectDir, state, collaborator, task.id, {
+			summary: `${collaborator} inspected the frozen RPC task evidence.`,
+			evidenceRefs: [`test:${task.id}:${collaborator}:continuous-collaboration`],
+			uncertainties: [],
+		});
+	}
+	beginAnsteelTeamTaskFinalVerification(projectDir, state, task.id);
+	reviewAnsteelTeamTask(projectDir, state, "tech-lead", task.id, { verdict: "approve" });
+	reviewAnsteelTeamTask(projectDir, state, "qa-engineer", task.id, { verdict: "approve" });
+	execFileSync("git", ["add", "src/staff.ts"], { cwd: projectDir, stdio: "ignore" });
+	execFileSync("git", ["commit", "-m", "complete anchor fixture task"], { cwd: projectDir, stdio: "ignore" });
+
+	runAnsteelTeamMilestoneTest(projectDir, state, "tech-lead", milestone.id, "node --test test/staff.test.mjs");
+	submitAnsteelTeamMilestone(projectDir, state, "tech-lead", milestone.id, "node --test test/staff.test.mjs");
+	for (const collaborator of ["staff-engineer", "qa-engineer"] as const) {
+		publishAnsteelTeamMilestoneCollaboration(projectDir, state, collaborator, milestone.id, {
+			summary: `${collaborator} inspected the frozen RPC integration evidence.`,
+			evidenceRefs: [`test:${milestone.id}:${collaborator}:continuous-collaboration`],
+			uncertainties: [],
+		});
+	}
+	beginAnsteelTeamMilestoneFinalVerification(projectDir, state, milestone.id);
+	reviewAnsteelTeamMilestone(projectDir, state, "staff-engineer", milestone.id, { verdict: "approve" });
+	reviewAnsteelTeamMilestone(projectDir, state, "qa-engineer", milestone.id, { verdict: "approve" });
+
+	appendAnsteelTeamEvent(projectDir, state, {
+		type: "task-review",
+		role: "tech-lead",
+		content: `${task.id} revision ${task.revision}: APPROVE`,
+	});
+	appendAnsteelTeamEvent(projectDir, state, {
+		type: "task-review",
+		role: "qa-engineer",
+		content: `${task.id} revision ${task.revision}: APPROVE`,
+	});
+	appendAnsteelTeamEvent(projectDir, state, {
+		type: "milestone-review",
+		role: "staff-engineer",
+		content: `${milestone.id} integration revision ${milestone.revision}: APPROVE`,
+	});
+	appendAnsteelTeamEvent(projectDir, state, {
+		type: "milestone-review",
+		role: "qa-engineer",
+		content: `${milestone.id} integration revision ${milestone.revision}: APPROVE`,
+	});
+	const logger = createAnsteelRuntimeLogger(
+		projectDir,
+		createAnsteelRunContext({ teamId: state.id, command: "prepare anchor RPC fixture" }),
+	);
+	logger.write({
+		level: "audit",
+		eventName: "anchor.rpc.fixture.prepared",
+		outcome: "succeeded",
+		message: "A strict runtime segment exists before the RPC anchor command.",
+		data: {},
+	});
+	logger.close();
+
+	const remoteDirectory = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-rpc-remote-"));
+	temporaryDirectories.push(remoteDirectory);
+	execFileSync("git", ["init", "--bare", remoteDirectory], { stdio: "ignore" });
+	const remote = "audit";
+	execFileSync("git", ["remote", "add", remote, remoteDirectory], { cwd: projectDir, stdio: "ignore" });
+	const branch = execFileSync("git", ["branch", "--show-current"], { cwd: projectDir, encoding: "utf8" }).trim();
+	execFileSync("git", ["push", remote, `HEAD:refs/heads/${branch}`], { cwd: projectDir, stdio: "ignore" });
+	return { taskId: task.id, milestoneId: milestone.id, remote };
+}
+
 function startRpcCli(projectDir: string, agentDir: string): RpcCliProcess {
 	const child = spawn(
 		process.execPath,
@@ -1484,6 +1617,67 @@ describe("Ansteel team CLI", () => {
 			await rpc.stop();
 		}
 	}, 30_000);
+
+	it("anchors and verifies approved task and milestone receipts through real Git RPC routes", async () => {
+		const { agentDir, projectDir } = createTemporaryProject();
+		const fixture = prepareAnchorRpcFixture(projectDir);
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "anchor-commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+
+			for (const [targetId, operation] of [
+				[fixture.taskId, "task"],
+				[fixture.milestoneId, "milestone"],
+			] as const) {
+				const anchored = await rpc.send({
+					id: `anchor-${operation}`,
+					type: "prompt",
+					message: `/${teamCommand} anchor ${targetId} ${fixture.remote}`,
+				});
+				expect(anchored).toMatchObject({ success: true, command: "prompt" });
+				const verified = await rpc.send({
+					id: `verify-${operation}`,
+					type: "prompt",
+					message: `/${teamCommand} verify-anchor ${targetId} ${fixture.remote}`,
+				});
+				expect(verified).toMatchObject({ success: true, command: "prompt" });
+			}
+
+			const remoteMismatch = await rpc.send({
+				id: "verify-anchor-remote-mismatch",
+				type: "prompt",
+				message: `/${teamCommand} verify-anchor ${fixture.taskId} origin`,
+			});
+			expect(remoteMismatch).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("verification remote does not match"),
+			});
+
+			const events = readFileSync(join(projectDir, ".pi", "ansteel-team", "events.jsonl"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { type: string; anchor?: { target?: { id?: string } } });
+			expect(events).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "task-anchor",
+						anchor: expect.objectContaining({ target: expect.objectContaining({ id: fixture.taskId }) }),
+					}),
+					expect.objectContaining({
+						type: "milestone-anchor",
+						anchor: expect.objectContaining({ target: expect.objectContaining({ id: fixture.milestoneId }) }),
+					}),
+				]),
+			);
+		} finally {
+			await rpc.stop();
+		}
+	}, 60_000);
 
 	it("returns RPC failure when doctor diagnoses a run without persisted logs", async () => {
 		const { agentDir, projectDir } = createTemporaryProject();

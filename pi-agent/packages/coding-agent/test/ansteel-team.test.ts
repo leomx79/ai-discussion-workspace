@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -16,6 +17,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	type AnsteelWorkCheckpoint,
 	type AnsteelWorkCheckpointInput,
+	anchorAnsteelTeamMilestone,
+	anchorAnsteelTeamTask,
 	appendAnsteelTeamEvent,
 	assessAnsteelTeamAction,
 	beginAnsteelTeamMilestoneFinalVerification,
@@ -26,19 +29,19 @@ import {
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
 	getAnsteelTeamEventPath,
+	getAnsteelTeamMilestoneFinalVerificationReadiness,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatePath,
 	getAnsteelTeamStatusAxes,
-	getAnsteelTeamMilestoneFinalVerificationReadiness,
-	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamTaskFinalVerificationReadiness,
+	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamTransactionPath,
 	getAnsteelTeamWriteBlockReason,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
-	publishAnsteelWorkCheckpoint,
 	publishAnsteelTeamMilestoneCollaboration,
 	publishAnsteelTeamTaskCollaboration,
+	publishAnsteelWorkCheckpoint,
 	raiseAnsteelProcessIssue,
 	recordAnsteelTeamTaskTestResult,
 	resolveAnsteelProcessIssue,
@@ -53,11 +56,19 @@ import {
 	saveAnsteelTeamState,
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
+	verifyAnsteelTeamExternalAnchor,
 } from "../src/core/ansteel-team.ts";
+import {
+	canonicalizeAnsteelAuditValue,
+	createAnsteelTeamMerkleRoot,
+	signAnsteelTeamAuditEvent,
+	verifyAnsteelTeamAuditEventSignatures,
+} from "../src/core/ansteel-team-integrity.ts";
 import {
 	type AnsteelRuntimeLogEntry,
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
+	getAnsteelRuntimeAnchorSnapshotPath,
 	readAnsteelRuntimeLogs,
 } from "../src/core/ansteel-team-observability.ts";
 import { createEditTool } from "../src/core/tools/edit.ts";
@@ -2342,12 +2353,12 @@ describe("Ansteel team state", () => {
 			reviewAnsteelTeamMilestone(cwd, team, "staff-engineer", milestone.id, { verdict: "approve" }),
 		).toThrow("not in final verification");
 		expect(getAnsteelTeamMilestoneFinalVerificationReadiness(cwd, team, milestone.id)).toMatchObject({
-		ready: false,
-		blockers: expect.arrayContaining([
-			"missing continuous collaboration update from staff-engineer",
-			"missing continuous collaboration update from qa-engineer",
-		]),
-	});
+			ready: false,
+			blockers: expect.arrayContaining([
+				"missing continuous collaboration update from staff-engineer",
+				"missing continuous collaboration update from qa-engineer",
+			]),
+		});
 		beginMilestoneFinalVerificationForTest(cwd, team, milestone.id);
 		reviewAnsteelTeamMilestone(cwd, team, "staff-engineer", milestone.id, { verdict: "approve" });
 		reviewAnsteelTeamMilestone(cwd, team, "qa-engineer", milestone.id, { verdict: "approve" });
@@ -2452,7 +2463,8 @@ describe("Ansteel team state", () => {
 			id: "CP-BLOCKING-COLLABORATION-0001",
 			taskId: task.id,
 			goal: "Publish the parser test boundary before frozen submission.",
-			currentUnderstanding: "The owner has a candidate parser change but peer counterexample coverage is incomplete.",
+			currentUnderstanding:
+				"The owner has a candidate parser change but peer counterexample coverage is incomplete.",
 			assumptions: [],
 			evidenceRefs: ["file:src/parser.ts"],
 			uncertainties: ["Whether an empty token bypasses the parser"],
@@ -2742,6 +2754,324 @@ describe("Ansteel team state", () => {
 		);
 		expect(logs.every((entry) => entry.traceId === context.traceId)).toBe(true);
 	});
+
+	it("rejects a role-identity forgery, replayed signature, and post-cutover unsigned event", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		const first = appendAnsteelTeamEvent(cwd, team, {
+			type: "role-report",
+			role: "staff-engineer",
+			content: "Staff evidence for a signed event.",
+		});
+		const second = appendAnsteelTeamEvent(cwd, team, {
+			type: "role-report",
+			role: "staff-engineer",
+			content: "A separate event that cannot reuse the first signature.",
+		});
+		expect(first.signature?.keyId).toMatch(/^ed25519-/);
+		expect(second.signature?.keyId).toBe(first.signature?.keyId);
+		expect(verifyAnsteelTeamAuditEventSignatures(cwd, [first, second])).toMatchObject({
+			mode: "fully-signed",
+			signedEventCount: 2,
+		});
+
+		const eventPath = getAnsteelTeamEventPath(cwd);
+		const records = readFileSync(eventPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const forgedIdentity = structuredClone(records);
+		forgedIdentity[1]!.signature = {
+			...(forgedIdentity[1]!.signature as Record<string, unknown>),
+			keyId: "ed25519-00000000000000000000000000000000",
+		};
+		writeFileSync(eventPath, `${forgedIdentity.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+		expect(() => listAnsteelTeamEvents(cwd)).toThrow("signature key does not belong");
+
+		const replayedSignature = structuredClone(records);
+		replayedSignature[1]!.signature = records[0]!.signature;
+		writeFileSync(eventPath, `${replayedSignature.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+		expect(() => listAnsteelTeamEvents(cwd)).toThrow("signature is invalid");
+
+		const downgraded = structuredClone(records);
+		delete downgraded[1]!.signature;
+		writeFileSync(eventPath, `${downgraded.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+		expect(() => listAnsteelTeamEvents(cwd)).toThrow("unsigned after the signing cutover");
+	});
+
+	it("uses JCS for new event hashes across hostile JSON shapes without changing legacy replay", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		const adversarial = JSON.parse(
+			'{"z":5e-324,"__proto__":{"constructor":"data"},"constructor":{"nested":{"deep":{"value":"\\u96ea"}}},"unicode":"\\ud83d\\ude80\\u0301","max":1.7976931348623157e+308}',
+		) as Record<string, unknown>;
+		const reordered = JSON.parse(
+			'{"max":1.7976931348623157e+308,"unicode":"\\ud83d\\ude80\\u0301","constructor":{"nested":{"deep":{"value":"\\u96ea"}}},"__proto__":{"constructor":"data"},"z":5e-324}',
+		) as Record<string, unknown>;
+		const canonical = canonicalizeAnsteelAuditValue(adversarial);
+		expect(canonicalizeAnsteelAuditValue(reordered)).toBe(canonical);
+		expect(canonical).toContain('"__proto__"');
+		expect(canonical).toContain('"constructor"');
+
+		const event = appendAnsteelTeamEvent(cwd, team, {
+			type: "role-report",
+			role: "tech-lead",
+			content: "JCS event body retains Unicode evidence: 雪 🚀.",
+		});
+		expect(event.hashAlgorithm).toBe("sha256-jcs-v1");
+		expect(listAnsteelTeamEvents(cwd)).toHaveLength(1);
+	});
+
+	it("uses domain-separated JCS Merkle roots and anchors approved tasks and milestones to verified remote Git notes", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		writeFileSync(join(cwd, ".gitignore"), ".pi/\n", "utf8");
+		execFileSync("git", ["add", ".gitignore"], { cwd, stdio: "ignore" });
+		execFileSync("git", ["commit", "-m", "ignore local audit state"], { cwd, stdio: "ignore" });
+		mkdirSync(join(cwd, "test"), { recursive: true });
+		writeFileSync(
+			join(cwd, "test", "integration.test.mjs"),
+			"import test from 'node:test';\ntest('integration', () => {});\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "test/integration.test.mjs"], { cwd, stdio: "ignore" });
+		execFileSync("git", ["commit", "-m", "integration fixture"], { cwd, stdio: "ignore" });
+		const team = createTeam(cwd);
+		const task = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-ANCHOR-PARSER",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Implement the parser change that belongs to the anchored milestone.",
+			acceptanceCriteria: "Task and integration tests pass before external anchoring.",
+		});
+		const milestone = createAnsteelTeamMilestone(cwd, team, {
+			id: "MILESTONE-ANCHOR-PARSER",
+			taskIds: [task.id],
+			description: "Anchor the approved parser integration milestone.",
+			acceptanceCriteria: "The remote Git note contains the verified Merkle receipt.",
+		});
+		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'anchored';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+			command: "npm test -- parser",
+			output: "PASS parser boundary",
+			isError: false,
+		});
+		submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+		beginTaskFinalVerificationForTest(cwd, team, task.id);
+		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+		execFileSync("git", ["add", "src/parser.ts"], { cwd, stdio: "ignore" });
+		execFileSync("git", ["commit", "-m", "anchored parser change"], { cwd, stdio: "ignore" });
+		expect(milestone.status).toBe("ready");
+		runAnsteelTeamMilestoneTest(cwd, team, "tech-lead", milestone.id, "node --test test/integration.test.mjs");
+		submitAnsteelTeamMilestone(cwd, team, "tech-lead", milestone.id, "node --test test/integration.test.mjs");
+		beginMilestoneFinalVerificationForTest(cwd, team, milestone.id);
+		reviewAnsteelTeamMilestone(cwd, team, "staff-engineer", milestone.id, { verdict: "approve" });
+		reviewAnsteelTeamMilestone(cwd, team, "qa-engineer", milestone.id, { verdict: "approve" });
+		expect(milestone.status).toBe("approved");
+
+		appendAnsteelTeamEvent(cwd, team, {
+			type: "role-report",
+			role: "tech-lead",
+			content: "The approved milestone is ready for its signed external anchor.",
+		});
+		appendAnsteelTeamEvent(cwd, team, {
+			type: "milestone-review",
+			role: "staff-engineer",
+			content: `${milestone.id} integration revision ${milestone.revision}: APPROVE`,
+		});
+		appendAnsteelTeamEvent(cwd, team, {
+			type: "milestone-review",
+			role: "qa-engineer",
+			content: `${milestone.id} integration revision ${milestone.revision}: APPROVE`,
+		});
+		const context = createAnsteelRunContext({ teamId: team.id, command: "anchor milestone" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "audit",
+			eventName: "milestone.anchor.preflight",
+			outcome: "succeeded",
+			message: "A durable runtime segment exists before anchoring.",
+			data: {},
+		});
+		logger.close();
+		const remoteDirectory = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-remote-"));
+		temporaryDirectories.push(remoteDirectory);
+		execFileSync("git", ["init", "--bare", remoteDirectory], { stdio: "ignore" });
+		execFileSync("git", ["remote", "add", "audit", remoteDirectory], { cwd, stdio: "ignore" });
+		const branch = execFileSync("git", ["branch", "--show-current"], { cwd, encoding: "utf8" }).trim();
+		execFileSync("git", ["push", "audit", `HEAD:refs/heads/${branch}`], { cwd, stdio: "ignore" });
+		const staleTeam = structuredClone(team);
+		appendAnsteelTeamEvent(cwd, team, {
+			type: "task-review",
+			role: "tech-lead",
+			content: `${task.id} revision ${task.revision}: APPROVE`,
+		});
+		appendAnsteelTeamEvent(cwd, team, {
+			type: "task-review",
+			role: "qa-engineer",
+			content: `${task.id} revision ${task.revision}: APPROVE`,
+		});
+		expect(() => anchorAnsteelTeamTask(cwd, staleTeam, task.id, { remote: "audit" })).toThrow(
+			"ledger head hash does not match",
+		);
+		const splitPushRemote = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-split-push-"));
+		temporaryDirectories.push(splitPushRemote);
+		execFileSync("git", ["init", "--bare", splitPushRemote], { stdio: "ignore" });
+		execFileSync("git", ["remote", "set-url", "--add", "--push", "audit", remoteDirectory], {
+			cwd,
+			stdio: "ignore",
+		});
+		execFileSync("git", ["remote", "set-url", "--add", "--push", "audit", splitPushRemote], {
+			cwd,
+			stdio: "ignore",
+		});
+		expect(() => anchorAnsteelTeamTask(cwd, team, task.id, { remote: "audit" })).toThrow(
+			"endpoints are not a single matching endpoint",
+		);
+		execFileSync("git", ["config", "--unset-all", "remote.audit.pushurl"], { cwd, stdio: "ignore" });
+
+		const postPushRewrite = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-post-push-rewrite-"));
+		temporaryDirectories.push(postPushRewrite);
+		writeFileSync(join(postPushRewrite, "replacement.txt"), "post-push replacement history\n", "utf8");
+		execFileSync("git", ["init"], { cwd: postPushRewrite, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "ansteel@example.test"], { cwd: postPushRewrite, stdio: "ignore" });
+		execFileSync("git", ["config", "user.name", "Ansteel Test"], { cwd: postPushRewrite, stdio: "ignore" });
+		execFileSync("git", ["add", "replacement.txt"], { cwd: postPushRewrite, stdio: "ignore" });
+		execFileSync("git", ["commit", "-m", "post-push replacement"], { cwd: postPushRewrite, stdio: "ignore" });
+		execFileSync("git", ["remote", "add", "audit", remoteDirectory], { cwd: postPushRewrite, stdio: "ignore" });
+		execFileSync("git", ["push", "audit", "HEAD:refs/heads/ansteel-post-push-rewrite"], {
+			cwd: postPushRewrite,
+			stdio: "ignore",
+		});
+		const replacementCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+			cwd: postPushRewrite,
+			encoding: "utf8",
+		}).trim();
+		const postReceiveHook = join(remoteDirectory, "hooks", "post-receive");
+		writeFileSync(postReceiveHook, `#!/bin/sh\ngit update-ref refs/heads/${branch} ${replacementCommit}\n`, "utf8");
+		chmodSync(postReceiveHook, 0o755);
+		expect(() => anchorAnsteelTeamTask(cwd, team, task.id, { remote: "audit" })).toThrow(
+			"anchored commit remains reachable from the remote source branch",
+		);
+		expect(listAnsteelTeamEvents(cwd).some((event) => event.type === "task-anchor")).toBe(false);
+		rmSync(postReceiveHook, { force: true });
+		execFileSync("git", ["push", "audit", `+HEAD:refs/heads/${branch}`], { cwd, stdio: "ignore" });
+		const taskAnchor = anchorAnsteelTeamTask(cwd, team, task.id, { remote: "audit" });
+		expect(taskAnchor).toMatchObject({
+			target: { kind: "task", id: task.id, revision: task.revision },
+			git: { remote: "audit" },
+		});
+		expect(verifyAnsteelTeamExternalAnchor(cwd, team, task.id)).toMatchObject({
+			anchorHash: taskAnchor.anchorHash,
+		});
+		expect(taskAnchor.runtimeLogSnapshotHash).toMatch(/^[0-9a-f]{64}$/);
+		const snapshotPath = getAnsteelRuntimeAnchorSnapshotPath(cwd, taskAnchor.runtimeLogSnapshotHash);
+		const originalSnapshot = readFileSync(snapshotPath, "utf8");
+		writeFileSync(snapshotPath, "{}\n", "utf8");
+		expect(() => verifyAnsteelTeamExternalAnchor(cwd, team, task.id)).toThrow(
+			"runtime anchor snapshot has an invalid schema",
+		);
+		writeFileSync(snapshotPath, originalSnapshot, "utf8");
+
+		const signingDirectory = join(cwd, ".pi", "ansteel-team");
+		const manifestPath = join(signingDirectory, "signing-manifest.json");
+		const privateKeyPath = join(signingDirectory, "signing-private-keys.json");
+		const originalManifest = readFileSync(manifestPath, "utf8");
+		const originalPrivateKeys = readFileSync(privateKeyPath, "utf8");
+		const eventPath = getAnsteelTeamEventPath(cwd);
+		const originalEvents = readFileSync(eventPath, "utf8");
+		rmSync(manifestPath, { force: true });
+		rmSync(privateKeyPath, { force: true });
+		const rekeyedEvents = originalEvents
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>)
+			.map((record) => ({
+				...record,
+				signature: signAnsteelTeamAuditEvent(cwd, team.id, {
+					sequence: record.sequence as number,
+					role: record.role as "tech-lead" | "staff-engineer" | "qa-engineer" | "coordinator",
+					hash: record.hash as string,
+				}),
+			}));
+		writeFileSync(eventPath, `${rekeyedEvents.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+		expect(() => verifyAnsteelTeamExternalAnchor(cwd, team, task.id)).toThrow(
+			"signing manifest does not match the anchored receipt",
+		);
+		writeFileSync(manifestPath, originalManifest, "utf8");
+		writeFileSync(privateKeyPath, originalPrivateKeys, "utf8");
+		writeFileSync(eventPath, originalEvents, "utf8");
+		expect(listAnsteelTeamEvents(cwd).at(-1)).toMatchObject({
+			type: "task-anchor",
+			anchor: { anchorHash: taskAnchor.anchorHash, target: { kind: "task", id: task.id } },
+		});
+		execFileSync("git", ["--git-dir", remoteDirectory, "update-ref", "-d", taskAnchor.git.notesRef], {
+			stdio: "ignore",
+		});
+		expect(() => verifyAnsteelTeamExternalAnchor(cwd, team, task.id)).toThrow("remote anchor ref was not found");
+
+		const beforeAnchor = listAnsteelTeamEvents(cwd);
+		const root = createAnsteelTeamMerkleRoot(beforeAnchor.map((event) => event.hash));
+		expect(createAnsteelTeamMerkleRoot([...beforeAnchor].reverse().map((event) => event.hash)).root).not.toBe(
+			root.root,
+		);
+		const anchor = anchorAnsteelTeamMilestone(cwd, team, milestone.id, { remote: "audit" });
+		expect(anchor).toMatchObject({
+			target: { kind: "milestone", id: milestone.id, revision: milestone.revision },
+			merkle: { root: root.root, leafCount: beforeAnchor.length },
+			git: { remote: "audit", commit: expect.stringMatching(/^[0-9a-f]{40}$/) },
+		});
+		expect(anchor.git.noteObject).toBe(anchor.git.remoteRefObject);
+		const note = execFileSync(
+			"git",
+			["--git-dir", remoteDirectory, "notes", `--ref=${anchor.git.notesRef}`, "show", anchor.git.commit],
+			{
+				encoding: "utf8",
+			},
+		);
+		expect(JSON.parse(note)).toMatchObject({ anchorHash: anchor.anchorHash, merkle: { root: root.root } });
+		expect(verifyAnsteelTeamExternalAnchor(cwd, team, milestone.id)).toMatchObject({ anchorHash: anchor.anchorHash });
+		const rewrittenSource = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-rewrite-"));
+		temporaryDirectories.push(rewrittenSource);
+		writeFileSync(join(rewrittenSource, "replacement.txt"), "unrelated replacement history\n", "utf8");
+		execFileSync("git", ["init"], { cwd: rewrittenSource, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "ansteel@example.test"], { cwd: rewrittenSource, stdio: "ignore" });
+		execFileSync("git", ["config", "user.name", "Ansteel Test"], { cwd: rewrittenSource, stdio: "ignore" });
+		execFileSync("git", ["add", "replacement.txt"], { cwd: rewrittenSource, stdio: "ignore" });
+		execFileSync("git", ["commit", "-m", "unrelated replacement"], { cwd: rewrittenSource, stdio: "ignore" });
+		execFileSync("git", ["remote", "add", "audit", remoteDirectory], { cwd: rewrittenSource, stdio: "ignore" });
+		execFileSync("git", ["push", "audit", `+HEAD:refs/heads/${branch}`], { cwd: rewrittenSource, stdio: "ignore" });
+		expect(() => verifyAnsteelTeamExternalAnchor(cwd, team, milestone.id)).toThrow(
+			"anchored commit remains reachable from the remote source branch",
+		);
+		execFileSync("git", ["push", "audit", `+${anchor.git.commit}:refs/heads/${branch}`], {
+			cwd,
+			stdio: "ignore",
+		});
+
+		const replacementRemote = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-replacement-"));
+		temporaryDirectories.push(replacementRemote);
+		execFileSync("git", ["init", "--bare", replacementRemote], { stdio: "ignore" });
+		execFileSync("git", ["remote", "add", "replacement", replacementRemote], { cwd, stdio: "ignore" });
+		execFileSync("git", ["push", "replacement", `${anchor.git.commit}:refs/heads/${branch}`], {
+			cwd,
+			stdio: "ignore",
+		});
+		execFileSync("git", ["push", "replacement", `${anchor.git.notesRef}:${anchor.git.notesRef}`], {
+			cwd,
+			stdio: "ignore",
+		});
+		execFileSync("git", ["remote", "set-url", "audit", replacementRemote], { cwd, stdio: "ignore" });
+		expect(() => verifyAnsteelTeamExternalAnchor(cwd, team, milestone.id)).toThrow(
+			"endpoint does not match the persisted receipt",
+		);
+		expect(listAnsteelTeamEvents(cwd).at(-1)).toMatchObject({
+			type: "milestone-anchor",
+			signature: expect.any(Object),
+			anchor: { anchorHash: anchor.anchorHash, target: { kind: "milestone", id: milestone.id } },
+		});
+	}, 30_000);
 
 	it("rejects state and event paths that escape the reviewed project", () => {
 		const cwd = createTemporaryProject();

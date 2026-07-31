@@ -13,17 +13,39 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import { ANSTEEL_ROLES, type AnsteelRole, DEFAULT_ANSTEEL_TEAM_TASK_OWNERS } from "./ansteel-discussion.ts";
 import {
+	type AnsteelTeamEventSignature,
+	assertAnsteelTeamAuditManifestTeam,
+	canonicalizeAnsteelAuditValue,
+	createAnsteelTeamMerkleRoot,
+	hashAnsteelAuditValue,
+	signAnsteelTeamAuditEvent,
+	verifyAnsteelTeamAuditEventSignatures,
+} from "./ansteel-team-integrity.ts";
+import {
 	type AnsteelRuntimeLogEntry,
 	type AnsteelRuntimeLogger,
+	captureAnsteelRuntimeAnchorSnapshot,
 	redactAnsteelSensitiveValue,
+	verifyAnsteelRuntimeAnchorSnapshot,
+	verifyAnsteelRuntimeLogIntegrity,
 } from "./ansteel-team-observability.ts";
 
 const ANSTEEL_TEAM_STATE_VERSION = 10;
+// Local diffs and explicit anchor traffic share one bounded Git execution
+// budget. In particular, an unavailable remote or credential helper must not
+// leave the coordinator command waiting indefinitely.
+const ANSTEEL_GIT_COMMAND_TIMEOUT_MS = 30_000;
+// Old ledgers used a deterministic field projection with JSON.stringify. New
+// records carry this explicit marker and are hashed through the mature JCS
+// implementation in ansteel-team-integrity.ts. The marker makes the cutover
+// replayable without silently changing historical event hashes.
+const ANSTEEL_TEAM_EVENT_HASH_ALGORITHM = "sha256-jcs-v1" as const;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
 const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
@@ -108,7 +130,11 @@ export type AnsteelTeamEventType =
 	| "process-resolution-review"
 	| "action-assessed"
 	| "action-review"
-	| "runtime-recovery";
+	| "runtime-recovery"
+	/** A locally approved task has a verified Merkle root in a pushed Git receipt. */
+	| "task-anchor"
+	/** A locally approved milestone has a verified Merkle root in a pushed Git note. */
+	| "milestone-anchor";
 
 export type AnsteelTeamEventActor = AnsteelRole | "coordinator";
 
@@ -349,6 +375,75 @@ export interface AnsteelTeamMilestoneReview {
 	reviewedAt: string;
 }
 
+export type AnsteelTeamAnchorTargetKind = "task" | "milestone";
+
+/** The reviewed work item represented by one immutable external receipt. */
+export interface AnsteelTeamAnchorTarget {
+	kind: AnsteelTeamAnchorTargetKind;
+	id: string;
+	revision: number;
+}
+
+/**
+ * Content-addressed receipt stored in the remote Git note. It intentionally
+ * omits local observation time and ref-object IDs, so a failed push can retry
+ * the identical snapshot without replacing any historical receipt.
+ */
+export interface AnsteelTeamAnchorNote {
+	schemaVersion: 3;
+	anchorHash: string;
+	teamId: string;
+	target: AnsteelTeamAnchorTarget;
+	eventRange: {
+		firstSequence: number;
+		lastSequence: number;
+		eventCount: number;
+	};
+	merkle: {
+		algorithm: "sha256-jcs-v1";
+		leafCount: number;
+		root: string;
+	};
+	signingManifestHash: string;
+	runtimeLogIndexHash: string;
+	/** Hash of the immutable runtime-index snapshot that proves the index state. */
+	runtimeLogSnapshotHash: string;
+	git: {
+		commit: string;
+		branch: string;
+		remote: string;
+		/** Credential-free identity of the remote endpoint, not the mutable alias. */
+		remoteEndpoint: string;
+		notesRef: string;
+	};
+}
+
+/**
+ * Structured receipt persisted in a signed ledger event after the remote ref
+ * is checked. Keeping ref-object IDs here makes later remote re-verification
+ * mechanical instead of relying on the human-readable event content.
+ */
+export interface AnsteelTeamExternalAnchor extends AnsteelTeamAnchorNote {
+	anchoredAt: string;
+	git: AnsteelTeamAnchorNote["git"] & {
+		noteObject: string;
+		remoteRefObject: string;
+	};
+}
+
+/** Compatibility alias for callers that anchor a milestone specifically. */
+export type AnsteelTeamMilestoneGitAnchor = AnsteelTeamExternalAnchor;
+/** A task is anchored with the same receipt and verification contract. */
+export type AnsteelTeamTaskGitAnchor = AnsteelTeamExternalAnchor;
+
+export interface AnchorAnsteelTeamOptions {
+	/** Defaults to origin. The command never discovers or substitutes another remote. */
+	remote?: string;
+}
+
+export type AnchorAnsteelTeamMilestoneOptions = AnchorAnsteelTeamOptions;
+export type AnchorAnsteelTeamTaskOptions = AnchorAnsteelTeamOptions;
+
 export interface ClaimAnsteelTeamTaskInput {
 	id: string;
 	owner: AnsteelRole;
@@ -453,14 +548,20 @@ export interface AnsteelTeamEventInput {
 	resolutionId?: string;
 	reasonCode?: "process-orphaned";
 	payload?: AnsteelTeamPublicEventPayload;
+	/** Coordinator-only structured evidence for a task or milestone anchor event. */
+	anchor?: AnsteelTeamExternalAnchor;
 	content: string;
 }
 
 export interface AnsteelTeamEvent extends AnsteelTeamEventInput {
+	/** Absent only on the immutable JSON.stringify ledger prefix that predates JCS. */
+	hashAlgorithm?: typeof ANSTEEL_TEAM_EVENT_HASH_ALGORITHM;
 	sequence: number;
 	createdAt: string;
 	previousHash: string | null;
 	hash: string;
+	/** Absent only for the immutable hash-only prefix that predates the signing cutover. */
+	signature?: AnsteelTeamEventSignature;
 }
 
 export interface AnsteelTeamPersistenceContext {
@@ -949,7 +1050,9 @@ function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], mileston
 			`milestone ${milestone.id}`,
 			"tech-lead",
 			revision,
-			new Set<number>((milestone.submissions as Array<{ revision: number }>).map((submission) => submission.revision)),
+			new Set<number>(
+				(milestone.submissions as Array<{ revision: number }>).map((submission) => submission.revision),
+			),
 		);
 		const tasksApproved = milestone.taskIds.every((taskId) => tasksById.get(taskId)?.status === "approved");
 		if (!tasksApproved && milestone.status !== "blocked") {
@@ -2188,9 +2291,9 @@ function getOpenBlockingProcessIssuesForTasks(
 	taskIds: ReadonlySet<string>,
 ): AnsteelProcessIssue[] {
 	const checkpointIds = new Set(
-		state.workCheckpoints.filter((checkpoint) => checkpoint.taskId !== undefined && taskIds.has(checkpoint.taskId)).map(
-			(checkpoint) => checkpoint.id,
-		),
+		state.workCheckpoints
+			.filter((checkpoint) => checkpoint.taskId !== undefined && taskIds.has(checkpoint.taskId))
+			.map((checkpoint) => checkpoint.id),
 	);
 	return state.processIssues.filter(
 		(issue) =>
@@ -2222,7 +2325,9 @@ export function publishAnsteelTeamMilestoneCollaboration(
 		);
 	}
 	if (!milestone.submissions.some((submission) => submission.revision === milestone.revision)) {
-		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} has no immutable integration evidence package`);
+		throw new AnsteelTeamStateError(
+			`Ansteel team milestone ${milestoneId} has no immutable integration evidence package`,
+		);
 	}
 	if (
 		milestone.collaborationUpdates.some(
@@ -2309,9 +2414,7 @@ export function reviewAnsteelTeamMilestone(
 	const milestone = state.milestones.find((item) => item.id === milestoneId);
 	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
 	if (milestone.status !== "final-verification") {
-		throw new AnsteelTeamStateError(
-			`Ansteel team milestone ${milestoneId} is not in final verification`,
-		);
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} is not in final verification`);
 	}
 	if (input.verdict !== "approve" && input.verdict !== "reject") {
 		throw new AnsteelTeamStateError("Ansteel team milestone review requires approve or reject");
@@ -2352,6 +2455,511 @@ export function reviewAnsteelTeamMilestone(
 	}
 	saveAnsteelTeamState(projectDirectory, state);
 	return review;
+}
+
+function assertAnsteelAnchorRemote(value: string): string {
+	const remote = value.trim();
+	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(remote)) {
+		throw new AnsteelTeamStateError("Ansteel team anchor remote name is invalid");
+	}
+	return remote;
+}
+
+/**
+ * Bind the receipt to the credential-free remote endpoint rather than only its
+ * local alias. Git remotes may contain a userinfo token or query credentials,
+ * so the persisted identity deliberately keeps only the protocol, host, port,
+ * and repository path. Local-path remotes are normalized to file URLs for the
+ * deterministic Git fixtures and air-gapped deployments.
+ */
+function canonicalizeAnsteelAnchorRemoteEndpoint(cwd: string, raw: string): string {
+	if (raw.length === 0 || raw.length > 4_096 || /[\r\n\0]/.test(raw)) {
+		throw new AnsteelTeamStateError("Ansteel team anchor remote endpoint is invalid");
+	}
+	if (!/^[A-Za-z]:[\\/]/.test(raw)) {
+		const scpLike = /^(?:[^@/:]+@)?([A-Za-z0-9][A-Za-z0-9.-]*):(.+)$/.exec(raw);
+		if (scpLike) {
+			const path = scpLike[2]!.replace(/^[\\/]+/, "").replace(/[\\/]+$/, "");
+			if (path.length === 0 || /[?#]/.test(path)) {
+				throw new AnsteelTeamStateError("Ansteel team anchor remote endpoint is invalid");
+			}
+			return `ssh://${scpLike[1]!.toLowerCase()}/${path.replaceAll("\\", "/")}`;
+		}
+	}
+	if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(raw) || raw.startsWith("file:")) {
+		try {
+			const parsed = new URL(raw);
+			const protocol = parsed.protocol.toLowerCase();
+			const host = parsed.hostname.toLowerCase();
+			if ((protocol !== "file:" && host.length === 0) || (parsed.username.length > 0 && protocol === "file:")) {
+				throw new Error("invalid endpoint");
+			}
+			const port = parsed.port.length > 0 ? `:${parsed.port}` : "";
+			const pathname = (parsed.pathname.replace(/\/+$/, "") || "/").replaceAll("\\", "/");
+			return `${protocol}//${host}${port}${pathname}`;
+		} catch {
+			throw new AnsteelTeamStateError("Ansteel team anchor remote endpoint is invalid");
+		}
+	}
+	return pathToFileURL(resolve(cwd, raw)).href;
+}
+
+/**
+ * Git may assign one alias distinct fetch URLs and multiple push URLs.
+ * Anchoring would then write evidence to an endpoint that verification never
+ * reads, so this protocol accepts only one effective credential-free endpoint
+ * across every configured fetch and push URL.
+ */
+function getAnsteelAnchorRemoteEndpoint(cwd: string, remote: string): string {
+	const getEndpoints = (push: boolean): string[] => {
+		const output = runAnsteelTeamGitCommand(
+			cwd,
+			["remote", "get-url", "--all", ...(push ? ["--push"] : []), remote],
+			"verify anchor remote",
+		);
+		const endpoints = new Set(
+			output
+				.split(/\r?\n/)
+				.map((value) => value.trim())
+				.filter((value) => value.length > 0)
+				.map((value) => canonicalizeAnsteelAnchorRemoteEndpoint(cwd, value)),
+		);
+		if (endpoints.size !== 1) {
+			throw new AnsteelTeamStateError("Ansteel team anchor remote endpoints are not a single matching endpoint");
+		}
+		return [...endpoints];
+	};
+	const [fetchEndpoint] = getEndpoints(false);
+	const [pushEndpoint] = getEndpoints(true);
+	if (fetchEndpoint !== pushEndpoint) {
+		throw new AnsteelTeamStateError("Ansteel team anchor remote endpoints are not a single matching endpoint");
+	}
+	return fetchEndpoint!;
+}
+
+function assertAnsteelAnchorRemoteEndpoint(value: unknown): asserts value is string {
+	if (typeof value !== "string" || value.length === 0 || value.length > 4_096 || /[\r\n\0]/.test(value)) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid remote endpoint");
+	}
+	try {
+		const parsed = new URL(value);
+		if (
+			(parsed.protocol !== "file:" && parsed.hostname.length === 0) ||
+			parsed.username.length > 0 ||
+			parsed.password.length > 0 ||
+			parsed.search.length > 0 ||
+			parsed.hash.length > 0
+		) {
+			throw new Error("invalid endpoint");
+		}
+	} catch {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid remote endpoint");
+	}
+}
+
+interface ResolvedAnsteelAnchorTarget {
+	target: AnsteelTeamAnchorTarget;
+	anchorEventType: "task-anchor" | "milestone-anchor";
+	approvalEventType: "task-review" | "milestone-review";
+	requiredReviewers: readonly AnsteelRole[];
+	approvalMarker: string;
+}
+
+function resolveAnsteelAnchorTarget(state: AnsteelTeamState, targetId: string): ResolvedAnsteelAnchorTarget {
+	if (/^TASK-/.test(targetId)) {
+		assertTaskId(targetId);
+		const task = state.tasks.find((item) => item.id === targetId);
+		if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${targetId} does not exist`);
+		if (task.status !== "approved" || task.revision < 1) {
+			throw new AnsteelTeamStateError(`Ansteel team task ${targetId} must be approved before external anchoring`);
+		}
+		return {
+			target: { kind: "task", id: task.id, revision: task.revision },
+			anchorEventType: "task-anchor",
+			approvalEventType: "task-review",
+			requiredReviewers: ANSTEEL_ROLES.filter((role) => role !== task.owner),
+			approvalMarker: `${task.id} revision ${task.revision}: APPROVE`,
+		};
+	}
+	assertMilestoneId(targetId);
+	const milestone = state.milestones.find((item) => item.id === targetId);
+	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${targetId} does not exist`);
+	if (milestone.status !== "approved" || milestone.revision < 1) {
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${targetId} must be approved before external anchoring`);
+	}
+	return {
+		target: { kind: "milestone", id: milestone.id, revision: milestone.revision },
+		anchorEventType: "milestone-anchor",
+		approvalEventType: "milestone-review",
+		requiredReviewers: ["staff-engineer", "qa-engineer"],
+		approvalMarker: `${milestone.id} integration revision ${milestone.revision}: APPROVE`,
+	};
+}
+
+function getAnsteelAnchorNotesRef(state: AnsteelTeamState, target: AnsteelTeamAnchorTarget): string {
+	// The validated kind and ID give every completed task or milestone revision
+	// its own immutable ref. A receipt can therefore never overwrite another
+	// work item's historical note on the same source commit.
+	return `refs/notes/ansteel/${state.id}/${target.kind}/${target.id}/${target.revision}`;
+}
+
+function assertAnsteelAnchorApprovalEvents(
+	events: readonly AnsteelTeamEvent[],
+	target: ResolvedAnsteelAnchorTarget,
+): void {
+	for (const reviewer of target.requiredReviewers) {
+		const approved = events.some(
+			(event) =>
+				event.type === target.approvalEventType &&
+				event.role === reviewer &&
+				event.content.includes(target.approvalMarker),
+		);
+		if (!approved) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team ${target.target.kind} ${target.target.id} requires a signed ${reviewer} approval event before external anchoring`,
+			);
+		}
+	}
+}
+
+function readGitRefObject(cwd: string, ref: string): string {
+	const object = runAnsteelTeamGitCommand(cwd, ["rev-parse", "--verify", ref], "read anchor Git ref").trim();
+	if (!/^[0-9a-f]{40,64}$/i.test(object)) {
+		throw new AnsteelTeamStateError("Ansteel team anchor Git ref does not resolve to an object ID");
+	}
+	return object;
+}
+
+function readRemoteGitRefObject(cwd: string, remote: string, ref: string): string {
+	const output = runAnsteelTeamGitCommand(cwd, ["ls-remote", "--refs", remote, ref], "verify remote anchor ref");
+	const line = output
+		.split(/\r?\n/)
+		.map((entry) => entry.trim())
+		.find((entry) => entry.length > 0);
+	if (!line) throw new AnsteelTeamStateError("Ansteel team remote anchor ref was not found after push");
+	const [object, actualRef] = line.split(/\s+/);
+	if (!object || actualRef !== ref || !/^[0-9a-f]{40,64}$/i.test(object)) {
+		throw new AnsteelTeamStateError("Ansteel team remote anchor ref is malformed");
+	}
+	return object;
+}
+
+/**
+ * A notes ref alone only proves receipt delivery. Fetch the recorded source
+ * branch into a disposable local ref and require the anchored commit to remain
+ * reachable from it, so a force-push that removes the anchored history is
+ * detected without treating an ordinary fast-forward as tampering.
+ */
+function assertAnsteelRemoteAnchorCommitReachable(cwd: string, remote: string, branch: string, commit: string): void {
+	const remoteBranchRef = `refs/heads/${branch}`;
+	const advertisedCommit = readRemoteGitRefObject(cwd, remote, remoteBranchRef);
+	const verificationRef = `refs/ansteel-verify/${createHash("sha256")
+		.update(`${remote}\0${branch}\0${process.pid}\0${Date.now()}`)
+		.digest("hex")}`;
+	try {
+		runAnsteelTeamGitCommand(
+			cwd,
+			["fetch", "--no-tags", remote, `+${remoteBranchRef}:${verificationRef}`],
+			"fetch recorded anchor source branch",
+		);
+		if (readGitRefObject(cwd, verificationRef) !== advertisedCommit) {
+			throw new AnsteelTeamStateError("Ansteel team remote anchor source branch changed during verification");
+		}
+		runAnsteelTeamGitCommand(
+			cwd,
+			["merge-base", "--is-ancestor", commit, verificationRef],
+			"verify anchored commit remains reachable from the remote source branch",
+		);
+	} finally {
+		// The verification ref is never evidence. Best-effort deletion is still
+		// bounded and leaves a failure closed if the ref cannot be cleaned up.
+		runAnsteelTeamGitCommand(cwd, ["update-ref", "-d", verificationRef], "clean anchor verification ref", [0, 1]);
+	}
+}
+
+/**
+ * Anchor a fully signed, approved task or milestone to an explicit Git remote.
+ * Network traffic occurs only when the user invokes an anchor command; normal
+ * approval, status, and task operations remain local.
+ */
+function anchorAnsteelTeamWorkUnit(
+	cwd: string,
+	state: AnsteelTeamState,
+	targetId: string,
+	options: AnchorAnsteelTeamOptions = {},
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamExternalAnchor {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	// Do not create a remote receipt from a caller-provided state until the
+	// durable sequence, head hash, and signing manifest prove it is current.
+	assertAnsteelTeamEventLedger(projectDirectory, state);
+	const target = resolveAnsteelAnchorTarget(state, targetId);
+
+	const events = listAnsteelTeamEvents(projectDirectory);
+	if (events.length === 0)
+		throw new AnsteelTeamStateError("Ansteel team external anchoring requires a non-empty event ledger");
+	assertAnsteelAnchorApprovalEvents(events, target);
+	const signing = verifyAnsteelTeamAuditEventSignatures(projectDirectory, events);
+	if (signing.mode !== "fully-signed" || !signing.manifestHash) {
+		throw new AnsteelTeamStateError(
+			"Ansteel team external anchoring requires a fully signed ledger; legacy unsigned history cannot be claimed as signed",
+		);
+	}
+	const runtimeIntegrity = verifyAnsteelRuntimeLogIntegrity(projectDirectory);
+	const runtimeSnapshot = captureAnsteelRuntimeAnchorSnapshot(projectDirectory, runtimeIntegrity.indexHash);
+	const workingTree = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["status", "--porcelain=v1", "--untracked-files=all"],
+		"verify anchor worktree",
+	);
+	if (workingTree.trim().length !== 0) {
+		throw new AnsteelTeamStateError("Ansteel team external anchoring requires a clean Git worktree");
+	}
+	const branch = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["symbolic-ref", "--quiet", "--short", "HEAD"],
+		"verify anchor branch",
+	).trim();
+	if (branch.length === 0)
+		throw new AnsteelTeamStateError("Ansteel team external anchoring requires a named Git branch");
+	const commit = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["rev-parse", "--verify", "HEAD"],
+		"read anchor commit",
+	).trim();
+	if (!/^[0-9a-f]{40,64}$/i.test(commit)) {
+		throw new AnsteelTeamStateError("Ansteel team external anchoring requires a verifiable Git HEAD");
+	}
+	const remote = assertAnsteelAnchorRemote(options.remote ?? "origin");
+	const remoteEndpoint = getAnsteelAnchorRemoteEndpoint(projectDirectory, remote);
+	const remoteCommit = readRemoteGitRefObject(projectDirectory, remote, `refs/heads/${branch}`);
+	if (remoteCommit !== commit) {
+		throw new AnsteelTeamStateError(
+			"Ansteel team external anchoring requires the selected remote branch to contain the exact current HEAD",
+		);
+	}
+
+	const merkle = createAnsteelTeamMerkleRoot(events.map((event) => event.hash));
+	const notesRef = getAnsteelAnchorNotesRef(state, target.target);
+	// The immutable receipt deliberately excludes a wall-clock timestamp. A push
+	// failure can leave its local note behind; excluding a fresh timestamp makes
+	// the identical ledger snapshot safely retryable without allowing a changed
+	// snapshot to overwrite the existing note.
+	const unsignedAnchor: Omit<AnsteelTeamAnchorNote, "anchorHash"> = {
+		schemaVersion: 3 as const,
+		teamId: state.id,
+		target: target.target,
+		eventRange: {
+			firstSequence: events[0]!.sequence,
+			lastSequence: events.at(-1)!.sequence,
+			eventCount: events.length,
+		},
+		merkle: {
+			algorithm: merkle.algorithm,
+			leafCount: merkle.leafCount,
+			root: merkle.root,
+		},
+		signingManifestHash: signing.manifestHash,
+		runtimeLogIndexHash: runtimeSnapshot.indexHash,
+		runtimeLogSnapshotHash: runtimeSnapshot.snapshotHash,
+		git: {
+			commit,
+			branch,
+			remote,
+			remoteEndpoint,
+			notesRef,
+		},
+	};
+	const note: AnsteelTeamAnchorNote = {
+		...unsignedAnchor,
+		anchorHash: hashAnsteelAuditValue(unsignedAnchor),
+	};
+	const noteContent = canonicalizeAnsteelAuditValue(note);
+
+	// Preflight key access before altering Git metadata. It intentionally signs
+	// a non-persisted placeholder hash, which proves key-store readability but
+	// cannot be replayed as a ledger signature.
+	signAnsteelTeamAuditEvent(projectDirectory, state.id, {
+		sequence: state.nextEventSequence,
+		role: "coordinator",
+		hash: "0".repeat(64),
+	});
+	const existingNote = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["notes", `--ref=${notesRef}`, "show", commit],
+		"read existing anchor note",
+		[0, 1],
+	);
+	if (existingNote.trim().length > 0 && existingNote.trim() !== noteContent) {
+		throw new AnsteelTeamStateError("Ansteel team anchor note already contains a different immutable receipt");
+	}
+	if (existingNote.trim().length === 0) {
+		runAnsteelTeamGitCommand(
+			projectDirectory,
+			["notes", `--ref=${notesRef}`, "add", "-m", noteContent, commit],
+			"write anchor Git note",
+		);
+	}
+	runAnsteelTeamGitCommand(projectDirectory, ["push", remote, `${notesRef}:${notesRef}`], "push external anchor");
+	// Re-read the configured endpoint and source branch after the write. This
+	// closes the success path if a remote alias changes locally or an unprotected
+	// server force-push removes the source commit while the notes ref is pushed.
+	if (getAnsteelAnchorRemoteEndpoint(projectDirectory, remote) !== remoteEndpoint) {
+		throw new AnsteelTeamStateError("Ansteel team anchor remote endpoint changed while anchoring was in progress");
+	}
+	assertAnsteelRemoteAnchorCommitReachable(projectDirectory, remote, branch, commit);
+	const noteObject = readGitRefObject(projectDirectory, notesRef);
+	const remoteRefObject = readRemoteGitRefObject(projectDirectory, remote, notesRef);
+	if (noteObject !== remoteRefObject) {
+		throw new AnsteelTeamStateError("Ansteel team remote anchor ref does not match the local note object");
+	}
+	const currentCommit = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["rev-parse", "--verify", "HEAD"],
+		"recheck anchor commit",
+	).trim();
+	if (currentCommit !== commit) {
+		throw new AnsteelTeamStateError("Ansteel team Git HEAD changed while external anchoring was in progress");
+	}
+
+	const anchor: AnsteelTeamExternalAnchor = {
+		...note,
+		anchoredAt: new Date().toISOString(),
+		git: { ...note.git, noteObject, remoteRefObject },
+	};
+	appendAnsteelTeamEvent(
+		projectDirectory,
+		state,
+		{
+			type: target.anchorEventType,
+			role: "coordinator",
+			anchor,
+			content: [
+				`${target.target.kind === "task" ? "Task" : "Milestone"} ${target.target.id} revision ${target.target.revision} externally anchored.`,
+				`Anchor hash: ${anchor.anchorHash}`,
+				`Merkle root: ${anchor.merkle.root}`,
+				`Git commit: ${anchor.git.commit}`,
+				`Git notes ref: ${anchor.git.notesRef}`,
+				`Remote: ${anchor.git.remote}`,
+			].join("\n"),
+		},
+		persistence,
+	);
+	return anchor;
+}
+
+export function anchorAnsteelTeamTask(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+	options: AnchorAnsteelTeamTaskOptions = {},
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamTaskGitAnchor {
+	return anchorAnsteelTeamWorkUnit(cwd, state, taskId, options, persistence);
+}
+
+export function anchorAnsteelTeamMilestone(
+	cwd: string,
+	state: AnsteelTeamState,
+	milestoneId: string,
+	options: AnchorAnsteelTeamMilestoneOptions = {},
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamMilestoneGitAnchor {
+	return anchorAnsteelTeamWorkUnit(cwd, state, milestoneId, options, persistence);
+}
+
+/** Reconstruct the exact immutable note body from its observed ledger receipt. */
+function getAnsteelAnchorNoteFromReceipt(anchor: AnsteelTeamExternalAnchor): AnsteelTeamAnchorNote {
+	return {
+		schemaVersion: anchor.schemaVersion,
+		anchorHash: anchor.anchorHash,
+		teamId: anchor.teamId,
+		target: anchor.target,
+		eventRange: anchor.eventRange,
+		merkle: anchor.merkle,
+		signingManifestHash: anchor.signingManifestHash,
+		runtimeLogIndexHash: anchor.runtimeLogIndexHash,
+		runtimeLogSnapshotHash: anchor.runtimeLogSnapshotHash,
+		git: {
+			commit: anchor.git.commit,
+			branch: anchor.git.branch,
+			remote: anchor.git.remote,
+			remoteEndpoint: anchor.git.remoteEndpoint,
+			notesRef: anchor.git.notesRef,
+		},
+	};
+}
+
+/**
+ * Replays the signed local receipt and checks that the exact recorded Git note
+ * object is still advertised by the named remote. This is intentionally a
+ * separate explicit command because it performs a network read.
+ */
+export function verifyAnsteelTeamExternalAnchor(
+	cwd: string,
+	state: AnsteelTeamState,
+	targetId: string,
+	options: AnchorAnsteelTeamOptions = {},
+): AnsteelTeamExternalAnchor {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertAnsteelTeamEventLedger(projectDirectory, state);
+	const target = resolveAnsteelAnchorTarget(state, targetId).target;
+	const events = listAnsteelTeamEvents(projectDirectory);
+	const event = [...events]
+		.reverse()
+		.find(
+			(candidate) =>
+				candidate.anchor?.target.kind === target.kind &&
+				candidate.anchor.target.id === target.id &&
+				candidate.anchor.target.revision === target.revision,
+		);
+	if (!event?.anchor) {
+		throw new AnsteelTeamStateError(
+			`Ansteel team ${target.kind} ${target.id} revision ${target.revision} has no persisted external anchor receipt`,
+		);
+	}
+	const anchor = event.anchor;
+	const remote = assertAnsteelAnchorRemote(options.remote ?? anchor.git.remote);
+	if (remote !== anchor.git.remote) {
+		throw new AnsteelTeamStateError("Ansteel team anchor verification remote does not match the persisted receipt");
+	}
+	const remoteEndpoint = getAnsteelAnchorRemoteEndpoint(projectDirectory, remote);
+	if (remoteEndpoint !== anchor.git.remoteEndpoint) {
+		throw new AnsteelTeamStateError("Ansteel team anchor verification endpoint does not match the persisted receipt");
+	}
+	assertAnsteelRemoteAnchorCommitReachable(projectDirectory, remote, anchor.git.branch, anchor.git.commit);
+	const remoteRefObject = readRemoteGitRefObject(projectDirectory, remote, anchor.git.notesRef);
+	if (remoteRefObject !== anchor.git.remoteRefObject || remoteRefObject !== anchor.git.noteObject) {
+		throw new AnsteelTeamStateError("Ansteel team remote anchor receipt no longer matches the signed ledger record");
+	}
+	if (readGitRefObject(projectDirectory, anchor.git.notesRef) !== remoteRefObject) {
+		throw new AnsteelTeamStateError("Ansteel team local anchor note ref no longer matches the remote receipt");
+	}
+	const localNoteContent = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["notes", `--ref=${anchor.git.notesRef}`, "show", anchor.git.commit],
+		"read anchored Git note",
+	);
+	let observedNote: unknown;
+	try {
+		observedNote = JSON.parse(localNoteContent);
+	} catch {
+		throw new AnsteelTeamStateError("Ansteel team anchored Git note is not valid JSON");
+	}
+	if (
+		canonicalizeAnsteelAuditValue(observedNote) !==
+		canonicalizeAnsteelAuditValue(getAnsteelAnchorNoteFromReceipt(anchor))
+	) {
+		throw new AnsteelTeamStateError("Ansteel team remote Git note does not match the signed ledger receipt");
+	}
+	const signing = verifyAnsteelTeamAuditEventSignatures(projectDirectory, events);
+	if (signing.mode !== "fully-signed" || signing.manifestHash !== anchor.signingManifestHash) {
+		throw new AnsteelTeamStateError("Ansteel team signing manifest does not match the anchored receipt");
+	}
+	verifyAnsteelRuntimeAnchorSnapshot(projectDirectory, anchor.runtimeLogIndexHash, anchor.runtimeLogSnapshotHash);
+	return anchor;
 }
 
 function getTaskForOwner(state: AnsteelTeamState, role: AnsteelRole, taskId: string): AnsteelTeamTask {
@@ -2446,11 +3054,36 @@ function runGit(cwd: string, args: string[], allowedExitCodes: readonly number[]
 		cwd,
 		encoding: "utf8",
 		maxBuffer: 4 * 1024 * 1024,
+		timeout: ANSTEEL_GIT_COMMAND_TIMEOUT_MS,
 		windowsHide: true,
 	});
 	if (result.error || result.status === null || !allowedExitCodes.includes(result.status)) {
 		const reason = result.error?.message ?? result.stderr?.trim() ?? "unknown git failure";
 		throw new AnsteelTeamStateError(`Ansteel team could not capture the task diff: ${reason}`);
+	}
+	return result.stdout;
+}
+
+/**
+ * Git anchor operations deliberately suppress raw stderr. Remote URLs and
+ * credential helpers can echo secrets on failure, while the runtime log still
+ * records the stable command outcome through its normal redaction boundary.
+ */
+function runAnsteelTeamGitCommand(
+	cwd: string,
+	args: string[],
+	operation: string,
+	allowedExitCodes: readonly number[] = [0],
+): string {
+	const result = spawnSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		maxBuffer: 4 * 1024 * 1024,
+		timeout: ANSTEEL_GIT_COMMAND_TIMEOUT_MS,
+		windowsHide: true,
+	});
+	if (result.error || result.status === null || !allowedExitCodes.includes(result.status)) {
+		throw new AnsteelTeamStateError(`Ansteel team could not ${operation}`);
 	}
 	return result.stdout;
 }
@@ -2804,11 +3437,17 @@ function recoverAnsteelTeamPendingTransaction(cwd: string, persistence?: Ansteel
 	const state = parseAnsteelTeamState(raw.state);
 	const event = parseAnsteelTeamEvent(raw.event);
 	const events = listAnsteelTeamEvents(cwd);
+	assertAnsteelTeamAuditManifestTeam(cwd, state.id);
 	const last = events.at(-1);
 	if (last?.hash !== event.hash) {
 		if (event.sequence !== events.length + 1 || event.previousHash !== (last?.hash ?? null)) {
 			throw new AnsteelTeamStateError("Ansteel team transaction does not continue the event ledger");
 		}
+		// A transaction survives crashes between its durable prepare record and
+		// ledger append. Verify the prepared signature before recovery so an
+		// attacker cannot inject an unsigned or role-forged final line.
+		verifyAnsteelTeamAuditEventSignatures(cwd, [...events, event]);
+		assertAnsteelTeamAnchorEventRanges([...events, event]);
 		appendDurableLine(getAnsteelTeamEventPath(cwd), `${JSON.stringify(event)}\n`);
 		persistence?.logger.write({
 			level: "audit",
@@ -3142,6 +3781,112 @@ function assertAnsteelTeamPublicEventEnvelope(event: AnsteelTeamEvent): void {
 	}
 }
 
+function assertAnsteelGitObjectId(value: unknown, field: string): asserts value is string {
+	if (typeof value !== "string" || !/^[0-9a-f]{40,64}$/i.test(value)) {
+		throw new AnsteelTeamStateError(`Ansteel team anchor ${field} must be a Git object ID`);
+	}
+}
+
+function parseAnsteelTeamExternalAnchor(value: unknown): AnsteelTeamExternalAnchor {
+	if (!isRecord(value) || value.schemaVersion !== 3) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid schema version");
+	}
+	if (typeof value.teamId !== "string" || value.teamId.trim().length === 0 || value.teamId.length > 256) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid team ID");
+	}
+	const teamId = value.teamId;
+	if (!isRecord(value.target)) throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid target");
+	const target = value.target;
+	if (target.kind !== "task" && target.kind !== "milestone") {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid target kind");
+	}
+	if (target.kind === "task") assertTaskId(target.id);
+	else assertMilestoneId(target.id);
+	if (typeof target.revision !== "number" || !Number.isSafeInteger(target.revision) || target.revision < 1) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid target revision");
+	}
+	const targetRevision = target.revision as number;
+	if (!isRecord(value.eventRange))
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid event range");
+	const eventRange = value.eventRange;
+	if (
+		typeof eventRange.firstSequence !== "number" ||
+		typeof eventRange.lastSequence !== "number" ||
+		typeof eventRange.eventCount !== "number" ||
+		!Number.isSafeInteger(eventRange.firstSequence) ||
+		!Number.isSafeInteger(eventRange.lastSequence) ||
+		!Number.isSafeInteger(eventRange.eventCount) ||
+		eventRange.firstSequence < 1 ||
+		eventRange.lastSequence < eventRange.firstSequence ||
+		eventRange.eventCount !== eventRange.lastSequence - eventRange.firstSequence + 1
+	) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid event range");
+	}
+	const firstSequence = eventRange.firstSequence as number;
+	const lastSequence = eventRange.lastSequence as number;
+	const eventCount = eventRange.eventCount as number;
+	if (!isRecord(value.merkle) || value.merkle.algorithm !== "sha256-jcs-v1") {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid Merkle description");
+	}
+	if (!Number.isSafeInteger(value.merkle.leafCount) || value.merkle.leafCount !== eventRange.eventCount) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt Merkle leaf count does not match its event range");
+	}
+	const leafCount = value.merkle.leafCount as number;
+	assertLedgerHash(value.merkle.root, "anchor Merkle root", false);
+	assertLedgerHash(value.signingManifestHash, "anchor signing manifest hash", false);
+	assertLedgerHash(value.runtimeLogIndexHash, "anchor runtime log index hash", false);
+	assertLedgerHash(value.runtimeLogSnapshotHash, "anchor runtime snapshot hash", false);
+	if (!isRecord(value.git)) throw new AnsteelTeamStateError("Ansteel team anchor receipt has invalid Git metadata");
+	const git = value.git;
+	assertAnsteelGitObjectId(git.commit, "commit");
+	if (typeof git.branch !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(git.branch)) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid Git branch");
+	}
+	if (typeof git.remote !== "string") {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid Git remote");
+	}
+	const remote = assertAnsteelAnchorRemote(git.remote);
+	assertAnsteelAnchorRemoteEndpoint(git.remoteEndpoint);
+	const remoteEndpoint = git.remoteEndpoint;
+	if (
+		typeof git.notesRef !== "string" ||
+		git.notesRef !== `refs/notes/ansteel/${teamId}/${target.kind}/${target.id}/${targetRevision}`
+	) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has an invalid Git notes ref");
+	}
+	assertAnsteelGitObjectId(git.noteObject, "local notes ref");
+	assertAnsteelGitObjectId(git.remoteRefObject, "remote notes ref");
+	if (git.noteObject !== git.remoteRefObject) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt has mismatched local and remote note objects");
+	}
+	assertStateTimestamp(value.anchoredAt, "anchor observation time");
+	assertLedgerHash(value.anchorHash, "anchor hash", false);
+	const noteInput: Omit<AnsteelTeamAnchorNote, "anchorHash"> = {
+		schemaVersion: 3,
+		teamId,
+		target: { kind: target.kind, id: target.id, revision: targetRevision },
+		eventRange: {
+			firstSequence,
+			lastSequence,
+			eventCount,
+		},
+		merkle: { algorithm: "sha256-jcs-v1", leafCount, root: value.merkle.root },
+		signingManifestHash: value.signingManifestHash,
+		runtimeLogIndexHash: value.runtimeLogIndexHash,
+		runtimeLogSnapshotHash: value.runtimeLogSnapshotHash,
+		git: { commit: git.commit, branch: git.branch, remote, remoteEndpoint, notesRef: git.notesRef },
+	};
+	if (hashAnsteelAuditValue(noteInput) !== value.anchorHash) {
+		throw new AnsteelTeamStateError("Ansteel team anchor receipt hash does not match its structured fields");
+	}
+	return {
+		...noteInput,
+		anchorHash: value.anchorHash,
+		anchoredAt: value.anchoredAt,
+		git: { ...noteInput.git, noteObject: git.noteObject, remoteRefObject: git.remoteRefObject },
+	};
+}
+
 function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "previousHash" | "hash"> {
 	if (!isRecord(value)) throw new AnsteelTeamStateError("Ansteel team event must be a JSON object");
 	const event = value as unknown as AnsteelTeamEvent;
@@ -3172,12 +3917,17 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "process-resolution-review" &&
 		event.type !== "action-assessed" &&
 		event.type !== "action-review" &&
-		event.type !== "runtime-recovery"
+		event.type !== "runtime-recovery" &&
+		event.type !== "task-anchor" &&
+		event.type !== "milestone-anchor"
 	) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid type");
 	}
 	if (event.schemaVersion !== undefined && event.schemaVersion !== 1 && event.schemaVersion !== 2) {
 		throw new AnsteelTeamStateError("Ansteel team event has an invalid schema version");
+	}
+	if (event.hashAlgorithm !== undefined && event.hashAlgorithm !== ANSTEEL_TEAM_EVENT_HASH_ALGORITHM) {
+		throw new AnsteelTeamStateError("Ansteel team event has an invalid hash algorithm");
 	}
 	const isPublicCollaborationEvent = isAnsteelPublicCollaborationEventType(event.type);
 	if (event.role === "coordinator") {
@@ -3187,10 +3937,12 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 			event.type !== "task-collaboration-returned" &&
 			event.type !== "task-final-verification-requested" &&
 			event.type !== "milestone-final-verification-requested" &&
-			event.type !== "runtime-recovery"
+			event.type !== "runtime-recovery" &&
+			event.type !== "task-anchor" &&
+			event.type !== "milestone-anchor"
 		) {
 			throw new AnsteelTeamStateError(
-				"Ansteel team coordinator can only record task assignment, final-verification, collaboration-return, or runtime-recovery events",
+				"Ansteel team coordinator can only record task assignment, final-verification, collaboration-return, runtime-recovery, task-anchor, or milestone-anchor events",
 			);
 		}
 	} else {
@@ -3233,7 +3985,23 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 	) {
 		throw new AnsteelTeamStateError("Ansteel team schema version 2 is reserved for public collaboration events");
 	}
+	const isAnchorEvent = event.type === "task-anchor" || event.type === "milestone-anchor";
+	if (isAnchorEvent) {
+		if (event.role !== "coordinator" || event.anchor === undefined) {
+			throw new AnsteelTeamStateError("Ansteel team anchor events require a coordinator structured receipt");
+		}
+		const anchor = parseAnsteelTeamExternalAnchor(event.anchor);
+		if (anchor.target.kind === "task" && event.type !== "task-anchor") {
+			throw new AnsteelTeamStateError("Ansteel team task anchor receipt has the wrong event type");
+		}
+		if (anchor.target.kind === "milestone" && event.type !== "milestone-anchor") {
+			throw new AnsteelTeamStateError("Ansteel team milestone anchor receipt has the wrong event type");
+		}
+	} else if (event.anchor !== undefined) {
+		throw new AnsteelTeamStateError("Ansteel team only permits structured anchor data on anchor events");
+	}
 	return {
+		...(event.hashAlgorithm === undefined ? {} : { hashAlgorithm: event.hashAlgorithm }),
 		sequence: event.sequence,
 		type: event.type,
 		role: event.role,
@@ -3245,6 +4013,7 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		...(event.resolutionId === undefined ? {} : { resolutionId: event.resolutionId }),
 		...(event.reasonCode === undefined ? {} : { reasonCode: event.reasonCode }),
 		...(event.payload === undefined ? {} : { payload: structuredClone(event.payload) }),
+		...(event.anchor === undefined ? {} : { anchor: parseAnsteelTeamExternalAnchor(event.anchor) }),
 		content: event.content,
 		createdAt: event.createdAt,
 	};
@@ -3257,10 +4026,49 @@ function parseAnsteelTeamEvent(value: unknown): AnsteelTeamEvent {
 	const hash = value.hash;
 	assertLedgerHash(previousHash, "event previous hash", true);
 	assertLedgerHash(hash, "event hash", false);
-	return { ...fields, previousHash, hash };
+	return {
+		...fields,
+		previousHash,
+		hash,
+		...(value.signature === undefined
+			? {}
+			: { signature: structuredClone(value.signature) as AnsteelTeamEventSignature }),
+	};
+}
+
+/**
+ * Produces the exact signed-event representation supplied to the JCS library.
+ * `hash` and `signature` are intentionally excluded: the hash identifies the
+ * finalized event body and the signature authenticates that resulting hash.
+ */
+function getAnsteelTeamJcsEventHashInput(event: Omit<AnsteelTeamEvent, "hash" | "signature">): Record<string, unknown> {
+	return {
+		hashAlgorithm: ANSTEEL_TEAM_EVENT_HASH_ALGORITHM,
+		sequence: event.sequence,
+		type: event.type,
+		role: event.role,
+		...(event.targetRole === undefined ? {} : { targetRole: event.targetRole }),
+		...(event.challengeId === undefined ? {} : { challengeId: event.challengeId }),
+		...(event.schemaVersion === undefined ? {} : { schemaVersion: event.schemaVersion }),
+		...(event.checkpointId === undefined ? {} : { checkpointId: event.checkpointId }),
+		...(event.issueId === undefined ? {} : { issueId: event.issueId }),
+		...(event.resolutionId === undefined ? {} : { resolutionId: event.resolutionId }),
+		...(event.reasonCode === undefined ? {} : { reasonCode: event.reasonCode }),
+		...(event.payload === undefined ? {} : { payload: event.payload }),
+		...(event.anchor === undefined ? {} : { anchor: event.anchor }),
+		content: event.content,
+		createdAt: event.createdAt,
+		previousHash: event.previousHash,
+	};
 }
 
 function hashAnsteelTeamEvent(event: Omit<AnsteelTeamEvent, "hash">): string {
+	if (event.hashAlgorithm === ANSTEEL_TEAM_EVENT_HASH_ALGORITHM) {
+		return hashAnsteelAuditValue(getAnsteelTeamJcsEventHashInput(event));
+	}
+	if (event.hashAlgorithm !== undefined) {
+		throw new AnsteelTeamStateError("Ansteel team event has an unsupported hash algorithm");
+	}
 	if (event.schemaVersion === 2 && event.type === "runtime-recovery") {
 		return createHash("sha256")
 			.update(
@@ -3341,9 +4149,32 @@ function readAnsteelTeamEventLedger(cwd: string): unknown[] {
 		});
 }
 
+function assertAnsteelTeamAnchorEventRanges(events: readonly AnsteelTeamEvent[]): void {
+	for (const event of events) {
+		if (event.type !== "task-anchor" && event.type !== "milestone-anchor") continue;
+		const anchor = event.anchor;
+		if (!anchor) throw new AnsteelTeamStateError("Ansteel team anchor event is missing its structured receipt");
+		if (
+			anchor.eventRange.firstSequence !== 1 ||
+			anchor.eventRange.lastSequence !== event.sequence - 1 ||
+			anchor.eventRange.eventCount !== event.sequence - 1
+		) {
+			throw new AnsteelTeamStateError(
+				"Ansteel team anchor receipt does not cover its immutable preceding event range",
+			);
+		}
+		const coveredEvents = events.slice(anchor.eventRange.firstSequence - 1, anchor.eventRange.lastSequence);
+		const merkle = createAnsteelTeamMerkleRoot(coveredEvents.map((covered) => covered.hash));
+		if (merkle.root !== anchor.merkle.root || merkle.leafCount !== anchor.merkle.leafCount) {
+			throw new AnsteelTeamStateError("Ansteel team anchor receipt Merkle root does not match its event range");
+		}
+	}
+}
+
 export function listAnsteelTeamEvents(cwd: string): AnsteelTeamEvent[] {
 	const events = readAnsteelTeamEventLedger(cwd).map((event) => parseAnsteelTeamEvent(event));
 	let previousHash: string | null = null;
+	let sawJcsHash = false;
 	for (let index = 0; index < events.length; index++) {
 		if (events[index].sequence !== index + 1) {
 			throw new AnsteelTeamStateError("Ansteel team event ledger has a non-contiguous sequence");
@@ -3354,13 +4185,29 @@ export function listAnsteelTeamEvents(cwd: string): AnsteelTeamEvent[] {
 		if (events[index].hash !== hashAnsteelTeamEvent(events[index])) {
 			throw new AnsteelTeamStateError("Ansteel team event ledger has a hash mismatch");
 		}
+		if (events[index].hashAlgorithm === ANSTEEL_TEAM_EVENT_HASH_ALGORITHM) {
+			sawJcsHash = true;
+		} else if (sawJcsHash) {
+			throw new AnsteelTeamStateError("Ansteel team event ledger has a legacy hash after the JCS cutover");
+		}
 		previousHash = events[index].hash;
 	}
+	// Legacy events remain readable, but the first signed event establishes an
+	// irreversible cutover: every later event must verify under its own actor's
+	// coordinator-held Ed25519 key.
+	verifyAnsteelTeamAuditEventSignatures(cwd, events);
+	assertAnsteelTeamAnchorEventRanges(events);
 	return events;
 }
 
 function assertAnsteelTeamEventLedger(cwd: string, state: AnsteelTeamState): void {
 	const events = listAnsteelTeamEvents(cwd);
+	assertAnsteelTeamAuditManifestTeam(cwd, state.id);
+	for (const event of events) {
+		if (event.anchor !== undefined && event.anchor.teamId !== state.id) {
+			throw new AnsteelTeamStateError("Ansteel team anchor receipt belongs to a different persisted team");
+		}
+	}
 	const ledgerHeadHash = events.at(-1)?.hash ?? null;
 	if (state.ledgerHeadHash !== ledgerHeadHash) {
 		throw new AnsteelTeamStateError("Ansteel team ledger head hash does not match the event chain");
@@ -3459,17 +4306,34 @@ export function appendAnsteelTeamEvent(
 	// Public collaboration events are durable and rendered to every role. Apply
 	// one recursive redaction boundary before hashing, replaying, or persisting
 	// any model/provider-authored payload so no caller can bypass sanitization.
-	const redactedInput = redactAnsteelSensitiveValue(input) as AnsteelTeamEventInput;
+	const redactedCandidate = redactAnsteelSensitiveValue(input) as AnsteelTeamEventInput & { signature?: unknown };
+	// A caller can never supply a signature. The coordinator creates it only
+	// after the immutable event hash and sequence have been assigned.
+	const { signature: _untrustedSignature, ...redactedInput } = redactedCandidate;
 	const unsignedEvent = {
 		...redactedInput,
+		hashAlgorithm: ANSTEEL_TEAM_EVENT_HASH_ALGORITHM,
 		sequence: state.nextEventSequence,
 		createdAt: new Date().toISOString(),
 		previousHash: state.ledgerHeadHash,
 	};
+	const hash = hashAnsteelTeamEvent(unsignedEvent);
+	const signature = signAnsteelTeamAuditEvent(cwd, state.id, {
+		sequence: unsignedEvent.sequence,
+		role: unsignedEvent.role,
+		hash,
+	});
 	const event = parseAnsteelTeamEvent({
 		...unsignedEvent,
-		hash: hashAnsteelTeamEvent(unsignedEvent),
+		hash,
+		signature,
 	});
+	// Validate the new receipt against the exact pre-append range before any
+	// pending transaction or durable line is written. This gives anchor events
+	// the same fail-closed persistence boundary as their signatures.
+	if (event.anchor !== undefined) {
+		assertAnsteelTeamAnchorEventRanges([...listAnsteelTeamEvents(cwd), event]);
+	}
 	const previewState = structuredClone(state);
 	applyAnsteelTeamEvent(previewState, event);
 	assertState(previewState);
@@ -3647,7 +4511,8 @@ export function raiseAnsteelProcessIssue(
 		resolutions: [],
 		createdAt: new Date().toISOString(),
 	};
-	const targetTask = checkpoint.taskId === undefined ? undefined : state.tasks.find((task) => task.id === checkpoint.taskId);
+	const targetTask =
+		checkpoint.taskId === undefined ? undefined : state.tasks.find((task) => task.id === checkpoint.taskId);
 	if (
 		targetTask?.status === "final-verification" &&
 		(issue.severity === "blocking" || issue.severity === "critical")
@@ -3656,10 +4521,7 @@ export function raiseAnsteelProcessIssue(
 			`Ansteel team task ${targetTask.id} is in final verification; use ansteel_review_task to reject its immutable evidence package`,
 		);
 	}
-	if (
-		targetTask?.status === "submitted" &&
-		(issue.severity === "blocking" || issue.severity === "critical")
-	) {
+	if (targetTask?.status === "submitted" && (issue.severity === "blocking" || issue.severity === "critical")) {
 		// A structured blocking challenge is continuous collaboration, not a final
 		// review. It revokes the frozen work package before final verification.
 		targetTask.status = "revision-required";
@@ -3837,7 +4699,10 @@ function hasCompletedTaskCollaboration(task: AnsteelTeamTask): boolean {
 }
 
 function hasCompletedMilestoneCollaboration(milestone: AnsteelTeamMilestone): boolean {
-	if (milestone.revision < 1 || !milestone.submissions.some((submission) => submission.revision === milestone.revision)) {
+	if (
+		milestone.revision < 1 ||
+		!milestone.submissions.some((submission) => submission.revision === milestone.revision)
+	) {
 		return false;
 	}
 	return (["staff-engineer", "qa-engineer"] as const).every((collaborator) =>
@@ -3904,7 +4769,8 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 		...state.tasks
 			.filter(
 				(task) =>
-					(task.status === "approved" || task.status === "final-verification") && !hasCompletedTaskCollaboration(task),
+					(task.status === "approved" || task.status === "final-verification") &&
+					!hasCompletedTaskCollaboration(task),
 			)
 			.map((task) => `task ${task.id}`),
 		...state.milestones
@@ -3916,7 +4782,8 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 			.map((milestone) => `milestone ${milestone.id}`),
 	];
 	const finalVerificationRejected =
-		state.tasks.some(hasRejectedTaskFinalVerification) || state.milestones.some(hasRejectedMilestoneFinalVerification);
+		state.tasks.some(hasRejectedTaskFinalVerification) ||
+		state.milestones.some(hasRejectedMilestoneFinalVerification);
 	const hasWork = state.tasks.length > 0 || state.milestones.length > 0;
 	const collaborationComplete =
 		hasWork &&
@@ -3947,11 +4814,15 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 	) {
 		collaborationStatus = "disputed";
 		if (blockingIssues.length > 0) {
-			collaborationReasons.push(`open blocking process issues: ${blockingIssues.map((issue) => issue.id).join(", ")}`);
+			collaborationReasons.push(
+				`open blocking process issues: ${blockingIssues.map((issue) => issue.id).join(", ")}`,
+			);
 		}
 		const openChallenges = state.openChallenges.filter((challenge) => challenge.status === "open");
 		if (openChallenges.length > 0) {
-			collaborationReasons.push(`open role challenges: ${openChallenges.map((challenge) => challenge.id).join(", ")}`);
+			collaborationReasons.push(
+				`open role challenges: ${openChallenges.map((challenge) => challenge.id).join(", ")}`,
+			);
 		}
 		if (finalVerificationRejected) {
 			collaborationReasons.push("a current final verification recorded REJECT and requires a new revision");
@@ -3972,10 +4843,14 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 		milestonesInFinalVerificationWithCollaboration.length > 0
 	) {
 		collaborationStatus = "ready-for-verification";
-		collaborationReasons.push("public collaboration is complete for at least one current revision; final verification is pending");
+		collaborationReasons.push(
+			"public collaboration is complete for at least one current revision; final verification is pending",
+		);
 	} else if (collaborationComplete) {
 		collaborationStatus = "collaboration-complete";
-		collaborationReasons.push("every current task and milestone has required public collaboration evidence and final approval");
+		collaborationReasons.push(
+			"every current task and milestone has required public collaboration evidence and final approval",
+		);
 	} else if (!hasWork && state.workCheckpoints.length === 0 && openIssues.length === 0) {
 		collaborationStatus = "orienting";
 		collaborationReasons.push("no governed task, milestone, checkpoint, or process issue exists yet");
@@ -3991,7 +4866,9 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 		return {
 			checkpoint,
 			rejected: reviews.some((review) => review.verdict === "reject"),
-			complete: requiredReviewers.every((role) => reviews.some((review) => review.reviewer === role && review.verdict === "approve")),
+			complete: requiredReviewers.every((role) =>
+				reviews.some((review) => review.reviewer === role && review.verdict === "approve"),
+			),
 		};
 	});
 	// Non-green actions may be recorded for a scope decision or a standalone
@@ -4000,25 +4877,31 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 	// after every currently active non-green action has its required peer review.
 	const hasGovernanceRequirement = hasWork || actionReviewStates.length > 0;
 	const allWorkApproved =
-		state.tasks.every((task) => task.status === "approved") && state.milestones.every((milestone) => milestone.status === "approved");
+		state.tasks.every((task) => task.status === "approved") &&
+		state.milestones.every((milestone) => milestone.status === "approved");
 	const governanceReasons: string[] = [];
 	let governanceStatus: AnsteelGovernanceStatus;
 	if (finalVerificationRejected || actionReviewStates.some((entry) => entry.rejected)) {
 		governanceStatus = "rejected";
 		if (finalVerificationRejected) governanceReasons.push("a current final verification recorded REJECT");
 		const rejectedActions = actionReviewStates.filter((entry) => entry.rejected).map((entry) => entry.checkpoint.id);
-		if (rejectedActions.length > 0) governanceReasons.push(`rejected governed actions: ${rejectedActions.join(", ")}`);
+		if (rejectedActions.length > 0)
+			governanceReasons.push(`rejected governed actions: ${rejectedActions.join(", ")}`);
 	} else if (!hasGovernanceRequirement) {
 		governanceStatus = "not-required";
 		governanceReasons.push("no task, milestone, or active non-green action currently requires governance");
 	} else if (allWorkApproved && actionReviewStates.every((entry) => entry.complete)) {
 		governanceStatus = "approved";
-		governanceReasons.push("all current task and milestone final approvals and active non-green action confirmations are complete");
+		governanceReasons.push(
+			"all current task and milestone final approvals and active non-green action confirmations are complete",
+		);
 	} else {
 		governanceStatus = "pending";
-		if (!allWorkApproved && hasWork) governanceReasons.push("at least one task or milestone has not received its final approval");
+		if (!allWorkApproved && hasWork)
+			governanceReasons.push("at least one task or milestone has not received its final approval");
 		const pendingActions = actionReviewStates.filter((entry) => !entry.complete).map((entry) => entry.checkpoint.id);
-		if (pendingActions.length > 0) governanceReasons.push(`pending governed action confirmations: ${pendingActions.join(", ")}`);
+		if (pendingActions.length > 0)
+			governanceReasons.push(`pending governed action confirmations: ${pendingActions.join(", ")}`);
 	}
 
 	const deliveryStatus = getRecordedAnsteelDeliveryStatus(state);
@@ -4049,7 +4932,8 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 	} else {
 		workflowStatus = "in-progress";
 		if (collaborationStatus !== "collaboration-complete") workflowReasons.push("collaboration is not complete");
-		if (governanceStatus !== "approved" && governanceStatus !== "not-required") workflowReasons.push("governance is not complete");
+		if (governanceStatus !== "approved" && governanceStatus !== "not-required")
+			workflowReasons.push("governance is not complete");
 		workflowReasons.push("delivery verification has not started");
 	}
 

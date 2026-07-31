@@ -19,12 +19,12 @@ import {
 	type AnsteelActionAssessment,
 	type AnsteelActionReview,
 	type AnsteelActionReviewInput,
-	type AnsteelTeamCollaborationUpdate,
 	type AnsteelProcessIssue,
 	type AnsteelProcessIssueInput,
 	type AnsteelProcessResolution,
 	type AnsteelProcessResolutionInput,
 	type AnsteelProcessResolutionReviewInput,
+	type AnsteelTeamCollaborationUpdate,
 	type AnsteelTeamEventActor,
 	type AnsteelTeamMilestone,
 	type AnsteelTeamMilestoneReview,
@@ -38,6 +38,8 @@ import {
 	type AnsteelTeamTaskType,
 	type AnsteelWorkCheckpoint,
 	type AnsteelWorkCheckpointInput,
+	anchorAnsteelTeamMilestone,
+	anchorAnsteelTeamTask,
 	appendAnsteelTeamEvent,
 	assessAnsteelTeamAction,
 	assignAnsteelTeamTasks,
@@ -55,24 +57,25 @@ import {
 	isAnsteelTeamGovernancePath,
 	listAnsteelTeamEvents,
 	loadAnsteelTeamState,
-	publishAnsteelWorkCheckpoint,
 	publishAnsteelTeamMilestoneCollaboration,
 	publishAnsteelTeamTaskCollaboration,
+	publishAnsteelWorkCheckpoint,
 	raiseAnsteelProcessIssue,
 	recordAnsteelTeamActionAssessment,
 	resolveAnsteelProcessIssue,
 	resolveAnsteelTeamWritePath,
+	returnAnsteelTeamTaskForCollaboration,
 	revalidateAnsteelTeamWritePath,
 	reviewAnsteelProcessResolution,
 	reviewAnsteelTeamAction,
 	reviewAnsteelTeamMilestone,
 	reviewAnsteelTeamTask,
-	returnAnsteelTeamTaskForCollaboration,
 	runAnsteelTeamMilestoneTest,
 	runAnsteelTeamTaskTest,
 	saveAnsteelTeamState,
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
+	verifyAnsteelTeamExternalAnchor,
 } from "../../core/ansteel-team.ts";
 import {
 	AnsteelObservabilityError,
@@ -89,6 +92,7 @@ import {
 	readAnsteelRuntimeLogs,
 	redactAnsteelSensitiveText,
 	traceAnsteelTeamRuntime,
+	verifyAnsteelRuntimeLogIntegrity,
 } from "../../core/ansteel-team-observability.ts";
 import {
 	defineTool,
@@ -224,11 +228,7 @@ interface ActiveAnsteelTeam {
 }
 
 interface DeferredCrossRoleReview {
-	kind:
-		| "task-collaboration"
-		| "task-final-verification"
-		| "milestone-collaboration"
-		| "milestone-final-verification";
+	kind: "task-collaboration" | "task-final-verification" | "milestone-collaboration" | "milestone-final-verification";
 	id: string;
 	revision: number;
 }
@@ -277,6 +277,7 @@ function createAnsteelPublicError(error: unknown): Error {
 
 function verifyPersistedAnsteelTeamIntegrity(cwd: string): AnsteelTeamState {
 	let events: ReturnType<typeof listAnsteelTeamEvents>;
+	let persistedState: AnsteelTeamState;
 	try {
 		events = listAnsteelTeamEvents(cwd);
 	} catch (error) {
@@ -287,18 +288,31 @@ function verifyPersistedAnsteelTeamIntegrity(cwd: string): AnsteelTeamState {
 		);
 	}
 	try {
-		const persistedState = loadAnsteelTeamState(cwd);
-		if (!persistedState) {
+		const loadedState = loadAnsteelTeamState(cwd);
+		if (!loadedState) {
 			throw new Error("No persisted Ansteel team state exists for doctor integrity verification");
 		}
 		// The active in-memory team is intentionally not consulted as integrity evidence.
-		getAnsteelTeamSharedBoard(persistedState, events);
-		return persistedState;
+		getAnsteelTeamSharedBoard(loadedState, events);
+		// `trace` may rebuild a recoverable index for diagnostics, but doctor is
+		// an integrity gate. It must reject a changed or missing log segment
+		// index instead of repairing it and then reporting the run as healthy.
+		persistedState = loadedState;
 	} catch (error) {
 		const detail = formatAnsteelPublicError(error);
 		throw new AnsteelObservabilityError(
 			"state-projection-mismatch",
 			`Ansteel persisted team integrity verification failed: ${detail}`,
+		);
+	}
+	try {
+		verifyAnsteelRuntimeLogIntegrity(cwd);
+		return persistedState!;
+	} catch (error) {
+		const detail = formatAnsteelPublicError(error);
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel persisted runtime-log integrity verification failed: ${detail}`,
 		);
 	}
 }
@@ -769,7 +783,11 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 							text: `${update.collaborator} published continuous collaboration for ${input.milestoneId} revision ${update.revision}.`,
 						},
 					],
-					details: { collaborator: update.collaborator, milestoneId: input.milestoneId, revision: update.revision },
+					details: {
+						collaborator: update.collaborator,
+						milestoneId: input.milestoneId,
+						revision: update.revision,
+					},
 				};
 			},
 		}),
@@ -1756,7 +1774,10 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							{ type: "role-report", role: collaborator, content: response.trim() },
 							getPersistenceContext(ctx.cwd),
 						);
-						emitTimelineMessage(pi, `## ${collaborator} task collaboration [${event.sequence}]\n\n${event.content}`);
+						emitTimelineMessage(
+							pi,
+							`## ${collaborator} task collaboration [${event.sequence}]\n\n${event.content}`,
+						);
 					} catch (error) {
 						activeTeam.state.roles[collaborator].status = "failed";
 						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
@@ -2062,7 +2083,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					`${current.id} integration revision ${finalSubmission.revision} entered final independent verification after both public collaboration updates.`,
 				);
 				const finalMilestone = activeTeam.state.milestones.find((item) => item.id === current.id);
-				if (!finalMilestone) throw new Error(`Ansteel team milestone ${current.id} disappeared before final verification`);
+				if (!finalMilestone)
+					throw new Error(`Ansteel team milestone ${current.id} disappeared before final verification`);
 				await requestMilestoneReviews(activeTeam, ctx, finalMilestone, finalSubmission);
 				return;
 			}
@@ -2116,12 +2138,14 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						if (!task || task.status !== "final-verification" || task.revision !== request.revision) continue;
 						await advanceTaskPostSubmission(activeTeam, ctx, task);
 						const current = activeTeam.state.tasks.find((item) => item.id === request.id);
-						if (current?.status === "final-verification" && current.revision === request.revision) retry.push(request);
+						if (current?.status === "final-verification" && current.revision === request.revision)
+							retry.push(request);
 						continue;
 					}
 					if (request.kind === "milestone-collaboration") {
 						const milestone = activeTeam.state.milestones.find((item) => item.id === request.id);
-						if (!milestone || milestone.status !== "submitted" || milestone.revision !== request.revision) continue;
+						if (!milestone || milestone.status !== "submitted" || milestone.revision !== request.revision)
+							continue;
 						await advanceMilestonePostSubmission(activeTeam, ctx, milestone);
 						const current = activeTeam.state.milestones.find((item) => item.id === request.id);
 						if (current?.status === "submitted" && current.revision === request.revision) retry.push(request);
@@ -2131,10 +2155,12 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						continue;
 					}
 					const milestone = activeTeam.state.milestones.find((item) => item.id === request.id);
-					if (!milestone || milestone.status !== "final-verification" || milestone.revision !== request.revision) continue;
+					if (!milestone || milestone.status !== "final-verification" || milestone.revision !== request.revision)
+						continue;
 					await advanceMilestonePostSubmission(activeTeam, ctx, milestone);
 					const current = activeTeam.state.milestones.find((item) => item.id === request.id);
-					if (current?.status === "final-verification" && current.revision === request.revision) retry.push(request);
+					if (current?.status === "final-verification" && current.revision === request.revision)
+						retry.push(request);
 				} catch (error) {
 					retry.push(request);
 					failures.push(error);
@@ -2425,24 +2451,19 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				});
 			},
 			publishTaskCollaboration: async (taskId, input) => {
-				return await runObservedOperation(
-					ctx.cwd,
-					"task.collaboration.publish",
-					{ role, taskId },
-					async () => {
-						const update = publishAnsteelTeamTaskCollaboration(ctx.cwd, activeTeam.state, role, taskId, input);
-						publishTaskEvent(
-							ctx,
-							activeTeam.state,
-							"task-collaboration",
-							role,
-							`${taskId} revision ${update.revision} continuous collaboration update\n\nSummary: ${update.summary}\n\nEvidence: ${update.evidenceRefs.join(", ")}\n\nUncertainties: ${
-								update.uncertainties.length === 0 ? "none" : update.uncertainties.join(", ")
-							}`,
-						);
-						return update;
-					},
-				);
+				return await runObservedOperation(ctx.cwd, "task.collaboration.publish", { role, taskId }, async () => {
+					const update = publishAnsteelTeamTaskCollaboration(ctx.cwd, activeTeam.state, role, taskId, input);
+					publishTaskEvent(
+						ctx,
+						activeTeam.state,
+						"task-collaboration",
+						role,
+						`${taskId} revision ${update.revision} continuous collaboration update\n\nSummary: ${update.summary}\n\nEvidence: ${update.evidenceRefs.join(", ")}\n\nUncertainties: ${
+							update.uncertainties.length === 0 ? "none" : update.uncertainties.join(", ")
+						}`,
+					);
+					return update;
+				});
 			},
 			reviewTask: async (taskId, input) => {
 				return await runObservedOperation(
@@ -2766,7 +2787,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 								// A deferred continuous-collaboration or final-verification phase
 								// waits for the queue flush; do not re-enter its owner session.
-								if (task.status === "submitted" || task.status === "final-verification") stoppedTaskIds.add(taskId);
+								if (task.status === "submitted" || task.status === "final-verification")
+									stoppedTaskIds.add(taskId);
 							}
 						}
 
@@ -3124,7 +3146,11 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							.map((task) => ({ kind: "task-collaboration" as const, id: task.id, revision: task.revision })),
 						...state.tasks
 							.filter((task) => task.status === "final-verification")
-							.map((task) => ({ kind: "task-final-verification" as const, id: task.id, revision: task.revision })),
+							.map((task) => ({
+								kind: "task-final-verification" as const,
+								id: task.id,
+								revision: task.revision,
+							})),
 						...state.milestones
 							.filter((milestone) => milestone.status === "submitted")
 							.map((milestone) => ({
@@ -3273,6 +3299,64 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						});
 						return;
 					}
+					if (command === "anchor") {
+						const parts = argument.length === 0 ? [] : argument.split(/\s+/);
+						if (parts.length < 1 || parts.length > 2) {
+							throw new Error("Usage: /ansteel-team anchor <TASK-ID|MILESTONE-ID> [remote]");
+						}
+						// Verify before runObservedCommand creates its own log entries. Runtime
+						// logger writes may rebuild a recoverable index for ordinary commands;
+						// an external anchor must instead fail closed on pre-existing drift.
+						const state = verifyPersistedAnsteelTeamIntegrity(ctx.cwd);
+						await runObservedCommand(ctx.cwd, state.id, `anchor ${parts.join(" ")}`, async () => {
+							const persisted = loadAnsteelTeamState(ctx.cwd);
+							if (!persisted) throw new Error("No persisted Ansteel team state exists for anchoring.");
+							const options = parts[1] === undefined ? {} : { remote: parts[1] };
+							const anchor = parts[0]!.startsWith("TASK-")
+								? anchorAnsteelTeamTask(ctx.cwd, persisted, parts[0]!, options, getPersistenceContext(ctx.cwd))
+								: anchorAnsteelTeamMilestone(
+										ctx.cwd,
+										persisted,
+										parts[0]!,
+										options,
+										getPersistenceContext(ctx.cwd),
+									);
+							const active = activeTeams.get(ctx.cwd);
+							if (active?.state.id === persisted.id) Object.assign(active.state, persisted);
+							emitTimelineMessage(
+								pi,
+								[
+									`${anchor.target.kind === "task" ? "Task" : "Milestone"} anchor: ${anchor.target.id} revision ${anchor.target.revision}`,
+									`Merkle root: ${anchor.merkle.root}`,
+									`Git commit: ${anchor.git.commit}`,
+									`Remote note: ${anchor.git.remote} ${anchor.git.notesRef}`,
+								].join("\n"),
+							);
+						});
+						return;
+					}
+					if (command === "verify-anchor") {
+						const parts = argument.length === 0 ? [] : argument.split(/\s+/);
+						if (parts.length < 1 || parts.length > 2) {
+							throw new Error("Usage: /ansteel-team verify-anchor <TASK-ID|MILESTONE-ID> [remote]");
+						}
+						const state = verifyPersistedAnsteelTeamIntegrity(ctx.cwd);
+						await runObservedCommand(ctx.cwd, state.id, `verify-anchor ${parts.join(" ")}`, async () => {
+							const persisted = loadAnsteelTeamState(ctx.cwd);
+							if (!persisted) throw new Error("No persisted Ansteel team state exists for anchor verification.");
+							const anchor = verifyAnsteelTeamExternalAnchor(
+								ctx.cwd,
+								persisted,
+								parts[0]!,
+								parts[1] === undefined ? {} : { remote: parts[1] },
+							);
+							emitTimelineMessage(
+								pi,
+								`${anchor.target.kind === "task" ? "Task" : "Milestone"} anchor verified: ${anchor.target.id} revision ${anchor.target.revision}\nMerkle root: ${anchor.merkle.root}\nRemote note: ${anchor.git.remote} ${anchor.git.notesRef}`,
+							);
+						});
+						return;
+					}
 					if (command === "board") {
 						if (argument.length > 0) throw new Error("Usage: /ansteel-team board");
 						const state = loadAnsteelTeamState(ctx.cwd);
@@ -3343,12 +3427,16 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						return;
 					}
 					if (command === "doctor") {
+						// Doctor is an integrity gate, so it validates the persisted ledger,
+						// state projection, and log index before starting an observed command.
+						// This prevents its own diagnostic log from repairing the evidence it
+						// is supposed to inspect.
+						verifyPersistedAnsteelTeamIntegrity(ctx.cwd);
 						await runObservedCommand(
 							ctx.cwd,
 							"ansteel-team-persistence-check",
 							`doctor${argument ? ` ${argument}` : ""}`,
 							async (logger) => {
-								verifyPersistedAnsteelTeamIntegrity(ctx.cwd);
 								const runId =
 									argument ||
 									listAnsteelRuntimeRuns(ctx.cwd)
@@ -3408,7 +3496,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						return;
 					}
 					throw new Error(
-						"Usage: /ansteel-team <start|ask|task|board|status|trace|doctor|incident|stop> [argument]",
+						"Usage: /ansteel-team <start|ask|task|anchor|verify-anchor|board|status|trace|doctor|incident|stop> [argument]",
 					);
 				} catch (error) {
 					const message = formatAnsteelPublicError(error);
