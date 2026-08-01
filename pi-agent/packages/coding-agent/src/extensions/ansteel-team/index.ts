@@ -77,6 +77,7 @@ import {
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
 	verifyAnsteelTeamExternalAnchor,
+	verifyAnsteelTeamTaskDelivery,
 } from "../../core/ansteel-team.ts";
 import {
 	AnsteelObservabilityError,
@@ -1335,12 +1336,14 @@ function formatStatus(state: AnsteelTeamState, axes = getAnsteelTeamStatusAxes(s
 		return `- ${role}: ${member.status} (${member.model})`;
 	});
 	const openChallenges = state.openChallenges.filter((challenge) => challenge.status === "open");
-	const taskLines = state.tasks.map(
-		(task) =>
-			`- ${task.id}: ${task.type}; owner=${task.owner}; ${task.status}${
-				task.dependsOn.length === 0 ? "" : ` (depends on ${task.dependsOn.join(", ")})`
-			}`,
-	);
+	const taskLines = state.tasks.map((task) => {
+		const delivery = [...state.deliveryVerifications]
+			.reverse()
+			.find((verification) => verification.taskId === task.id && verification.revision === task.revision);
+		return `- ${task.id}: ${task.type}; owner=${task.owner}; ${task.status}; delivery=${delivery?.status ?? "not-started"}${
+			task.dependsOn.length === 0 ? "" : ` (depends on ${task.dependsOn.join(", ")})`
+		}`;
+	});
 	const milestoneLines = state.milestones.map(
 		(milestone) => `- ${milestone.id}: ${milestone.status} (${milestone.taskIds.join(", ")})`,
 	);
@@ -1371,7 +1374,7 @@ export function formatSharedBoard(board: AnsteelTeamSharedBoard): string {
 	});
 	const taskLines = board.tasks.map(
 		(task) =>
-			`- ${task.id}: type=${task.type}; owner=${task.owner}; status=${task.status}; dependencies=${
+			`- ${task.id}: type=${task.type}; owner=${task.owner}; status=${task.status}; delivery=${task.deliveryStatus}; dependencies=${
 				task.dependsOn.length === 0 ? "none" : task.dependsOn.join(", ")
 			}${task.assignmentReason === undefined ? "" : `; assignment reason=${task.assignmentReason}`}`,
 	);
@@ -3462,6 +3465,39 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						});
 						return;
 					}
+					if (command === "verify") {
+						const match = /^(TASK-[A-Z0-9-]+)\s+(.+)$/.exec(argument);
+						if (!match) {
+							throw new Error("Usage: /ansteel-team verify <TASK-ID> <absolute-manifest-path>");
+						}
+						const taskId = match[1]!;
+						const rawManifestPath = match[2]!.trim();
+						const manifestPath =
+							(rawManifestPath.startsWith('"') && rawManifestPath.endsWith('"')) ||
+							(rawManifestPath.startsWith("'") && rawManifestPath.endsWith("'"))
+								? rawManifestPath.slice(1, -1)
+								: rawManifestPath;
+						const state = verifyPersistedAnsteelTeamIntegrity(ctx.cwd);
+						await runObservedCommand(ctx.cwd, state.id, `verify ${taskId}`, async () => {
+							const persisted = loadAnsteelTeamState(ctx.cwd);
+							if (!persisted)
+								throw new Error("No persisted Ansteel team state exists for delivery verification.");
+							const verification = verifyAnsteelTeamTaskDelivery(
+								ctx.cwd,
+								persisted,
+								taskId,
+								manifestPath,
+								getPersistenceContext(ctx.cwd),
+							);
+							const active = activeTeams.get(ctx.cwd);
+							if (active?.state.id === persisted.id) Object.assign(active.state, persisted);
+							emitTimelineMessage(
+								pi,
+								`Task delivery verified: ${verification.taskId} revision ${verification.revision}\nVerification: ${verification.id}\nChecks: ${verification.checks.length}\nSource commit: ${verification.sourceCommit}`,
+							);
+						});
+						return;
+					}
 					if (command === "verify-anchor") {
 						const parts = argument.length === 0 ? [] : argument.split(/\s+/);
 						if (parts.length < 1 || parts.length > 2) {
@@ -3623,7 +3659,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						return;
 					}
 					throw new Error(
-						"Usage: /ansteel-team <start|ask|task|anchor|verify-anchor|board|status|trace|doctor|incident|stop> [argument]",
+						"Usage: /ansteel-team <start|ask|task|verify|anchor|verify-anchor|board|status|trace|doctor|incident|stop> [argument]",
 					);
 				} catch (error) {
 					const message = formatAnsteelPublicError(error);

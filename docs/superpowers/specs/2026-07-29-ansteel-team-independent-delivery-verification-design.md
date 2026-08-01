@@ -4,6 +4,11 @@
 > [鞍钢宪法式三 AI 持续协作协议设计](./2026-07-29-ansteel-team-continuous-collaboration-protocol-design.md)。
 > 本文保留为持续协作完成后的独立验证与最终交付兜底层，不应再把事后报告、证据包或双审批解释为三 AI
 > 协作本身。
+>
+> 2026-08-01 实现进度：L1，本设计中的 coordinator 最终交付检查已按现有 v10 主线兼容实现为状态 v11，
+> 包括项目外 manifest、结构化 argv、环境白名单、外部内容寻址输出、签名 delivery 事件、三轴投影和
+> 依赖/milestone 解锁门禁。L3，真实三提供商固定夹具尚未运行；本文提出的 reviewer 各自执行独立
+> 验证命令及 evidence ID 绑定尚未实现，不能由现有双最终评审代替。
 
 ## 背景
 
@@ -398,6 +403,12 @@ Delivery evidence: none
 
 ## 状态版本与迁移
 
+以下 version 6 -> 7 是本文最初提出的目标模型，不是当前主线的实际版本号。当前实现保持 v10 的
+`submitted -> collaboration -> final-verification -> approved` 任务状态机，在 v11 另增
+`deliveryVerifications` 持久证据数组：治理 `approved` 不改名，只有相同 task revision 和冻结 diff 的
+`passed` 收据才使三轴 `workflowStatus` 成为 `completed` 并解锁依赖。v10 -> v11 迁移不会伪造 delivery
+证据，且会把此前仅凭旧 approval 解锁的依赖和 milestone 重新置为 `blocked`。
+
 状态版本从 6 升到 7。加载 version 6 时执行一次确定性迁移：
 
 - `blocked/claimed/submitted/revision-required` 映射到同名 `workflowStatus`；
@@ -418,6 +429,10 @@ Delivery evidence: none
 失败时保持原文件不变并拒绝启动团队。
 
 ## 测试层级
+
+本节中 reviewer verification evidence 相关条目仍是后续目标。当前已实现并通过的范围是 coordinator
+delivery 的成功、非零退出、环境凭据隔离、task/workspace 漂移、manifest 边界、v10 迁移、签名事件
+重放、三轴投影、依赖/milestone 解锁，以及 `/verify` 的真实 RPC 成功和失败关闭路径。
 
 ### 核心状态机测试
 

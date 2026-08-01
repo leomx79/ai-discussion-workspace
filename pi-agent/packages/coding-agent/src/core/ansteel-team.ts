@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
@@ -10,6 +10,7 @@ import {
 	readFileSync,
 	realpathSync,
 	renameSync,
+	statSync,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
@@ -36,7 +37,7 @@ import {
 	verifyAnsteelRuntimeLogIntegrity,
 } from "./ansteel-team-observability.ts";
 
-const ANSTEEL_TEAM_STATE_VERSION = 10;
+const ANSTEEL_TEAM_STATE_VERSION = 11;
 // Local diffs and explicit anchor traffic share one bounded Git execution
 // budget. In particular, an unavailable remote or credential helper must not
 // leave the coordinator command waiting indefinitely.
@@ -48,6 +49,38 @@ const ANSTEEL_GIT_COMMAND_TIMEOUT_MS = 30_000;
 const ANSTEEL_TEAM_EVENT_HASH_ALGORITHM = "sha256-jcs-v1" as const;
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
+const ANSTEEL_TEAM_DELIVERY_MANIFEST_MAX_BYTES = 64 * 1024;
+const ANSTEEL_TEAM_DELIVERY_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
+const ANSTEEL_TEAM_DELIVERY_ALLOWED_EXECUTABLES = new Set([
+	"node",
+	"node.exe",
+	"npm",
+	"npm.cmd",
+	"npx",
+	"npx.cmd",
+	"pnpm",
+	"pnpm.cmd",
+	"yarn",
+	"yarn.cmd",
+	"bun",
+	"bun.exe",
+	"python",
+	"python.exe",
+	"pytest",
+	"pytest.exe",
+	"go",
+	"go.exe",
+	"cargo",
+	"cargo.exe",
+	"dotnet",
+	"dotnet.exe",
+	"mvn",
+	"mvn.cmd",
+	"gradlew",
+	"gradlew.bat",
+	"make",
+	"make.exe",
+]);
 const ANSTEEL_TEAM_TEST_COMMAND_PREFIX =
 	/^(?:npm (?:test|run (?:test|check|lint|typecheck)\b|exec -- (?:vitest|jest|tsc)\b)|npx (?:vitest|jest|tsc)\b|pnpm (?:test|run (?:test|check|lint|typecheck)\b)|yarn (?:test|run (?:test|check|lint|typecheck)\b)|bun test\b|vitest\b|jest\b|node --test\b|pytest\b|go test\b|cargo test\b|dotnet test\b|mvn test\b|(?:\.\/)?gradlew test\b|make test\b)/;
 
@@ -67,8 +100,8 @@ export type AnsteelWorkflowStatus = "in-progress" | "blocked" | "completed";
 
 /**
  * Read-only, mechanically derived status axes. They deliberately remain
- * separate from task approval: the current model has no trusted delivery
- * evidence record, so it cannot derive delivery success from governance facts.
+ * separate from task approval: only a replayed current-revision delivery
+ * receipt can derive delivery success from coordinator-owned evidence.
  */
 export interface AnsteelTeamStatusAxes {
 	collaborationStatus: AnsteelCollaborationStatus;
@@ -119,6 +152,10 @@ export type AnsteelTeamEventType =
 	| "task-collaboration-returned"
 	| "task-final-verification-requested"
 	| "task-review"
+	| "task-delivery-started"
+	| "task-delivery-check"
+	| "task-delivery-passed"
+	| "task-delivery-failed"
 	| "milestone-planned"
 	| "milestone-submitted"
 	| "milestone-collaboration"
@@ -278,6 +315,15 @@ export type AnsteelTeamPublicEventPayload =
 	  }
 	| { kind: "action-assessed"; assessment: AnsteelActionAssessment }
 	| { kind: "action-review"; review: AnsteelActionReview }
+	| { kind: "task-delivery-started"; verification: AnsteelTeamDeliveryVerification }
+	| { kind: "task-delivery-check"; verificationId: string; check: AnsteelTeamDeliveryCheckEvidence }
+	| {
+			kind: "task-delivery-finished";
+			verificationId: string;
+			status: "passed" | "failed";
+			completedAt: string;
+			failureReason?: AnsteelTeamDeliveryFailureReason;
+	  }
 	| {
 			kind: "runtime-recovery";
 			runId: string;
@@ -327,6 +373,55 @@ export interface AnsteelTeamTaskReview {
 	verdict: "approve" | "reject";
 	issue?: string;
 	reviewedAt: string;
+}
+
+export type AnsteelTeamDeliveryFailureReason =
+	| "check-failed"
+	| "check-timeout"
+	| "check-launch-failed"
+	| "diff-drift"
+	| "source-commit-drift"
+	| "interrupted";
+
+export interface AnsteelTeamDeliveryCheckEvidence {
+	id: string;
+	commandHash: string;
+	outputHash: string;
+	artifactHash: string;
+	exitCode: number | null;
+	timedOut: boolean;
+	isError: boolean;
+	startedAt: string;
+	completedAt: string;
+}
+
+export interface AnsteelTeamDeliveryVerification {
+	id: string;
+	taskId: string;
+	revision: number;
+	diffHash: string;
+	workspaceHash: string;
+	sourceCommit: string;
+	manifestHash: string;
+	status: "verifying" | "passed" | "failed";
+	checks: AnsteelTeamDeliveryCheckEvidence[];
+	startedAt: string;
+	completedAt?: string;
+	failureReason?: AnsteelTeamDeliveryFailureReason;
+}
+
+export interface AnsteelTeamDeliveryManifestCheck {
+	id: string;
+	executable: string;
+	args: string[];
+	timeoutMs: number;
+}
+
+export interface AnsteelTeamDeliveryManifest {
+	version: 1;
+	taskId: string;
+	revision: number;
+	checks: AnsteelTeamDeliveryManifestCheck[];
 }
 
 /**
@@ -494,6 +589,7 @@ export interface AnsteelTeamState {
 	workCheckpoints: AnsteelWorkCheckpoint[];
 	processIssues: AnsteelProcessIssue[];
 	actionReviews: AnsteelActionReview[];
+	deliveryVerifications: AnsteelTeamDeliveryVerification[];
 	ledgerHeadHash: string | null;
 }
 
@@ -516,6 +612,7 @@ export interface AnsteelTeamSharedBoard {
 		type: AnsteelTeamTaskType;
 		assignmentReason?: string;
 		status: AnsteelTeamTask["status"];
+		deliveryStatus: AnsteelDeliveryStatus;
 		dependsOn: string[];
 	}>;
 	activeCheckpoints: AnsteelWorkCheckpoint[];
@@ -666,6 +763,12 @@ function assertProcessIssueId(id: unknown): asserts id is string {
 function assertProcessResolutionId(id: unknown): asserts id is string {
 	if (typeof id !== "string" || !/^PR-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(id)) {
 		throw new AnsteelTeamStateError("Ansteel team process resolution IDs must use the PR-<UPPERCASE-ID> form");
+	}
+}
+
+function assertDeliveryVerificationId(id: unknown): asserts id is string {
+	if (typeof id !== "string" || !/^DV-[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/.test(id)) {
+		throw new AnsteelTeamStateError("Ansteel team delivery verification IDs must use the DV-<UUID> form");
 	}
 }
 
@@ -916,12 +1019,151 @@ function assertState(state: AnsteelTeamState): void {
 			}
 		}
 	}
-	assertAnsteelTeamTaskDependencyGraph(state.tasks);
-	assertAnsteelTeamMilestones(state.tasks, state.milestones);
+	assertAnsteelTeamDeliveryVerifications(state);
+	assertAnsteelTeamTaskDependencyGraph(state);
+	assertAnsteelTeamMilestones(state);
 	assertAnsteelPublicCollaborationState(state);
 }
 
-function assertAnsteelTeamTaskDependencyGraph(tasks: readonly AnsteelTeamTask[]): void {
+function assertAnsteelTeamDeliveryVerifications(state: AnsteelTeamState): void {
+	if (!Array.isArray(state.deliveryVerifications)) {
+		throw new AnsteelTeamStateError("Ansteel team state has invalid delivery verifications");
+	}
+	const taskIds = new Set(state.tasks.map((task) => task.id));
+	const verificationIds = new Set<string>();
+	const activeScopes = new Set<string>();
+	for (const verification of state.deliveryVerifications) {
+		if (!isRecord(verification)) throw new AnsteelTeamStateError("Ansteel team has an invalid delivery verification");
+		assertDeliveryVerificationId(verification.id);
+		if (verificationIds.has(verification.id)) {
+			throw new AnsteelTeamStateError(`Ansteel team delivery verification ${verification.id} is duplicated`);
+		}
+		verificationIds.add(verification.id);
+		assertTaskId(verification.taskId);
+		if (!taskIds.has(verification.taskId)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} targets an unknown task`,
+			);
+		}
+		if (!Number.isSafeInteger(verification.revision) || verification.revision < 1) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} has an invalid revision`,
+			);
+		}
+		assertLedgerHash(verification.diffHash, "delivery diff hash", false);
+		assertLedgerHash(verification.workspaceHash, "delivery workspace hash", false);
+		assertLedgerHash(verification.manifestHash, "delivery manifest hash", false);
+		if (typeof verification.sourceCommit !== "string" || !/^[0-9a-f]{40,64}$/i.test(verification.sourceCommit)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} has an invalid source commit`,
+			);
+		}
+		if (verification.status !== "verifying" && verification.status !== "passed" && verification.status !== "failed") {
+			throw new AnsteelTeamStateError(`Ansteel team delivery verification ${verification.id} has an invalid status`);
+		}
+		assertStateTimestamp(verification.startedAt, `delivery verification ${verification.id} start time`);
+		if (!Array.isArray(verification.checks)) {
+			throw new AnsteelTeamStateError(`Ansteel team delivery verification ${verification.id} has invalid checks`);
+		}
+		const checkIds = new Set<string>();
+		for (const check of verification.checks) {
+			if (!isRecord(check) || typeof check.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(check.id)) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team delivery verification ${verification.id} has an invalid check`,
+				);
+			}
+			if (checkIds.has(check.id)) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team delivery verification ${verification.id} repeats check ${check.id}`,
+				);
+			}
+			checkIds.add(check.id);
+			assertLedgerHash(check.commandHash, "delivery command hash", false);
+			assertLedgerHash(check.outputHash, "delivery output hash", false);
+			assertLedgerHash(check.artifactHash, "delivery artifact hash", false);
+			if (check.exitCode !== null && (!Number.isSafeInteger(check.exitCode) || check.exitCode < 0)) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team delivery verification ${verification.id} has an invalid exit code`,
+				);
+			}
+			if (typeof check.timedOut !== "boolean" || typeof check.isError !== "boolean") {
+				throw new AnsteelTeamStateError(
+					`Ansteel team delivery verification ${verification.id} has invalid check flags`,
+				);
+			}
+			assertStateTimestamp(check.startedAt, `delivery check ${check.id} start time`);
+			assertStateTimestamp(check.completedAt, `delivery check ${check.id} completion time`);
+		}
+		if (verification.status === "verifying") {
+			if (verification.completedAt !== undefined || verification.failureReason !== undefined) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team active delivery verification ${verification.id} has terminal fields`,
+				);
+			}
+			const scope = `${verification.taskId}@${verification.revision}`;
+			if (activeScopes.has(scope)) {
+				throw new AnsteelTeamStateError(`Ansteel team has multiple active delivery verifications for ${scope}`);
+			}
+			activeScopes.add(scope);
+		} else {
+			assertStateTimestamp(verification.completedAt, `delivery verification ${verification.id} completion time`);
+			if (verification.status === "passed") {
+				if (
+					verification.failureReason !== undefined ||
+					verification.checks.length === 0 ||
+					verification.checks.some((check) => check.isError)
+				) {
+					throw new AnsteelTeamStateError(
+						`Ansteel team passed delivery verification ${verification.id} has invalid evidence`,
+					);
+				}
+			} else if (
+				verification.failureReason !== "check-failed" &&
+				verification.failureReason !== "check-timeout" &&
+				verification.failureReason !== "check-launch-failed" &&
+				verification.failureReason !== "diff-drift" &&
+				verification.failureReason !== "source-commit-drift" &&
+				verification.failureReason !== "interrupted"
+			) {
+				throw new AnsteelTeamStateError(
+					`Ansteel team failed delivery verification ${verification.id} has no stable reason`,
+				);
+			}
+		}
+	}
+}
+
+function getCurrentPassedDeliveryVerification(
+	state: AnsteelTeamState,
+	task: AnsteelTeamTask,
+): AnsteelTeamDeliveryVerification | undefined {
+	return [...state.deliveryVerifications].reverse().find(
+		(verification) =>
+			verification.taskId === task.id &&
+			verification.revision === task.revision &&
+			verification.status === "passed" &&
+			verification.diffHash ===
+				createHash("sha256")
+					.update(task.submissions.at(-1)?.diff ?? "", "utf8")
+					.digest("hex"),
+	);
+}
+
+function isAnsteelTeamTaskDelivered(state: AnsteelTeamState, task: AnsteelTeamTask): boolean {
+	return task.status === "approved" && getCurrentPassedDeliveryVerification(state, task) !== undefined;
+}
+
+function getAnsteelTeamTaskDeliveryStatus(state: AnsteelTeamState, task: AnsteelTeamTask): AnsteelDeliveryStatus {
+	const current = state.deliveryVerifications.filter(
+		(verification) => verification.taskId === task.id && verification.revision === task.revision,
+	);
+	if (current.some((verification) => verification.status === "verifying")) return "verifying";
+	if (current.some((verification) => verification.status === "failed")) return "failed";
+	return isAnsteelTeamTaskDelivered(state, task) ? "passed" : "not-started";
+}
+
+function assertAnsteelTeamTaskDependencyGraph(state: AnsteelTeamState): void {
+	const tasks = state.tasks;
 	const tasksById = new Map(tasks.map((task) => [task.id, task]));
 	for (const task of tasks) {
 		if (!Array.isArray(task.dependsOn) || task.dependsOn.some((dependency) => typeof dependency !== "string")) {
@@ -954,16 +1196,16 @@ function assertAnsteelTeamTaskDependencyGraph(tasks: readonly AnsteelTeamTask[])
 	for (const task of tasks) visit(task);
 
 	for (const task of tasks) {
-		const dependenciesApproved = task.dependsOn.every(
-			(dependency) => tasksById.get(dependency)?.status === "approved",
+		const dependenciesApproved = task.dependsOn.every((dependency) =>
+			isAnsteelTeamTaskDelivered(state, tasksById.get(dependency)!),
 		);
 		if (!dependenciesApproved && task.status !== "blocked") {
 			throw new AnsteelTeamStateError(
-				`Ansteel team task ${task.id} is unblocked before its dependencies are approved`,
+				`Ansteel team task ${task.id} is unblocked before its dependencies pass delivery verification`,
 			);
 		}
 		if (dependenciesApproved && task.status === "blocked") {
-			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} is blocked despite approved dependencies`);
+			throw new AnsteelTeamStateError(`Ansteel team task ${task.id} is blocked despite delivered dependencies`);
 		}
 	}
 }
@@ -971,8 +1213,8 @@ function assertAnsteelTeamTaskDependencyGraph(tasks: readonly AnsteelTeamTask[])
 function reconcileAnsteelTeamTaskDependencies(state: AnsteelTeamState): void {
 	const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
 	for (const task of state.tasks) {
-		const dependenciesApproved = task.dependsOn.every(
-			(dependency) => tasksById.get(dependency)?.status === "approved",
+		const dependenciesApproved = task.dependsOn.every((dependency) =>
+			isAnsteelTeamTaskDelivered(state, tasksById.get(dependency)!),
 		);
 		if (!dependenciesApproved && task.status !== "blocked") {
 			task.status = "blocked";
@@ -982,7 +1224,9 @@ function reconcileAnsteelTeamTaskDependencies(state: AnsteelTeamState): void {
 		}
 	}
 	for (const milestone of state.milestones) {
-		const tasksApproved = milestone.taskIds.every((taskId) => tasksById.get(taskId)?.status === "approved");
+		const tasksApproved = milestone.taskIds.every((taskId) =>
+			isAnsteelTeamTaskDelivered(state, tasksById.get(taskId)!),
+		);
 		if (!tasksApproved && milestone.status !== "blocked") {
 			milestone.status = "blocked";
 			milestone.testEvidence = [];
@@ -992,7 +1236,9 @@ function reconcileAnsteelTeamTaskDependencies(state: AnsteelTeamState): void {
 	}
 }
 
-function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], milestones: unknown): void {
+function assertAnsteelTeamMilestones(state: AnsteelTeamState): void {
+	const tasks = state.tasks;
+	const milestones = state.milestones;
 	if (!Array.isArray(milestones)) throw new AnsteelTeamStateError("Ansteel team state has invalid milestones");
 	const tasksById = new Map(tasks.map((task) => [task.id, task]));
 	const milestoneIds = new Set<string>();
@@ -1054,14 +1300,16 @@ function assertAnsteelTeamMilestones(tasks: readonly AnsteelTeamTask[], mileston
 				(milestone.submissions as Array<{ revision: number }>).map((submission) => submission.revision),
 			),
 		);
-		const tasksApproved = milestone.taskIds.every((taskId) => tasksById.get(taskId)?.status === "approved");
+		const tasksApproved = milestone.taskIds.every((taskId) =>
+			isAnsteelTeamTaskDelivered(state, tasksById.get(taskId)!),
+		);
 		if (!tasksApproved && milestone.status !== "blocked") {
 			throw new AnsteelTeamStateError(
-				`Ansteel team milestone ${milestone.id} is unblocked before its tasks are approved`,
+				`Ansteel team milestone ${milestone.id} is unblocked before its tasks pass delivery verification`,
 			);
 		}
 		if (tasksApproved && milestone.status === "blocked") {
-			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} is blocked despite approved tasks`);
+			throw new AnsteelTeamStateError(`Ansteel team milestone ${milestone.id} is blocked despite delivered tasks`);
 		}
 	}
 }
@@ -1413,6 +1661,7 @@ export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): 
 		workCheckpoints: [],
 		processIssues: [],
 		actionReviews: [],
+		deliveryVerifications: [],
 		ledgerHeadHash: null,
 	};
 	assertState(state);
@@ -1698,7 +1947,7 @@ export function getAnsteelTeamWriteBlockReason(
 		return `Ansteel team writes to ${normalizedFile} must be claimed by ${role}; it belongs to ${task.owner} via ${task.id}`;
 	}
 	if (task.status === "blocked") {
-		return `Ansteel team task ${task.id} is waiting for approved dependencies: ${task.dependsOn.join(", ")}`;
+		return `Ansteel team task ${task.id} is waiting for delivered dependencies: ${task.dependsOn.join(", ")}`;
 	}
 	if (task.status !== "claimed" && task.status !== "revision-required") {
 		return `Ansteel team task ${task.id} is ${task.status}; code is frozen until peer review returns it for revision`;
@@ -2008,7 +2257,10 @@ function claimAnsteelTeamTaskInState(
 		description: input.description.trim(),
 		acceptanceCriteria: input.acceptanceCriteria.trim(),
 		dependsOn: [...dependsOn],
-		status: dependsOn.every((dependency) => state.tasks.find((task) => task.id === dependency)?.status === "approved")
+		status: dependsOn.every((dependency) => {
+			const dependencyTask = state.tasks.find((task) => task.id === dependency)!;
+			return isAnsteelTeamTaskDelivered(state, dependencyTask);
+		})
 			? "claimed"
 			: "blocked",
 		revision: 0,
@@ -2150,8 +2402,8 @@ export function createAnsteelTeamMilestone(
 	if (typeof input.acceptanceCriteria !== "string" || input.acceptanceCriteria.trim().length === 0) {
 		throw new AnsteelTeamStateError("Ansteel team milestone requires acceptance criteria");
 	}
-	const tasksApproved = input.taskIds.every(
-		(taskId) => state.tasks.find((task) => task.id === taskId)?.status === "approved",
+	const tasksApproved = input.taskIds.every((taskId) =>
+		isAnsteelTeamTaskDelivered(state, state.tasks.find((task) => task.id === taskId)!),
 	);
 	const milestone: AnsteelTeamMilestone = {
 		id: input.id,
@@ -2182,7 +2434,7 @@ function getMilestoneForIntegration(
 	const milestone = state.milestones.find((item) => item.id === milestoneId);
 	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
 	if (milestone.status === "blocked") {
-		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} is waiting for approved tasks`);
+		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} is waiting for delivered tasks`);
 	}
 	if (milestone.status !== "ready" && milestone.status !== "revision-required") {
 		throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} cannot accept new integration evidence`);
@@ -3398,6 +3650,422 @@ export function reviewAnsteelTeamTask(
 	return review;
 }
 
+function hashAnsteelTeamTaskSubmissionDiff(task: AnsteelTeamTask): string {
+	const submission = task.submissions.find((candidate) => candidate.revision === task.revision);
+	if (!submission) throw new AnsteelTeamStateError(`Ansteel team task ${task.id} has no current submission`);
+	return createHash("sha256").update(submission.diff, "utf8").digest("hex");
+}
+
+interface AnsteelTeamDeliveryWorkspaceSnapshot {
+	hash: string;
+	trackedDiffHash: string;
+	untracked: Array<{ file: string; sha256: string }>;
+}
+
+function captureAnsteelTeamDeliveryWorkspaceSnapshot(cwd: string): AnsteelTeamDeliveryWorkspaceSnapshot {
+	// Coordinator audit state changes while verification is running and is not a
+	// product input. Exclude only that private directory; every other tracked or
+	// untracked project file remains part of the immutable workspace binding.
+	// Exclude the directory entry itself, not only its descendants. Some Git
+	// versions still traverse an untracked `.pi` directory when only `.pi/**`
+	// is supplied, so the normalized TypeScript filter below is the second
+	// boundary for coordinator-created audit files.
+	const projectPathspec = [".", ":(top,exclude).pi"];
+	const trackedDiff = runGit(cwd, ["diff", "--no-ext-diff", "--binary", "HEAD", "--", ...projectPathspec], [0]);
+	const untrackedFiles = runGit(
+		cwd,
+		["ls-files", "--others", "--exclude-standard", "-z", "--", ...projectPathspec],
+		[0],
+	)
+		.split("\0")
+		.filter((file) => file.length > 0 && file !== ".pi" && !file.startsWith(".pi/"))
+		.sort();
+	const projectDirectory = realpathSync(assertProjectDirectory(cwd));
+	const untracked = untrackedFiles.map((file) => {
+		const absolutePath = realpathSync(resolvePath(file, projectDirectory));
+		if (getCwdRelativePath(absolutePath, projectDirectory) === undefined || !statSync(absolutePath).isFile()) {
+			throw new AnsteelTeamStateError("Ansteel team delivery verification found an unsafe untracked file");
+		}
+		return {
+			file,
+			sha256: createHash("sha256").update(readFileSync(absolutePath)).digest("hex"),
+		};
+	});
+	const trackedDiffHash = createHash("sha256").update(trackedDiff, "utf8").digest("hex");
+	return {
+		hash: hashAnsteelAuditValue({ trackedDiffHash, untracked }),
+		trackedDiffHash,
+		untracked,
+	};
+}
+
+function describeAnsteelTeamDeliveryWorkspaceDrift(
+	before: AnsteelTeamDeliveryWorkspaceSnapshot,
+	after: AnsteelTeamDeliveryWorkspaceSnapshot,
+): string {
+	const reasons: string[] = [];
+	if (before.trackedDiffHash !== after.trackedDiffHash) reasons.push("tracked-diff");
+	const beforeFiles = new Map(before.untracked.map((entry) => [entry.file, entry.sha256]));
+	const afterFiles = new Map(after.untracked.map((entry) => [entry.file, entry.sha256]));
+	for (const file of [...new Set([...beforeFiles.keys(), ...afterFiles.keys()])].sort()) {
+		if (beforeFiles.get(file) !== afterFiles.get(file)) reasons.push(`untracked:${file}`);
+	}
+	return reasons.length === 0 ? "unclassified" : reasons.join(",");
+}
+
+function readAnsteelTeamDeliveryManifest(
+	cwd: string,
+	manifestPath: string,
+): { manifest: AnsteelTeamDeliveryManifest; manifestHash: string } {
+	if (typeof manifestPath !== "string" || !isAbsolute(manifestPath)) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest path must be absolute");
+	}
+	const projectDirectory = realpathSync(assertProjectDirectory(cwd));
+	const resolvedManifestPath = realpathSync(resolve(manifestPath));
+	if (getCwdRelativePath(resolvedManifestPath, projectDirectory) !== undefined) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest must remain outside the role project directory");
+	}
+	const manifestStat = statSync(resolvedManifestPath);
+	if (
+		!manifestStat.isFile() ||
+		manifestStat.size < 2 ||
+		manifestStat.size > ANSTEEL_TEAM_DELIVERY_MANIFEST_MAX_BYTES
+	) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest has an invalid size");
+	}
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readFileSync(resolvedManifestPath, "utf8"));
+	} catch {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest is not valid JSON");
+	}
+	if (
+		!isRecord(raw) ||
+		Object.keys(raw).length !== 4 ||
+		!["version", "taskId", "revision", "checks"].every((key) => Object.hasOwn(raw, key))
+	) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest has an invalid schema");
+	}
+	if (raw.version !== 1) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest requires version 1");
+	}
+	assertTaskId(raw.taskId);
+	if (typeof raw.revision !== "number" || !Number.isSafeInteger(raw.revision) || raw.revision < 1) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest has an invalid revision");
+	}
+	if (!Array.isArray(raw.checks) || raw.checks.length < 1 || raw.checks.length > 32) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest requires 1 to 32 checks");
+	}
+	const checkIds = new Set<string>();
+	const checks = raw.checks.map((value) => {
+		if (
+			!isRecord(value) ||
+			Object.keys(value).length !== 4 ||
+			!["id", "executable", "args", "timeoutMs"].every((key) => Object.hasOwn(value, key)) ||
+			typeof value.id !== "string" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value.id)
+		) {
+			throw new AnsteelTeamStateError("Ansteel team delivery manifest has an invalid check schema");
+		}
+		if (checkIds.has(value.id))
+			throw new AnsteelTeamStateError(`Ansteel team delivery check ${value.id} is duplicated`);
+		checkIds.add(value.id);
+		if (typeof value.executable !== "string" || value.executable.includes("\0")) {
+			throw new AnsteelTeamStateError(`Ansteel team delivery check ${value.id} has an invalid executable`);
+		}
+		const executableName = basename(value.executable).toLowerCase();
+		if (!ANSTEEL_TEAM_DELIVERY_ALLOWED_EXECUTABLES.has(executableName)) {
+			throw new AnsteelTeamStateError(`Ansteel team delivery check ${value.id} executable is not allowed`);
+		}
+		if (
+			!Array.isArray(value.args) ||
+			value.args.length > 128 ||
+			value.args.some((arg) => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)
+		) {
+			throw new AnsteelTeamStateError(`Ansteel team delivery check ${value.id} has invalid arguments`);
+		}
+		if (
+			typeof value.timeoutMs !== "number" ||
+			!Number.isSafeInteger(value.timeoutMs) ||
+			value.timeoutMs < 1_000 ||
+			value.timeoutMs > 21_600_000
+		) {
+			throw new AnsteelTeamStateError(`Ansteel team delivery check ${value.id} has an invalid timeout`);
+		}
+		return {
+			id: value.id,
+			executable: value.executable,
+			args: [...value.args] as string[],
+			timeoutMs: value.timeoutMs as number,
+		};
+	});
+	const manifest: AnsteelTeamDeliveryManifest = {
+		version: 1,
+		taskId: raw.taskId,
+		revision: raw.revision as number,
+		checks,
+	};
+	return { manifest, manifestHash: hashAnsteelAuditValue(raw) };
+}
+
+function prepareAnsteelTeamDeliveryEvidenceDirectory(cwd: string, teamId: string, manifestPath: string): string {
+	const projectDirectory = realpathSync(assertProjectDirectory(cwd));
+	const scope = createHash("sha256").update(`${projectDirectory}\0${teamId}`, "utf8").digest("hex");
+	const root = join(dirname(realpathSync(manifestPath)), ".ansteel-delivery-evidence");
+	mkdirSync(root, { recursive: true });
+	const canonicalRoot = realpathSync(root);
+	if (getCwdRelativePath(canonicalRoot, projectDirectory) !== undefined) {
+		throw new AnsteelTeamStateError("Ansteel team delivery evidence directory must remain outside the role project");
+	}
+	const directory = join(canonicalRoot, scope);
+	mkdirSync(directory, { recursive: true });
+	const canonicalDirectory = realpathSync(directory);
+	if (getCwdRelativePath(canonicalDirectory, projectDirectory) !== undefined) {
+		throw new AnsteelTeamStateError("Ansteel team delivery evidence directory must remain outside the role project");
+	}
+	return canonicalDirectory;
+}
+
+function getAnsteelTeamDeliveryEnvironment(): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = { CI: "1", NO_COLOR: "1" };
+	for (const key of ["PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "HOME", "USERPROFILE"]) {
+		if (process.env[key] !== undefined) environment[key] = process.env[key];
+	}
+	return environment;
+}
+
+function appendAnsteelTeamDeliveryTerminalEvent(
+	cwd: string,
+	state: AnsteelTeamState,
+	verificationId: string,
+	status: "passed" | "failed",
+	failureReason: AnsteelTeamDeliveryFailureReason | undefined,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamDeliveryVerification {
+	const completedAt = new Date().toISOString();
+	appendAnsteelTeamEvent(
+		cwd,
+		state,
+		{
+			schemaVersion: 2,
+			type: status === "passed" ? "task-delivery-passed" : "task-delivery-failed",
+			role: "coordinator",
+			payload: {
+				kind: "task-delivery-finished",
+				verificationId,
+				status,
+				completedAt,
+				...(failureReason === undefined ? {} : { failureReason }),
+			},
+			content:
+				status === "passed"
+					? `Delivery verification ${verificationId} passed.`
+					: `Delivery verification ${verificationId} failed: ${failureReason}.`,
+		},
+		persistence,
+	);
+	return state.deliveryVerifications.find((verification) => verification.id === verificationId)!;
+}
+
+/**
+ * Runs a coordinator-owned, project-external manifest without exposing its
+ * commands or output to role sessions. Every durable success is bound to the
+ * current task revision, frozen task diff, whole workspace and Git commit.
+ */
+export function verifyAnsteelTeamTaskDelivery(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+	manifestPath: string,
+	persistence?: AnsteelTeamPersistenceContext,
+): AnsteelTeamDeliveryVerification {
+	const projectDirectory = assertProjectDirectory(cwd);
+	assertState(state);
+	assertTaskId(taskId);
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+	if (task.status !== "approved") {
+		throw new AnsteelTeamStateError(`Ansteel team task ${taskId} must be approved before delivery verification`);
+	}
+	const { manifest, manifestHash } = readAnsteelTeamDeliveryManifest(projectDirectory, manifestPath);
+	if (manifest.taskId !== task.id || manifest.revision !== task.revision) {
+		throw new AnsteelTeamStateError("Ansteel team delivery manifest does not match the current task revision");
+	}
+
+	const active = state.deliveryVerifications.find(
+		(verification) =>
+			verification.taskId === task.id &&
+			verification.revision === task.revision &&
+			verification.status === "verifying",
+	);
+	if (active) {
+		appendAnsteelTeamDeliveryTerminalEvent(projectDirectory, state, active.id, "failed", "interrupted", persistence);
+	}
+
+	const diffHash = hashAnsteelTeamTaskSubmissionDiff(task);
+	const currentDiffHash = createHash("sha256").update(collectTaskDiff(projectDirectory, task), "utf8").digest("hex");
+	if (currentDiffHash !== diffHash) {
+		throw new AnsteelTeamStateError("Ansteel team task diff drifted before delivery verification");
+	}
+	const workspaceSnapshot = captureAnsteelTeamDeliveryWorkspaceSnapshot(projectDirectory);
+	const workspaceHash = workspaceSnapshot.hash;
+	const sourceCommit = runAnsteelTeamGitCommand(
+		projectDirectory,
+		["rev-parse", "HEAD"],
+		"read delivery commit",
+	).trim();
+	if (!/^[0-9a-f]{40,64}$/i.test(sourceCommit)) {
+		throw new AnsteelTeamStateError("Ansteel team delivery verification requires a valid Git commit");
+	}
+	const evidenceDirectory = prepareAnsteelTeamDeliveryEvidenceDirectory(projectDirectory, state.id, manifestPath);
+
+	const verification: AnsteelTeamDeliveryVerification = {
+		id: `DV-${randomUUID().toUpperCase()}`,
+		taskId: task.id,
+		revision: task.revision,
+		diffHash,
+		workspaceHash,
+		sourceCommit,
+		manifestHash,
+		status: "verifying",
+		checks: [],
+		startedAt: new Date().toISOString(),
+	};
+	appendAnsteelTeamEvent(
+		projectDirectory,
+		state,
+		{
+			schemaVersion: 2,
+			type: "task-delivery-started",
+			role: "coordinator",
+			payload: { kind: "task-delivery-started", verification },
+			content: `Delivery verification ${verification.id} started for ${task.id} revision ${task.revision}.`,
+		},
+		persistence,
+	);
+
+	for (const check of manifest.checks) {
+		const startedAt = new Date().toISOString();
+		const commandHash = hashAnsteelAuditValue({ executable: check.executable, args: check.args });
+		const result = spawnSync(check.executable, check.args, {
+			cwd: projectDirectory,
+			encoding: "utf8",
+			env: getAnsteelTeamDeliveryEnvironment(),
+			maxBuffer: ANSTEEL_TEAM_DELIVERY_OUTPUT_MAX_BYTES,
+			timeout: check.timeoutMs,
+			windowsHide: true,
+			shell: false,
+		});
+		const completedAt = new Date().toISOString();
+		const timedOut = result.error !== undefined && "code" in result.error && result.error.code === "ETIMEDOUT";
+		const isError = result.error !== undefined || result.status !== 0;
+		const output = {
+			verificationId: verification.id,
+			checkId: check.id,
+			stdout: result.stdout ?? "",
+			stderr: result.stderr ?? "",
+			exitCode: result.status,
+			timedOut,
+			isError,
+			startedAt,
+			completedAt,
+		};
+		const outputHash = hashAnsteelAuditValue({ stdout: output.stdout, stderr: output.stderr });
+		const artifactHash = hashAnsteelAuditValue(output);
+		writeDurableTemporaryFile(
+			join(evidenceDirectory, `${artifactHash}.json`),
+			`${canonicalizeAnsteelAuditValue(output)}\n`,
+		);
+		const evidence: AnsteelTeamDeliveryCheckEvidence = {
+			id: check.id,
+			commandHash,
+			outputHash,
+			artifactHash,
+			exitCode: result.status,
+			timedOut,
+			isError,
+			startedAt,
+			completedAt,
+		};
+		appendAnsteelTeamEvent(
+			projectDirectory,
+			state,
+			{
+				schemaVersion: 2,
+				type: "task-delivery-check",
+				role: "coordinator",
+				payload: { kind: "task-delivery-check", verificationId: verification.id, check: evidence },
+				content: `Delivery verification ${verification.id} check ${check.id} ${isError ? "failed" : "passed"}.`,
+			},
+			persistence,
+		);
+		if (isError) {
+			const reason: AnsteelTeamDeliveryFailureReason = timedOut
+				? "check-timeout"
+				: result.error === undefined
+					? "check-failed"
+					: "check-launch-failed";
+			const failed = appendAnsteelTeamDeliveryTerminalEvent(
+				projectDirectory,
+				state,
+				verification.id,
+				"failed",
+				reason,
+				persistence,
+			);
+			throw new AnsteelTeamStateError(`Ansteel team delivery verification ${failed.id} failed: ${reason}`);
+		}
+		const postCheckDiffHash = createHash("sha256")
+			.update(collectTaskDiff(projectDirectory, task), "utf8")
+			.digest("hex");
+		const taskDiffDrifted = postCheckDiffHash !== diffHash;
+		const postCheckWorkspaceSnapshot = captureAnsteelTeamDeliveryWorkspaceSnapshot(projectDirectory);
+		const workspaceDrifted = postCheckWorkspaceSnapshot.hash !== workspaceHash;
+		if (taskDiffDrifted || workspaceDrifted) {
+			appendAnsteelTeamDeliveryTerminalEvent(
+				projectDirectory,
+				state,
+				verification.id,
+				"failed",
+				"diff-drift",
+				persistence,
+			);
+			const driftScope = taskDiffDrifted
+				? "task"
+				: `workspace:${describeAnsteelTeamDeliveryWorkspaceDrift(workspaceSnapshot, postCheckWorkspaceSnapshot)}`;
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} failed: diff-drift (${driftScope})`,
+			);
+		}
+		const currentCommit = runAnsteelTeamGitCommand(
+			projectDirectory,
+			["rev-parse", "HEAD"],
+			"recheck delivery commit",
+		).trim();
+		if (currentCommit !== sourceCommit) {
+			appendAnsteelTeamDeliveryTerminalEvent(
+				projectDirectory,
+				state,
+				verification.id,
+				"failed",
+				"source-commit-drift",
+				persistence,
+			);
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} failed: source-commit-drift`,
+			);
+		}
+	}
+	return appendAnsteelTeamDeliveryTerminalEvent(
+		projectDirectory,
+		state,
+		verification.id,
+		"passed",
+		undefined,
+		persistence,
+	);
+}
+
 function writeBuffer(fd: number, content: Buffer): void {
 	let offset = 0;
 	while (offset < content.length) offset += writeSync(fd, content, offset, content.length - offset);
@@ -3585,7 +4253,7 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 	if (state.version === 9) {
 		state = {
 			...state,
-			version: ANSTEEL_TEAM_STATE_VERSION,
+			version: 10,
 			tasks: Array.isArray(state.tasks)
 				? state.tasks.map((task) =>
 						isRecord(task)
@@ -3609,6 +4277,27 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 									collaborationUpdates: [],
 								}
 							: milestone,
+					)
+				: state.milestones,
+		};
+	}
+	if (state.version === 10) {
+		state = {
+			...state,
+			version: ANSTEEL_TEAM_STATE_VERSION,
+			deliveryVerifications: [],
+			// A v10 approval proves governance only. Without a current revision's
+			// delivery receipt it cannot keep dependent work or milestones unlocked.
+			tasks: Array.isArray(state.tasks)
+				? state.tasks.map((task) =>
+						isRecord(task) && Array.isArray(task.dependsOn) && task.dependsOn.length > 0
+							? { ...task, status: "blocked", testEvidence: [] }
+							: task,
+					)
+				: state.tasks,
+			milestones: Array.isArray(state.milestones)
+				? state.milestones.map((milestone) =>
+						isRecord(milestone) ? { ...milestone, status: "blocked", testEvidence: [] } : milestone,
 					)
 				: state.milestones,
 		};
@@ -3718,7 +4407,11 @@ function isAnsteelPublicCollaborationEventType(type: AnsteelTeamEventType): bool
 		type === "process-resolution-review" ||
 		type === "action-assessed" ||
 		type === "action-review" ||
-		type === "runtime-recovery"
+		type === "runtime-recovery" ||
+		type === "task-delivery-started" ||
+		type === "task-delivery-check" ||
+		type === "task-delivery-passed" ||
+		type === "task-delivery-failed"
 	);
 }
 
@@ -3745,6 +4438,45 @@ function assertAnsteelTeamPublicEventEnvelope(event: AnsteelTeamEvent): void {
 		}
 		assertLedgerHash(event.payload.previousHeadHash, "runtime recovery previous head hash", true);
 		assertLedgerHash(event.payload.recoveredHeadHash, "runtime recovery recovered head hash", false);
+		return;
+	}
+	if (
+		event.type === "task-delivery-started" ||
+		event.type === "task-delivery-check" ||
+		event.type === "task-delivery-passed" ||
+		event.type === "task-delivery-failed"
+	) {
+		if (event.role !== "coordinator" || event.reasonCode !== undefined) {
+			throw new AnsteelTeamStateError("Ansteel team delivery events require the coordinator actor");
+		}
+		if (event.type === "task-delivery-started") {
+			if (
+				event.payload.kind !== "task-delivery-started" ||
+				!isRecord(event.payload.verification) ||
+				event.payload.verification.status !== "verifying"
+			) {
+				throw new AnsteelTeamStateError("Ansteel team delivery-started event has an invalid payload");
+			}
+			return;
+		}
+		if (event.type === "task-delivery-check") {
+			if (
+				event.payload.kind !== "task-delivery-check" ||
+				typeof event.payload.verificationId !== "string" ||
+				!isRecord(event.payload.check)
+			) {
+				throw new AnsteelTeamStateError("Ansteel team delivery-check event has an invalid payload");
+			}
+			return;
+		}
+		if (
+			event.payload.kind !== "task-delivery-finished" ||
+			typeof event.payload.verificationId !== "string" ||
+			(event.payload.status !== "passed" && event.payload.status !== "failed") ||
+			(event.type === "task-delivery-passed") !== (event.payload.status === "passed")
+		) {
+			throw new AnsteelTeamStateError("Ansteel team delivery terminal event has an invalid payload");
+		}
 		return;
 	}
 	if (event.role === "coordinator") {
@@ -3952,6 +4684,10 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 		event.type !== "task-collaboration-returned" &&
 		event.type !== "task-final-verification-requested" &&
 		event.type !== "task-review" &&
+		event.type !== "task-delivery-started" &&
+		event.type !== "task-delivery-check" &&
+		event.type !== "task-delivery-passed" &&
+		event.type !== "task-delivery-failed" &&
 		event.type !== "milestone-planned" &&
 		event.type !== "milestone-submitted" &&
 		event.type !== "milestone-collaboration" &&
@@ -3982,13 +4718,17 @@ function parseAnsteelTeamEventFields(value: unknown): Omit<AnsteelTeamEvent, "pr
 			event.type !== "tasks-assigned" &&
 			event.type !== "task-collaboration-returned" &&
 			event.type !== "task-final-verification-requested" &&
+			event.type !== "task-delivery-started" &&
+			event.type !== "task-delivery-check" &&
+			event.type !== "task-delivery-passed" &&
+			event.type !== "task-delivery-failed" &&
 			event.type !== "milestone-final-verification-requested" &&
 			event.type !== "runtime-recovery" &&
 			event.type !== "task-anchor" &&
 			event.type !== "milestone-anchor"
 		) {
 			throw new AnsteelTeamStateError(
-				"Ansteel team coordinator can only record task assignment, final-verification, collaboration-return, runtime-recovery, task-anchor, or milestone-anchor events",
+				"Ansteel team coordinator can only record task assignment, final-verification, collaboration-return, delivery verification, runtime-recovery, task-anchor, or milestone-anchor events",
 			);
 		}
 	} else {
@@ -4315,6 +5055,44 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 	}
 	if (payload.kind === "action-assessed") return;
 	if (payload.kind === "runtime-recovery") return;
+	if (payload.kind === "task-delivery-started") {
+		state.deliveryVerifications.push(structuredClone(payload.verification));
+		return;
+	}
+	if (payload.kind === "task-delivery-check") {
+		const verification = state.deliveryVerifications.find((item) => item.id === payload.verificationId);
+		if (!verification || verification.status !== "verifying") {
+			throw new AnsteelTeamStateError(`Ansteel team has no active delivery verification ${payload.verificationId}`);
+		}
+		if (verification.checks.some((check) => check.id === payload.check.id)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${payload.verificationId} already recorded check ${payload.check.id}`,
+			);
+		}
+		verification.checks.push(structuredClone(payload.check));
+		return;
+	}
+	if (payload.kind === "task-delivery-finished") {
+		const verification = state.deliveryVerifications.find((item) => item.id === payload.verificationId);
+		if (!verification || verification.status !== "verifying") {
+			throw new AnsteelTeamStateError(`Ansteel team has no active delivery verification ${payload.verificationId}`);
+		}
+		verification.status = payload.status;
+		verification.completedAt = payload.completedAt;
+		if (payload.failureReason !== undefined) verification.failureReason = payload.failureReason;
+		const task = state.tasks.find((item) => item.id === verification.taskId);
+		if (!task || task.revision !== verification.revision) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} no longer matches its task revision`,
+			);
+		}
+		if (payload.status === "failed" && payload.failureReason !== "interrupted") {
+			task.status = "revision-required";
+			task.testEvidence = [];
+		}
+		reconcileAnsteelTeamTaskDependencies(state);
+		return;
+	}
 	const issue = state.processIssues.find((item) => item.id === payload.issueId);
 	if (!issue) {
 		throw new AnsteelTeamStateError(`Ansteel team has no process issue ${payload.issueId}`);
@@ -4787,10 +5565,17 @@ function getCheckpointActionReviews(state: AnsteelTeamState, checkpoint: Ansteel
 	);
 }
 
-function getRecordedAnsteelDeliveryStatus(_state: AnsteelTeamState): AnsteelDeliveryStatus {
-	// Delivery verification is intentionally not inferred from task review, action
-	// confirmation, Git text, or provider prose. A later trusted record source can
-	// extend this function without changing the independent-axis contract.
+function getRecordedAnsteelDeliveryStatus(state: AnsteelTeamState): AnsteelDeliveryStatus {
+	const taskStatuses = state.tasks.map((task) => getAnsteelTeamTaskDeliveryStatus(state, task));
+	if (taskStatuses.includes("verifying")) return "verifying";
+	if (taskStatuses.includes("failed")) return "failed";
+	if (
+		state.tasks.length > 0 &&
+		state.tasks.every((task) => isAnsteelTeamTaskDelivered(state, task)) &&
+		state.milestones.every((milestone) => milestone.status === "approved")
+	) {
+		return "passed";
+	}
 	return "not-started";
 }
 
@@ -4952,9 +5737,16 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 	}
 
 	const deliveryStatus = getRecordedAnsteelDeliveryStatus(state);
-	const deliveryReasons = [
-		"no trusted, replayable delivery-verification evidence is recorded; task, milestone, and action approval are not delivery evidence",
-	];
+	const deliveryReasons =
+		deliveryStatus === "passed"
+			? ["every current task revision has trusted delivery evidence and every milestone is approved"]
+			: deliveryStatus === "verifying"
+				? ["a coordinator-owned delivery verification is running"]
+				: deliveryStatus === "failed"
+					? ["a current task revision has a failed trusted delivery verification"]
+					: [
+							"no trusted, replayable delivery-verification evidence set is complete; task, milestone, and action approval are not delivery evidence",
+						];
 	const workflowReasons: string[] = [];
 	let workflowStatus: AnsteelWorkflowStatus;
 	if (collaborationStatus === "blocked" || collaborationStatus === "disputed") {
@@ -4981,7 +5773,13 @@ export function getAnsteelTeamStatusAxes(state: AnsteelTeamState): AnsteelTeamSt
 		if (collaborationStatus !== "collaboration-complete") workflowReasons.push("collaboration is not complete");
 		if (governanceStatus !== "approved" && governanceStatus !== "not-required")
 			workflowReasons.push("governance is not complete");
-		workflowReasons.push("delivery verification has not started");
+		workflowReasons.push(
+			deliveryStatus === "failed"
+				? "delivery verification failed"
+				: deliveryStatus === "verifying"
+					? "delivery verification is still running"
+					: "delivery verification has not started",
+		);
 	}
 
 	return {
@@ -5032,6 +5830,10 @@ export function getAnsteelTeamSharedBoard(
 	replayedState.workCheckpoints = [];
 	replayedState.processIssues = [];
 	replayedState.actionReviews = [];
+	// Delivery evidence is itself projected from signed v2 events. Starting
+	// from the persisted array would apply every receipt twice and make a valid
+	// second verification fail as a false state-projection mismatch.
+	replayedState.deliveryVerifications = [];
 	try {
 		for (const event of parsedEvents) {
 			if (event.schemaVersion === 2 && isAnsteelPublicCollaborationEventType(event.type)) {
@@ -5045,9 +5847,10 @@ export function getAnsteelTeamSharedBoard(
 	if (
 		!isDeepStrictEqual(replayedState.workCheckpoints, state.workCheckpoints) ||
 		!isDeepStrictEqual(replayedState.processIssues, state.processIssues) ||
-		!isDeepStrictEqual(replayedState.actionReviews, state.actionReviews)
+		!isDeepStrictEqual(replayedState.actionReviews, state.actionReviews) ||
+		!isDeepStrictEqual(replayedState.deliveryVerifications, state.deliveryVerifications)
 	) {
-		throwAnsteelStateProjectionMismatch("persisted collaboration state does not match event replay");
+		throwAnsteelStateProjectionMismatch("persisted collaboration or delivery state does not match event replay");
 	}
 
 	const activeCheckpoints = state.workCheckpoints.filter((checkpoint) => checkpoint.status === "active");
@@ -5087,6 +5890,7 @@ export function getAnsteelTeamSharedBoard(
 			type: task.type,
 			...(task.assignmentReason === undefined ? {} : { assignmentReason: task.assignmentReason }),
 			status: task.status,
+			deliveryStatus: getAnsteelTeamTaskDeliveryStatus(state, task),
 			dependsOn: [...task.dependsOn],
 		})),
 		activeCheckpoints: structuredClone(activeCheckpoints),

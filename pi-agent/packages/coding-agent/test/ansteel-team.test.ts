@@ -58,6 +58,7 @@ import {
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
 	verifyAnsteelTeamExternalAnchor,
+	verifyAnsteelTeamTaskDelivery,
 } from "../src/core/ansteel-team.ts";
 import {
 	canonicalizeAnsteelAuditValue,
@@ -105,6 +106,39 @@ function createTeam(cwd: string) {
 		},
 		now: new Date("2026-07-24T00:00:00.000Z"),
 	});
+}
+
+function createDeliveryManifestForTest(
+	_cwd: string,
+	team: ReturnType<typeof createTeam>,
+	taskId: string,
+	script = "process.exit(0)",
+): string {
+	const task = team.tasks.find((item) => item.id === taskId);
+	if (!task) throw new Error(`Missing test task ${taskId}`);
+	const manifestDirectory = mkdtempSync(join(tmpdir(), "pi-ansteel-delivery-manifest-"));
+	temporaryDirectories.push(manifestDirectory);
+	const manifestPath = join(manifestDirectory, "delivery.json");
+	writeFileSync(
+		manifestPath,
+		JSON.stringify({
+			version: 1,
+			taskId,
+			revision: task.revision,
+			checks: [{ id: "acceptance", executable: process.execPath, args: ["-e", script], timeoutMs: 10_000 }],
+		}),
+		"utf8",
+	);
+	return manifestPath;
+}
+
+function verifyTaskDeliveryForTest(
+	cwd: string,
+	team: ReturnType<typeof createTeam>,
+	taskId: string,
+	script = "process.exit(0)",
+) {
+	return verifyAnsteelTeamTaskDelivery(cwd, team, taskId, createDeliveryManifestForTest(cwd, team, taskId, script));
 }
 
 function createCompletePublicCorrectionLoop(cwd: string) {
@@ -247,6 +281,31 @@ function beginTaskFinalVerificationForTest(cwd: string, team: ReturnType<typeof 
 		});
 	}
 	beginAnsteelTeamTaskFinalVerification(cwd, team, taskId);
+}
+
+function createApprovedParserTaskForTest(
+	cwd: string,
+	team: ReturnType<typeof createTeam>,
+	taskId = "TASK-DELIVERY-PARSER",
+) {
+	const task = claimAnsteelTeamTask(cwd, team, {
+		id: taskId,
+		owner: "staff-engineer",
+		files: ["src/parser.ts"],
+		description: "Implement the parser boundary for independent delivery verification.",
+		acceptanceCriteria: "The frozen parser revision passes coordinator-owned delivery checks.",
+	});
+	writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+	recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
+		command: "npm test -- parser",
+		output: "PASS parser boundary",
+		isError: false,
+	});
+	submitAnsteelTeamTask(cwd, team, "staff-engineer", task.id, "npm test -- parser");
+	beginTaskFinalVerificationForTest(cwd, team, task.id);
+	reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
+	reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+	return task;
 }
 
 function beginMilestoneFinalVerificationForTest(
@@ -406,7 +465,7 @@ describe("public collaboration state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 10,
+			version: 11,
 			actionReviews: [],
 			tasks: [{ id: "TASK-MIGRATE-RISK", type: "implementation", owner: "staff-engineer" }],
 			workCheckpoints: [{ id: checkpoint.id, status: "superseded", governedAction: null }],
@@ -1285,14 +1344,14 @@ describe("public collaboration state", () => {
 		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
 
 		expect(migrated).toMatchObject({
-			version: 10,
+			version: 11,
 			workCheckpoints: [],
 			processIssues: [],
 			actionReviews: [],
 			...preserved,
 		});
 		expect(persisted).toMatchObject({
-			version: 10,
+			version: 11,
 			workCheckpoints: [],
 			processIssues: [],
 			actionReviews: [],
@@ -1305,7 +1364,7 @@ describe("public collaboration state", () => {
 		writePersistedTeamState(cwd, createValidPublicCollaborationState(cwd));
 
 		expect(loadAnsteelTeamState(cwd)).toMatchObject({
-			version: 10,
+			version: 11,
 			workCheckpoints: [{ id: "CP-PARSER-0001" }],
 			processIssues: [{ id: "PI-PARSER-0001" }],
 			actionReviews: [],
@@ -1558,7 +1617,7 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 
 		expect(migrated).toMatchObject({
-			version: 10,
+			version: 11,
 			tasks: [],
 			milestones: [],
 			workCheckpoints: [],
@@ -1600,8 +1659,8 @@ describe("Ansteel team state", () => {
 			previousHash: null,
 			hash: expect.stringMatching(/^[a-f0-9]{64}$/),
 		});
-		expect(migrated).toMatchObject({ version: 10, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
-		expect(persistedState).toMatchObject({ version: 10, ledgerHeadHash: events[0]?.hash });
+		expect(migrated).toMatchObject({ version: 11, ledgerHeadHash: events[0]?.hash, nextEventSequence: 2 });
+		expect(persistedState).toMatchObject({ version: 11, ledgerHeadHash: events[0]?.hash });
 		expect(persistedEvent).toMatchObject({ previousHash: null, hash: events[0]?.hash });
 	});
 
@@ -1616,9 +1675,9 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		const persistedState = JSON.parse(readFileSync(getAnsteelTeamStatePath(cwd), "utf8")) as Record<string, unknown>;
 
-		expect(migrated).toMatchObject({ version: 10, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
+		expect(migrated).toMatchObject({ version: 11, taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"] });
 		expect(persistedState).toMatchObject({
-			version: 10,
+			version: 11,
 			taskOwners: ["tech-lead", "staff-engineer", "qa-engineer"],
 		});
 	});
@@ -2331,7 +2390,7 @@ describe("Ansteel team state", () => {
 		);
 	});
 
-	it("derives a dependent task's lock and release from approved predecessors", () => {
+	it("keeps dependent tasks blocked until an approved predecessor passes delivery verification", () => {
 		const cwd = createTemporaryProject();
 		initializeGitProject(cwd);
 		const team = createTeam(cwd);
@@ -2353,7 +2412,7 @@ describe("Ansteel team state", () => {
 
 		expect(dependent).toMatchObject({ dependsOn: ["TASK-PARSER"], status: "blocked" });
 		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "src/integration.ts")).toContain(
-			"waiting for approved dependencies",
+			"waiting for delivered dependencies",
 		);
 
 		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
@@ -2367,11 +2426,246 @@ describe("Ansteel team state", () => {
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", predecessor.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", predecessor.id, { verdict: "approve" });
 
+		expect(dependent.status).toBe("blocked");
+		verifyTaskDeliveryForTest(cwd, team, predecessor.id);
 		expect(dependent.status).toBe("claimed");
 		expect(getAnsteelTeamWriteBlockReason(cwd, team, "staff-engineer", "src/integration.ts")).toBeUndefined();
 
 		predecessor.status = "revision-required";
-		expect(() => saveAnsteelTeamState(cwd, team)).toThrow("is unblocked before its dependencies are approved");
+		expect(() => saveAnsteelTeamState(cwd, team)).toThrow(
+			"is unblocked before its dependencies pass delivery verification",
+		);
+	});
+
+	it("records replayable delivery evidence and completes the independent delivery axis", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = createApprovedParserTaskForTest(cwd, team);
+
+		expect(getAnsteelTeamStatusAxes(team)).toMatchObject({
+			collaborationStatus: "collaboration-complete",
+			governanceStatus: "approved",
+			deliveryStatus: "not-started",
+			workflowStatus: "in-progress",
+		});
+
+		const previousKey = process.env.ANSTEEL_API_KEY;
+		process.env.ANSTEEL_API_KEY = "must-not-reach-delivery-check";
+		let verification: ReturnType<typeof verifyTaskDeliveryForTest>;
+		try {
+			verification = verifyTaskDeliveryForTest(
+				cwd,
+				team,
+				task.id,
+				"if (process.env.ANSTEEL_API_KEY) process.exit(9); process.exit(0)",
+			);
+		} finally {
+			if (previousKey === undefined) delete process.env.ANSTEEL_API_KEY;
+			else process.env.ANSTEEL_API_KEY = previousKey;
+		}
+
+		expect(verification).toMatchObject({
+			taskId: task.id,
+			revision: 1,
+			status: "passed",
+			checks: [{ id: "acceptance", exitCode: 0, timedOut: false, isError: false }],
+		});
+		expect(verification.diffHash).toMatch(/^[a-f0-9]{64}$/);
+		expect(verification.workspaceHash).toMatch(/^[a-f0-9]{64}$/);
+		expect(verification.manifestHash).toMatch(/^[a-f0-9]{64}$/);
+		expect(getAnsteelTeamStatusAxes(team)).toMatchObject({
+			deliveryStatus: "passed",
+			workflowStatus: "completed",
+		});
+		expect(listAnsteelTeamEvents(cwd).map((event) => event.type)).toEqual([
+			"task-delivery-started",
+			"task-delivery-check",
+			"task-delivery-passed",
+		]);
+
+		const reloaded = loadAnsteelTeamState(cwd)!;
+		expect(reloaded.deliveryVerifications).toEqual(team.deliveryVerifications);
+		expect(getAnsteelTeamStatusAxes(reloaded)).toMatchObject({
+			deliveryStatus: "passed",
+			workflowStatus: "completed",
+		});
+		expect(getAnsteelTeamSharedBoard(reloaded, listAnsteelTeamEvents(cwd)).axes).toMatchObject({
+			deliveryStatus: "passed",
+			workflowStatus: "completed",
+		});
+		const tampered = structuredClone(reloaded);
+		tampered.deliveryVerifications = [];
+		expect(() => getAnsteelTeamSharedBoard(tampered, listAnsteelTeamEvents(cwd))).toThrow(
+			"state-projection-mismatch",
+		);
+	});
+
+	it("fails closed when a coordinator delivery check fails", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = createApprovedParserTaskForTest(cwd, team, "TASK-DELIVERY-FAILURE");
+
+		expect(() => verifyTaskDeliveryForTest(cwd, team, task.id, "process.exit(7)")).toThrow("check-failed");
+		expect(task.status).toBe("revision-required");
+		expect(team.deliveryVerifications.at(-1)).toMatchObject({
+			taskId: task.id,
+			status: "failed",
+			failureReason: "check-failed",
+			checks: [{ exitCode: 7, isError: true }],
+		});
+		expect(getAnsteelTeamStatusAxes(team)).toMatchObject({
+			deliveryStatus: "failed",
+			workflowStatus: "in-progress",
+		});
+	});
+
+	it("records stable timeout and launch failure reasons", () => {
+		for (const failure of ["check-timeout", "check-launch-failed"] as const) {
+			const cwd = createTemporaryProject();
+			initializeGitProject(cwd);
+			const team = createTeam(cwd);
+			const task = createApprovedParserTaskForTest(cwd, team, `TASK-DELIVERY-${failure.toUpperCase()}`);
+			const manifestPath = createDeliveryManifestForTest(
+				cwd,
+				team,
+				task.id,
+				failure === "check-timeout" ? "setTimeout(() => {}, 5_000)" : "process.exit(0)",
+			);
+			const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+				checks: Array<{ executable: string; timeoutMs: number }>;
+			};
+			if (failure === "check-timeout") manifest.checks[0]!.timeoutMs = 1_000;
+			else manifest.checks[0]!.executable = join(manifestPath, "node.exe");
+			writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
+
+			expect(() => verifyAnsteelTeamTaskDelivery(cwd, team, task.id, manifestPath)).toThrow(failure);
+			expect(team.deliveryVerifications.at(-1)).toMatchObject({
+				status: "failed",
+				failureReason: failure,
+			});
+			expect(task.status).toBe("revision-required");
+		}
+	});
+
+	it("fails closed when a delivery check changes Git HEAD", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = createApprovedParserTaskForTest(cwd, team, "TASK-DELIVERY-HEAD-DRIFT");
+		const script =
+			"require('node:child_process').execFileSync('git', ['commit', '--allow-empty', '-m', 'delivery-head-drift'], { stdio: 'ignore' })";
+
+		expect(() => verifyTaskDeliveryForTest(cwd, team, task.id, script)).toThrow("source-commit-drift");
+		expect(team.deliveryVerifications.at(-1)).toMatchObject({
+			status: "failed",
+			failureReason: "source-commit-drift",
+		});
+		expect(task.status).toBe("revision-required");
+	});
+
+	it("records diff drift when a delivery check mutates the frozen task", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = createApprovedParserTaskForTest(cwd, team, "TASK-DELIVERY-DRIFT");
+		const script = "require('node:fs').writeFileSync('src/parser.ts', \"export const parser = 'drift';\\n\", 'utf8')";
+
+		expect(() => verifyTaskDeliveryForTest(cwd, team, task.id, script)).toThrow("diff-drift");
+		expect(team.deliveryVerifications.at(-1)).toMatchObject({
+			status: "failed",
+			failureReason: "diff-drift",
+			checks: [{ exitCode: 0, isError: false }],
+		});
+		expect(task.status).toBe("revision-required");
+	});
+
+	it("rejects project-local and mismatched delivery manifests before recording evidence", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = createApprovedParserTaskForTest(cwd, team, "TASK-DELIVERY-MANIFEST");
+		const localManifest = join(cwd, "delivery.json");
+		writeFileSync(
+			localManifest,
+			JSON.stringify({
+				version: 1,
+				taskId: task.id,
+				revision: task.revision,
+				checks: [{ id: "local", executable: process.execPath, args: ["-e", "process.exit(0)"], timeoutMs: 5_000 }],
+			}),
+			"utf8",
+		);
+		expect(() => verifyAnsteelTeamTaskDelivery(cwd, team, task.id, localManifest)).toThrow(
+			"must remain outside the role project directory",
+		);
+		const mismatchedManifest = createDeliveryManifestForTest(cwd, team, task.id);
+		const raw = JSON.parse(readFileSync(mismatchedManifest, "utf8")) as Record<string, unknown>;
+		raw.revision = 99;
+		writeFileSync(mismatchedManifest, JSON.stringify(raw), "utf8");
+		expect(() => verifyAnsteelTeamTaskDelivery(cwd, team, task.id, mismatchedManifest)).toThrow(
+			"does not match the current task revision",
+		);
+		expect(team.deliveryVerifications).toEqual([]);
+	});
+
+	it("rejects ambiguous manifests and an evidence directory redirected into the project", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		const task = createApprovedParserTaskForTest(cwd, team, "TASK-DELIVERY-EVIDENCE-BOUNDARY");
+		const ambiguousManifest = createDeliveryManifestForTest(cwd, team, task.id);
+		const ambiguous = JSON.parse(readFileSync(ambiguousManifest, "utf8")) as Record<string, unknown>;
+		ambiguous.unexpected = true;
+		writeFileSync(ambiguousManifest, JSON.stringify(ambiguous), "utf8");
+		expect(() => verifyAnsteelTeamTaskDelivery(cwd, team, task.id, ambiguousManifest)).toThrow(
+			"manifest has an invalid schema",
+		);
+
+		const redirectedManifest = createDeliveryManifestForTest(cwd, team, task.id);
+		const projectEvidenceTarget = join(cwd, "redirected-delivery-evidence");
+		mkdirSync(projectEvidenceTarget, { recursive: true });
+		symlinkSync(
+			projectEvidenceTarget,
+			join(redirectedManifest, "..", ".ansteel-delivery-evidence"),
+			process.platform === "win32" ? "junction" : "dir",
+		);
+		expect(() => verifyAnsteelTeamTaskDelivery(cwd, team, task.id, redirectedManifest)).toThrow(
+			"evidence directory must remain outside",
+		);
+		expect(team.deliveryVerifications).toEqual([]);
+	});
+
+	it("migrates v10 approvals without inventing delivery evidence or unlocked dependencies", () => {
+		const cwd = createTemporaryProject();
+		const team = createTeam(cwd);
+		const predecessor = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-V10-APPROVED",
+			owner: "staff-engineer",
+			files: ["src/predecessor.ts"],
+			description: "Represent a governance-approved v10 task.",
+			acceptanceCriteria: "Migration preserves approval without inventing delivery.",
+		});
+		const dependent = claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-V10-DEPENDENT",
+			owner: "staff-engineer",
+			files: ["src/dependent.ts"],
+			description: "Represent work previously unlocked by governance approval.",
+			acceptanceCriteria: "Migration blocks it until trusted delivery passes.",
+			dependsOn: [predecessor.id],
+		});
+		predecessor.status = "approved";
+		dependent.status = "claimed";
+		const raw = structuredClone(team) as unknown as Record<string, unknown>;
+		raw.version = 10;
+		delete raw.deliveryVerifications;
+		writePersistedTeamState(cwd, raw);
+
+		const migrated = loadAnsteelTeamState(cwd)!;
+		expect(migrated).toMatchObject({ version: 11, deliveryVerifications: [] });
+		expect(migrated.tasks.find((task) => task.id === predecessor.id)?.status).toBe("approved");
+		expect(migrated.tasks.find((task) => task.id === dependent.id)?.status).toBe("blocked");
 	});
 
 	it("rejects unknown, self-referential, and cyclic task dependencies", () => {
@@ -2446,7 +2740,7 @@ describe("Ansteel team state", () => {
 		expect(milestone.status).toBe("blocked");
 		expect(() =>
 			runAnsteelTeamMilestoneTest(cwd, team, "tech-lead", milestone.id, "node --test test/integration.test.mjs"),
-		).toThrow("is waiting for approved tasks");
+		).toThrow("is waiting for delivered tasks");
 
 		writeFileSync(join(cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
 		recordAnsteelTeamTaskTestResult(cwd, team, "staff-engineer", task.id, {
@@ -2459,6 +2753,7 @@ describe("Ansteel team state", () => {
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
 
+		verifyTaskDeliveryForTest(cwd, team, task.id);
 		expect(milestone.status).toBe("ready");
 		const evidence = runAnsteelTeamMilestoneTest(
 			cwd,
@@ -2667,7 +2962,7 @@ describe("Ansteel team state", () => {
 		);
 	});
 
-	it("migrates a v9 submitted milestone into legacy final verification without inventing collaboration updates", () => {
+	it("migrates a v9 submitted milestone without inventing delivery evidence", () => {
 		const cwd = createTemporaryProject();
 		initializeGitProject(cwd);
 		mkdirSync(join(cwd, "test"), { recursive: true });
@@ -2694,6 +2989,7 @@ describe("Ansteel team state", () => {
 		beginTaskFinalVerificationForTest(cwd, team, task.id);
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+		verifyTaskDeliveryForTest(cwd, team, task.id);
 		const milestone = createAnsteelTeamMilestone(cwd, team, {
 			id: "MILESTONE-V9-FINAL",
 			taskIds: [task.id],
@@ -2712,18 +3008,16 @@ describe("Ansteel team state", () => {
 		const migrated = loadAnsteelTeamState(cwd);
 		expect(migrated?.milestones).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ id: milestone.id, status: "final-verification", collaborationUpdates: [] }),
+				expect.objectContaining({ id: milestone.id, status: "blocked", collaborationUpdates: [] }),
 			]),
 		);
+		expect(migrated?.deliveryVerifications).toEqual([]);
 		expect(getAnsteelTeamStatusAxes(migrated!)).toMatchObject({
 			collaborationStatus: "active",
 			governanceStatus: "pending",
 			deliveryStatus: "not-started",
 			workflowStatus: "in-progress",
 		});
-		expect(getAnsteelTeamStatusAxes(migrated!).reasons.collaboration).toEqual(
-			expect.arrayContaining([expect.stringContaining(`milestone ${milestone.id}`)]),
-		);
 	});
 
 	it("keeps a v9 approved task active when migration has no collaboration evidence", () => {
@@ -2987,6 +3281,7 @@ describe("Ansteel team state", () => {
 		beginTaskFinalVerificationForTest(cwd, team, task.id);
 		reviewAnsteelTeamTask(cwd, team, "tech-lead", task.id, { verdict: "approve" });
 		reviewAnsteelTeamTask(cwd, team, "qa-engineer", task.id, { verdict: "approve" });
+		verifyTaskDeliveryForTest(cwd, team, task.id);
 		execFileSync("git", ["add", "src/parser.ts"], { cwd, stdio: "ignore" });
 		execFileSync("git", ["commit", "-m", "anchored parser change"], { cwd, stdio: "ignore" });
 		expect(milestone.status).toBe("ready");

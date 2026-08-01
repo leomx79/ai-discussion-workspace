@@ -12,6 +12,7 @@ import {
 	claimAnsteelTeamTask,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
+	loadAnsteelTeamState,
 	publishAnsteelTeamMilestoneCollaboration,
 	publishAnsteelTeamTaskCollaboration,
 	recordAnsteelTeamTaskTestResult,
@@ -20,6 +21,7 @@ import {
 	runAnsteelTeamMilestoneTest,
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
+	verifyAnsteelTeamTaskDelivery,
 } from "../src/core/ansteel-team.ts";
 import {
 	createAnsteelRunContext,
@@ -30,6 +32,23 @@ import {
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const ansteelTeamExtensionPath = resolve(__dirname, "../src/extensions/ansteel-team/index.ts");
 const temporaryDirectories: string[] = [];
+
+function createDeliveryManifestForRpc(taskId: string, revision: number, script = "process.exit(0)"): string {
+	const directory = mkdtempSync(join(tmpdir(), "pi-ansteel-team-cli-delivery-"));
+	temporaryDirectories.push(directory);
+	const manifestPath = join(directory, "delivery.json");
+	writeFileSync(
+		manifestPath,
+		JSON.stringify({
+			version: 1,
+			taskId,
+			revision,
+			checks: [{ id: "acceptance", executable: process.execPath, args: ["-e", script], timeoutMs: 10_000 }],
+		}),
+		"utf8",
+	);
+	return manifestPath;
+}
 
 const DETERMINISTIC_TEAM_PROVIDER_EXTENSION = `
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
@@ -863,6 +882,7 @@ function prepareAnchorRpcFixture(projectDir: string): {
 	beginAnsteelTeamTaskFinalVerification(projectDir, state, task.id);
 	reviewAnsteelTeamTask(projectDir, state, "tech-lead", task.id, { verdict: "approve" });
 	reviewAnsteelTeamTask(projectDir, state, "qa-engineer", task.id, { verdict: "approve" });
+	verifyAnsteelTeamTaskDelivery(projectDir, state, task.id, createDeliveryManifestForRpc(task.id, task.revision));
 	execFileSync("git", ["add", "src/staff.ts"], { cwd: projectDir, stdio: "ignore" });
 	execFileSync("git", ["commit", "-m", "complete anchor fixture task"], { cwd: projectDir, stdio: "ignore" });
 
@@ -1613,6 +1633,97 @@ describe("Ansteel team CLI", () => {
 			const postTamperRecords = JSON.stringify(rpc.records().slice(postTamperRecordIndex));
 			expect(postTamperRecords).not.toContain("Health: healthy");
 			expect(postTamperRecords).not.toContain("Active checkpoints:");
+		} finally {
+			await rpc.stop();
+		}
+	}, 30_000);
+
+	it("runs coordinator delivery verification through RPC and fails closed on a later rejected check", async () => {
+		const { agentDir, projectDir } = createTemporaryProject();
+		initializeTaskDeliveryProject(projectDir);
+		const state = createAnsteelTeamState({
+			cwd: projectDir,
+			topic: "Exercise independent RPC delivery verification",
+			roleModels: {
+				"tech-lead": "deterministic-team-tl/tl",
+				"staff-engineer": "deterministic-team-staff/staff",
+				"qa-engineer": "deterministic-team-qa/qa",
+			},
+		});
+		const task = claimAnsteelTeamTask(projectDir, state, {
+			id: "TASK-RPC-DELIVERY",
+			owner: "staff-engineer",
+			files: ["src/staff.ts"],
+			description: "Provide one approved revision for coordinator delivery checks.",
+			acceptanceCriteria: "The external delivery manifest decides the final delivery axis.",
+		});
+		writeFileSync(join(projectDir, "src", "staff.ts"), "export const staff = 'implemented';\n", "utf8");
+		recordAnsteelTeamTaskTestResult(projectDir, state, "staff-engineer", task.id, {
+			command: "node --test test/staff.test.mjs",
+			output: "PASS deterministic staff fixture",
+			isError: false,
+		});
+		submitAnsteelTeamTask(projectDir, state, "staff-engineer", task.id, "node --test test/staff.test.mjs");
+		for (const collaborator of ["tech-lead", "qa-engineer"] as const) {
+			publishAnsteelTeamTaskCollaboration(projectDir, state, collaborator, task.id, {
+				summary: `${collaborator} inspected the frozen RPC delivery package.`,
+				evidenceRefs: [`test:${task.id}:${collaborator}:continuous-collaboration`],
+				uncertainties: [],
+			});
+		}
+		beginAnsteelTeamTaskFinalVerification(projectDir, state, task.id);
+		reviewAnsteelTeamTask(projectDir, state, "tech-lead", task.id, { verdict: "approve" });
+		reviewAnsteelTeamTask(projectDir, state, "qa-engineer", task.id, { verdict: "approve" });
+		const passedManifest = createDeliveryManifestForRpc(task.id, task.revision);
+		const failedManifest = createDeliveryManifestForRpc(task.id, task.revision, "process.exit(7)");
+		const logger = createAnsteelRuntimeLogger(
+			projectDir,
+			createAnsteelRunContext({ teamId: state.id, command: "prepare delivery RPC fixture" }),
+		);
+		logger.write({
+			level: "audit",
+			eventName: "delivery.rpc.fixture.prepared",
+			outcome: "succeeded",
+			message: "A strict runtime segment exists before the delivery RPC command.",
+			data: {},
+		});
+		logger.close();
+
+		const rpc = startRpcCli(projectDir, agentDir);
+		try {
+			const commands = await rpc.send({ id: "delivery-commands", type: "get_commands" });
+			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
+				command.name.startsWith("ansteel-team"),
+			)?.name;
+			expect(teamCommand).toBeDefined();
+			const passed = await rpc.send({
+				id: "delivery-passed",
+				type: "prompt",
+				message: `/${teamCommand} verify ${task.id} "${passedManifest}"`,
+			});
+			expect(passed, JSON.stringify(passed)).toMatchObject({ success: true, command: "prompt" });
+			expect(loadAnsteelTeamState(projectDir)?.deliveryVerifications.at(-1)).toMatchObject({
+				taskId: task.id,
+				status: "passed",
+			});
+
+			const failed = await rpc.send({
+				id: "delivery-failed",
+				type: "prompt",
+				message: `/${teamCommand} verify ${task.id} "${failedManifest}"`,
+			});
+			expect(failed).toMatchObject({
+				success: false,
+				command: "prompt",
+				error: expect.stringContaining("check-failed"),
+			});
+			const failedState = loadAnsteelTeamState(projectDir);
+			expect(failedState?.deliveryVerifications.at(-1)).toMatchObject({
+				taskId: task.id,
+				status: "failed",
+				failureReason: "check-failed",
+			});
+			expect(failedState?.tasks.find((candidate) => candidate.id === task.id)?.status).toBe("revision-required");
 		} finally {
 			await rpc.stop();
 		}

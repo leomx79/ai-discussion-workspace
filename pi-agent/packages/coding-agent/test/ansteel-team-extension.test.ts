@@ -48,6 +48,23 @@ function createTemporaryProject(): string {
 	return cwd;
 }
 
+function createDeliveryManifest(taskId: string, revision: number, script = "process.exit(0)"): string {
+	const directory = mkdtempSync(join(tmpdir(), "pi-ansteel-team-extension-delivery-"));
+	temporaryDirectories.push(directory);
+	const path = join(directory, "delivery.json");
+	writeFileSync(
+		path,
+		JSON.stringify({
+			version: 1,
+			taskId,
+			revision,
+			checks: [{ id: "acceptance", executable: process.execPath, args: ["-e", script], timeoutMs: 10_000 }],
+		}),
+		"utf8",
+	);
+	return path;
+}
+
 function createConfig(): AnsteelConfig {
 	return {
 		allowSingleModel: false,
@@ -121,8 +138,13 @@ function setup(
 						await options.taskOperations.reviewTask("TASK-1", { verdict: "approve" });
 					}
 					if (prompt.includes("continuous collaborator for")) {
-						const taskMatch = /for (TASK-[A-Z0-9-]+) revision/.exec(prompt);
-						const milestoneMatch = /for (MILESTONE-[A-Z0-9-]+) integration revision/.exec(prompt);
+						const taskMatch = /^You are the .* continuous collaborator for (TASK-[A-Z0-9-]+) revision/.exec(
+							prompt,
+						);
+						const milestoneMatch =
+							/^You are the .* continuous collaborator for (MILESTONE-[A-Z0-9-]+) integration revision/.exec(
+								prompt,
+							);
 						if (taskMatch) {
 							const task = options.taskOperations.state.tasks.find((item) => item.id === taskMatch[1]);
 							if (
@@ -1904,6 +1926,12 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		});
 		writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'milestone-ready';\n", "utf8");
 		await staff.taskOperations.submitTask("TASK-PREREQUISITE", "node --test test/parser.test.mjs");
+		const prerequisite = staff.taskOperations.state.tasks.find((task) => task.id === "TASK-PREREQUISITE");
+		if (!prerequisite) throw new Error("Missing approved prerequisite task");
+		await command(
+			`verify ${prerequisite.id} "${createDeliveryManifest(prerequisite.id, prerequisite.revision)}"`,
+			harness.ctx,
+		);
 		await techLead.taskOperations.createMilestone({
 			id: "MILESTONE-OLD",
 			taskIds: ["TASK-PREREQUISITE"],
