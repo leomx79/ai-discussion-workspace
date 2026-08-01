@@ -3261,6 +3261,52 @@ export function getAnsteelTeamTaskProgressFingerprint(cwd: string, state: Anstee
 		.digest("hex");
 }
 
+/**
+ * Fingerprints durable collaboration facts for the task's current revision.
+ * This is intentionally separate from delivery progress: collaboration can
+ * justify one bounded owner continuation, but it cannot manufacture delivery.
+ */
+export function getAnsteelTeamTaskCollaborationFingerprint(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+): string {
+	assertProjectDirectory(cwd);
+	assertState(state);
+	assertTaskId(taskId);
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+
+	const revisionPrefix = `${task.id}@${task.revision};`;
+	const checkpoints = state.workCheckpoints
+		.filter(
+			(checkpoint) =>
+				checkpoint.taskId === task.id && checkpoint.governedAction?.version.startsWith(revisionPrefix) === true,
+		)
+		.map((checkpoint) => ({ id: checkpoint.id, version: checkpoint.governedAction!.version }))
+		.sort((left, right) => left.id.localeCompare(right.id));
+	const checkpointIds = new Set(checkpoints.map((checkpoint) => checkpoint.id));
+	const processIssues = state.processIssues
+		.filter((issue) => checkpointIds.has(issue.targetCheckpointId))
+		.map((issue) => ({
+			id: issue.id,
+			resolutions: issue.resolutions
+				.map((resolution) => ({ id: resolution.id, reviewed: resolution.review !== undefined }))
+				.sort((left, right) => left.id.localeCompare(right.id)),
+		}))
+		.sort((left, right) => left.id.localeCompare(right.id));
+	const actionReviews = state.actionReviews
+		.filter((review) => checkpointIds.has(review.checkpointId))
+		.map((review) => ({ checkpointId: review.checkpointId, reviewer: review.reviewer }))
+		.sort((left, right) =>
+			`${left.checkpointId}\0${left.reviewer}`.localeCompare(`${right.checkpointId}\0${right.reviewer}`),
+		);
+
+	return createHash("sha256")
+		.update(JSON.stringify({ checkpoints, processIssues, actionReviews }), "utf8")
+		.digest("hex");
+}
+
 export function submitAnsteelTeamTask(
 	cwd: string,
 	state: AnsteelTeamState,

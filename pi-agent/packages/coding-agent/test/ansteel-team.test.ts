@@ -33,6 +33,7 @@ import {
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatePath,
 	getAnsteelTeamStatusAxes,
+	getAnsteelTeamTaskCollaborationFingerprint,
 	getAnsteelTeamTaskFinalVerificationReadiness,
 	getAnsteelTeamTaskProgressFingerprint,
 	getAnsteelTeamTransactionPath,
@@ -2089,6 +2090,114 @@ describe("Ansteel team state", () => {
 		const after = getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER");
 		expect(after).not.toBe(before);
 		expect(getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER")).toBe(after);
+	});
+
+	it("tracks durable task collaboration separately from delivery progress across restart", () => {
+		const cwd = createTemporaryProject();
+		initializeGitProject(cwd);
+		const team = createTeam(cwd);
+		claimAnsteelTeamTask(cwd, team, {
+			id: "TASK-PARSER",
+			owner: "staff-engineer",
+			files: ["src/parser.ts"],
+			description: "Update the parser.",
+			acceptanceCriteria: "The parser test passes.",
+		});
+		const delivery = getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER");
+		let collaboration = getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER");
+		publishAnsteelWorkCheckpoint(cwd, team, "tech-lead", {
+			id: "CP-UNSCOPED-0001",
+			goal: "Record unrelated team context",
+			currentUnderstanding: "This checkpoint is not bound to the parser task",
+			assumptions: [],
+			evidenceRefs: [],
+			uncertainties: [],
+			nextAction: {
+				kind: "read",
+				target: "README.md",
+				expectedResult: "General project context is available",
+			},
+			confidence: "L2",
+		});
+		expect(getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER")).toBe(collaboration);
+
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, team, "staff-engineer", {
+			id: "CP-TASK-PARSER-0001",
+			taskId: "TASK-PARSER",
+			goal: "Verify the parser change before editing",
+			currentUnderstanding: "The claimed parser file needs a governed change",
+			assumptions: [],
+			evidenceRefs: ["file:src/parser.ts"],
+			uncertainties: ["The exact boundary behavior still needs a test"],
+			nextAction: {
+				kind: "read",
+				target: "src/parser.ts",
+				expectedResult: "The current parser boundary behavior is confirmed",
+			},
+			confidence: "L2",
+		});
+		expect(getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER")).toBe(delivery);
+		const afterCheckpoint = getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER");
+		expect(afterCheckpoint).not.toBe(collaboration);
+		collaboration = afterCheckpoint;
+
+		appendAnsteelTeamEvent(cwd, team, {
+			type: "role-report",
+			role: "staff-engineer",
+			content: "Repeated prose is not a durable collaboration fact.",
+		});
+		expect(getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER")).toBe(delivery);
+		expect(getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER")).toBe(collaboration);
+
+		reviewAnsteelTeamAction(cwd, team, "tech-lead", {
+			checkpointId: checkpoint.id,
+			action: {
+				kind: checkpoint.governedAction!.kind,
+				target: checkpoint.governedAction!.target,
+				version: checkpoint.governedAction!.version,
+			},
+			verdict: "approve",
+			reason: "The read is scoped to the claimed parser file.",
+		});
+		const afterActionReview = getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER");
+		expect(afterActionReview).not.toBe(collaboration);
+		collaboration = afterActionReview;
+
+		const issue = raiseAnsteelProcessIssue(cwd, team, "qa-engineer", {
+			id: "PI-TASK-PARSER-0001",
+			targetCheckpointId: checkpoint.id,
+			severity: "advisory",
+			claim: "The checkpoint does not yet identify the boundary test.",
+			evidenceRefs: ["test/parser.test.mjs"],
+			suggestedCorrection: "Run a focused boundary experiment before editing.",
+		});
+		const afterIssue = getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER");
+		expect(afterIssue).not.toBe(collaboration);
+		collaboration = afterIssue;
+
+		resolveAnsteelProcessIssue(cwd, team, "staff-engineer", {
+			id: "PR-TASK-PARSER-0001",
+			issueId: issue.id,
+			outcome: "EXPERIMENT_REQUIRED",
+			summary: "Run the focused parser boundary experiment.",
+			evidenceRefs: ["test/parser.test.mjs"],
+			experiment: "Run only the parser boundary test.",
+		});
+		const afterResolution = getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER");
+		expect(afterResolution).not.toBe(collaboration);
+		collaboration = afterResolution;
+
+		reviewAnsteelProcessResolution(cwd, team, "qa-engineer", issue.id, {
+			verdict: "accept",
+			reason: "The experiment is specific and reproducible.",
+		});
+		const finalCollaboration = getAnsteelTeamTaskCollaborationFingerprint(cwd, team, "TASK-PARSER");
+		expect(finalCollaboration).not.toBe(collaboration);
+		expect(getAnsteelTeamTaskProgressFingerprint(cwd, team, "TASK-PARSER")).toBe(delivery);
+
+		const restarted = loadAnsteelTeamState(cwd);
+		if (!restarted) throw new Error("Missing restarted Ansteel team state");
+		expect(getAnsteelTeamTaskCollaborationFingerprint(cwd, restarted, "TASK-PARSER")).toBe(finalCollaboration);
 	});
 
 	it("allows an explicitly authorized Tech Lead to claim a change task", () => {

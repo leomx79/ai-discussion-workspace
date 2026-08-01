@@ -52,6 +52,7 @@ import {
 	getAnsteelTeamMilestoneFinalVerificationReadiness,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatusAxes,
+	getAnsteelTeamTaskCollaborationFingerprint,
 	getAnsteelTeamTaskFinalVerificationReadiness,
 	getAnsteelTeamTaskProgressFingerprint,
 	isAnsteelTeamGovernancePath,
@@ -119,6 +120,9 @@ const ANSTEEL_TEAM_STAGE_RETRY_LIMIT = 3;
 const ANSTEEL_TEAM_REPAIR_TURN_TIMEOUT_MS = 120_000;
 const DEFAULT_ANSTEEL_TEAM_TASK_MAX_EPOCHS = 8;
 const DEFAULT_ANSTEEL_TEAM_TASK_MAX_NO_PROGRESS_EPOCHS = 2;
+// One task-command run may spend this single grace continuation on durable
+// collaboration. Delivery progress and the hard epoch ceiling remain separate.
+const ANSTEEL_TEAM_TASK_MAX_COLLABORATION_CONTINUATIONS = 1;
 const ANSTEEL_TEAM_TASK_TOOL_NAMES = [
 	"ansteel_submit_change",
 	"ansteel_publish_task_collaboration",
@@ -133,6 +137,34 @@ const ANSTEEL_TEAM_TASK_TOOL_NAMES = [
 	"ansteel_review_process_resolution",
 	"ansteel_review_action",
 ] as const;
+
+interface AnsteelTeamTaskEpochProgress {
+	noProgressEpochs: number;
+	collaborationContinuations: number;
+}
+
+/** Applies the same bounded dual-counter rule to serial and parallel owners. */
+function advanceAnsteelTeamTaskEpochProgress(
+	current: AnsteelTeamTaskEpochProgress,
+	beforeDelivery: string,
+	afterDelivery: string,
+	beforeCollaboration: string,
+	afterCollaboration: string,
+): AnsteelTeamTaskEpochProgress {
+	if (afterDelivery !== beforeDelivery) {
+		return { ...current, noProgressEpochs: 0 };
+	}
+	if (
+		afterCollaboration !== beforeCollaboration &&
+		current.collaborationContinuations < ANSTEEL_TEAM_TASK_MAX_COLLABORATION_CONTINUATIONS
+	) {
+		return {
+			noProgressEpochs: 0,
+			collaborationContinuations: current.collaborationContinuations + 1,
+		};
+	}
+	return { ...current, noProgressEpochs: current.noProgressEpochs + 1 };
+}
 const ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS = [
 	"ansteel_publish_task_collaboration",
 	"ansteel_publish_integration_collaboration",
@@ -2709,6 +2741,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			taskId: string,
 		): Promise<void> => {
 			let noProgressEpochs = 0;
+			let collaborationContinuations = 0;
 			for (let epoch = 1; epoch <= activeTeam.taskMaxEpochs; epoch++) {
 				let task = activeTeam.state.tasks.find((item) => item.id === taskId);
 				if (!task) throw new Error(`Ansteel team task ${taskId} does not exist`);
@@ -2725,7 +2758,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 
 				const session = activeTeam.sessions.get(task.owner);
 				if (!session) throw new Error(`Ansteel team ${task.owner} session is not active`);
-				const before = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+				const beforeDelivery = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+				const beforeCollaboration = getAnsteelTeamTaskCollaborationFingerprint(ctx.cwd, activeTeam.state, task.id);
 				activeTeam.state.roles[task.owner].status = "working";
 				saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
 				try {
@@ -2781,12 +2815,17 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					if (task.status === "approved") return;
 					if (task.status === "submitted" || task.status === "final-verification") return;
 				}
-				const after = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
-				if (after === before) {
-					noProgressEpochs++;
-				} else {
-					noProgressEpochs = 0;
-				}
+				const afterDelivery = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+				const afterCollaboration = getAnsteelTeamTaskCollaborationFingerprint(ctx.cwd, activeTeam.state, task.id);
+				const progress = advanceAnsteelTeamTaskEpochProgress(
+					{ noProgressEpochs, collaborationContinuations },
+					beforeDelivery,
+					afterDelivery,
+					beforeCollaboration,
+					afterCollaboration,
+				);
+				noProgressEpochs = progress.noProgressEpochs;
+				collaborationContinuations = progress.collaborationContinuations;
 				if (noProgressEpochs >= activeTeam.taskMaxNoProgressEpochs) {
 					activeTeam.state.roles[task.owner].status = "failed";
 					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
@@ -2834,6 +2873,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			taskIds: readonly string[],
 		): Promise<void> => {
 			const noProgressEpochs = new Map(taskIds.map((taskId) => [taskId, 0]));
+			const collaborationContinuations = new Map(taskIds.map((taskId) => [taskId, 0]));
 			const stoppedTaskIds = new Set<string>();
 			activeTeam.crossRolePromptDeferralDepth++;
 			let executionFailure: unknown;
@@ -2869,10 +2909,16 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							);
 						if (runnableTasks.length === 0) return;
 
-						const beforeFingerprints = new Map(
+						const beforeDeliveryFingerprints = new Map(
 							runnableTasks.map((task) => [
 								task.id,
 								getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id),
+							]),
+						);
+						const beforeCollaborationFingerprints = new Map(
+							runnableTasks.map((task) => [
+								task.id,
+								getAnsteelTeamTaskCollaborationFingerprint(ctx.cwd, activeTeam.state, task.id),
 							]),
 						);
 						const ownerResults = await Promise.allSettled(
@@ -2942,10 +2988,25 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								}
 							}
 							if (task.status === "approved") continue;
-							const after = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
-							const before = beforeFingerprints.get(task.id);
-							const noProgress = after === before ? (noProgressEpochs.get(task.id) ?? 0) + 1 : 0;
-							noProgressEpochs.set(task.id, noProgress);
+							const afterDelivery = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+							const afterCollaboration = getAnsteelTeamTaskCollaborationFingerprint(
+								ctx.cwd,
+								activeTeam.state,
+								task.id,
+							);
+							const progress = advanceAnsteelTeamTaskEpochProgress(
+								{
+									noProgressEpochs: noProgressEpochs.get(task.id) ?? 0,
+									collaborationContinuations: collaborationContinuations.get(task.id) ?? 0,
+								},
+								beforeDeliveryFingerprints.get(task.id)!,
+								afterDelivery,
+								beforeCollaborationFingerprints.get(task.id)!,
+								afterCollaboration,
+							);
+							noProgressEpochs.set(task.id, progress.noProgressEpochs);
+							collaborationContinuations.set(task.id, progress.collaborationContinuations);
+							const noProgress = progress.noProgressEpochs;
 							if (noProgress >= activeTeam.taskMaxNoProgressEpochs) {
 								activeTeam.state.roles[task.owner].status = "failed";
 								saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));

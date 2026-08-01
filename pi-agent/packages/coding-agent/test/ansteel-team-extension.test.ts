@@ -2143,6 +2143,106 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		});
 	});
 
+	it("grants only one collaboration continuation without marking delivery started", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 4;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		let taskEpochs = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-COLLABORATION")) {
+				taskEpochs++;
+				const staff = harness.roleSessionOptions.find((entry) => entry.role === role);
+				if (!staff) throw new Error("Missing Staff Engineer operations");
+				await staff.taskOperations.publishCheckpoint({
+					id: `CP-COLLABORATION-${String(taskEpochs).padStart(4, "0")}`,
+					taskId: "TASK-COLLABORATION",
+					goal: "Refine the governed parser implementation path",
+					currentUnderstanding: `Collaboration fact from owner epoch ${taskEpochs}`,
+					assumptions: [],
+					evidenceRefs: ["file:src/parser.ts"],
+					uncertainties: ["No delivery evidence exists yet"],
+					nextAction: {
+						kind: "read",
+						target: "src/parser.ts",
+						expectedResult: "The next implementation step is bounded",
+					},
+					confidence: "L2",
+				});
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-COLLABORATION","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(taskEpochs).toBe(2);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({
+			id: "TASK-COLLABORATION",
+			status: "claimed",
+			revision: 0,
+			testEvidence: [],
+			submissions: [],
+			reviews: [],
+		});
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).filter((event) => event.type === "work-checkpoint")).toHaveLength(
+			2,
+		);
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).at(-1)).toMatchObject({
+			type: "role-failure",
+			content: expect.stringContaining("owner-no-progress"),
+		});
+	});
+
+	it("never lets collaboration continuation bypass the task epoch ceiling", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 1;
+		config.teamTaskMaxNoProgressEpochs = 1;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-COLLABORATION")) {
+				const staff = harness.roleSessionOptions.find((entry) => entry.role === role);
+				if (!staff) throw new Error("Missing Staff Engineer operations");
+				await staff.taskOperations.publishCheckpoint({
+					id: "CP-COLLABORATION-CEILING",
+					taskId: "TASK-COLLABORATION",
+					goal: "Exercise the immutable epoch ceiling",
+					currentUnderstanding: "Collaboration exists without delivery",
+					assumptions: [],
+					evidenceRefs: ["file:src/parser.ts"],
+					uncertainties: ["The implementation has not started"],
+					nextAction: {
+						kind: "read",
+						target: "src/parser.ts",
+						expectedResult: "The next step remains visible",
+					},
+					confidence: "L2",
+				});
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-COLLABORATION","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).at(-1)).toMatchObject({
+			type: "role-failure",
+			content: expect.stringContaining("task-epoch-limit"),
+		});
+	});
+
 	it("stops a progressing coordinator task at the configured epoch ceiling", async () => {
 		const config = createConfig();
 		config.teamTaskMaxEpochs = 1;
