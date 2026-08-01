@@ -251,8 +251,8 @@ export interface AnsteelActionFileIdentity {
 
 export type AnsteelWorkCheckpointInput = Omit<
 	AnsteelWorkCheckpoint,
-	"actor" | "governedAction" | "status" | "createdAt"
->;
+	"actor" | "governedAction" | "status" | "createdAt" | "risk"
+> & { risk?: AnsteelActionRisk };
 export type AnsteelProcessIssueInput = Omit<
 	AnsteelProcessIssue,
 	"author" | "targetRole" | "status" | "resolutions" | "createdAt"
@@ -4394,7 +4394,8 @@ export function publishAnsteelWorkCheckpoint(
 		nextAction.target = normalizeTaskFilePath(cwd, nextAction.target);
 	}
 	const computedRisk = classifyCheckpointActionRisk(cwd, nextAction);
-	const effectiveRisk = maxAnsteelActionRisk(computedRisk, input.risk);
+	// risk 可由协调器按动作类型机械推导（只升不降）；模型省略时使用计算风险。
+	const effectiveRisk = input.risk === undefined ? computedRisk : maxAnsteelActionRisk(computedRisk, input.risk);
 	const checkpoint: AnsteelWorkCheckpoint = {
 		...structuredClone(input),
 		nextAction,

@@ -1311,6 +1311,24 @@ describe("public collaboration state", () => {
 		});
 	});
 
+	it("derives checkpoint risk from the action when the model omits it", () => {
+		const cwd = createTemporaryProject();
+		const state = createTeam(cwd);
+		const checkpoint = publishAnsteelWorkCheckpoint(cwd, state, "staff-engineer", {
+			id: "CP-RISK-DERIVED-0001",
+			goal: "Publish a checkpoint without an explicit risk",
+			currentUnderstanding: "risk is mechanically derived from the action kind",
+			assumptions: [],
+			evidenceRefs: [],
+			uncertainties: [],
+			nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "Edit authorized at yellow" },
+			confidence: "L2",
+		});
+		expect(checkpoint.risk).toBe("yellow");
+		expect(checkpoint.governedAction.computedRisk).toBe("yellow");
+		expect(checkpoint.governedAction.effectiveRisk).toBe("yellow");
+	});
+
 	it("rejects duplicate checkpoint IDs", () => {
 		const cwd = createTemporaryProject();
 		const state = createValidPublicCollaborationState(cwd);

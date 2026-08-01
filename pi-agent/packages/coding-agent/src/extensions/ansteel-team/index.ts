@@ -116,6 +116,7 @@ const MAX_LEDGER_EVENTS_IN_PROMPT = 24;
 const DEFAULT_ANSTEEL_TEAM_STAGE_TIMEOUT_MS = 120_000;
 const ANSTEEL_TEAM_ABORT_GRACE_MS = 1_000;
 const ANSTEEL_TEAM_STAGE_RETRY_LIMIT = 3;
+const ANSTEEL_TEAM_REPAIR_TURN_TIMEOUT_MS = 120_000;
 const DEFAULT_ANSTEEL_TEAM_TASK_MAX_EPOCHS = 8;
 const DEFAULT_ANSTEEL_TEAM_TASK_MAX_NO_PROGRESS_EPOCHS = 2;
 const ANSTEEL_TEAM_TASK_TOOL_NAMES = [
@@ -462,7 +463,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 					target: Type.String(),
 					expectedResult: Type.String(),
 				}),
-				risk: Type.Union([Type.Literal("green"), Type.Literal("yellow"), Type.Literal("red")]),
+				risk: Type.Optional(Type.Union([Type.Literal("green"), Type.Literal("yellow"), Type.Literal("red")])),
 				confidence: Type.Union([Type.Literal("L1"), Type.Literal("L2"), Type.Literal("L3"), Type.Literal("L4")]),
 				supersedesCheckpointId: Type.Optional(Type.String()),
 			}),
@@ -1492,38 +1493,74 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			...fields,
 			message: `${role} provider request started`,
 		});
-		const getFailedCollaborationToolError = (): Error | undefined => {
+		const getFailClosedAuditStatus = (
+			emptyIsFailure = false,
+		):
+			| { kind: "ok" }
+			| { kind: "last-error"; toolName: string }
+			| { kind: "retry-limit"; toolName: string; errorCount: number } => {
 			// Governed tool input errors are retryable inside the stage: the agent loop
 			// returns them to the model as error tool results, so a corrected retry may
 			// succeed. The stage still fails closed when the final governed-tool attempt
-			// in the stage is an error, or when governed-tool input errors repeat beyond
-			// the bounded per-stage retry limit even though a later attempt succeeded.
+			// in the stage is an error (after one mechanically forced repair turn), or
+			// when governed-tool input errors repeat beyond the bounded per-stage retry
+			// limit even though a later attempt succeeded.
 			const failClosedEvents = (session.getLastStageAudit?.()?.events ?? []).filter(
 				(event) =>
 					event.type === "tool-execution-end" &&
 					ANSTEEL_TEAM_FAIL_CLOSED_COLLABORATION_TOOLS.some((toolName) => toolName === event.toolName),
 			);
-			if (failClosedEvents.length === 0) return undefined;
+			if (failClosedEvents.length === 0) {
+				return emptyIsFailure ? { kind: "last-error", toolName: "ansteel governed tool" } : { kind: "ok" };
+			}
 			const lastEvent = failClosedEvents[failClosedEvents.length - 1];
 			if (lastEvent.isError === true) {
-				observation.failClosedCollaborationError ??= new Error(
-					`Ansteel team role stage failed: ${lastEvent.toolName} returned an error without a successful retry`,
-				);
-				return observation.failClosedCollaborationError;
+				return { kind: "last-error", toolName: lastEvent.toolName ?? "ansteel governed tool" };
 			}
 			const errorCount = failClosedEvents.filter((event) => event.isError === true).length;
 			if (errorCount >= ANSTEEL_TEAM_STAGE_RETRY_LIMIT) {
-				observation.failClosedCollaborationError ??= new Error(
-					`Ansteel team role stage failed: ${lastEvent.toolName} exceeded the stage retry limit (${errorCount} tool input errors)`,
-				);
-				return observation.failClosedCollaborationError;
+				return { kind: "retry-limit", toolName: lastEvent.toolName ?? "ansteel governed tool", errorCount };
 			}
-			return undefined;
+			return { kind: "ok" };
 		};
+		const failClosedError = (
+			status:
+				| { kind: "last-error"; toolName: string }
+				| { kind: "retry-limit"; toolName: string; errorCount: number },
+		): Error => {
+			observation.failClosedCollaborationError ??=
+				status.kind === "last-error"
+					? new Error(
+							`Ansteel team role stage failed: ${status.toolName} returned an error without a successful retry`,
+						)
+					: new Error(
+							`Ansteel team role stage failed: ${status.toolName} exceeded the stage retry limit (${status.errorCount} tool input errors)`,
+						);
+			return observation.failClosedCollaborationError;
+		};
+		let repairState: { toolName: string } | undefined;
 		try {
-			const response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
-			const failedCollaborationToolError = getFailedCollaborationToolError();
-			if (failedCollaborationToolError !== undefined) throw failedCollaborationToolError;
+			let response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+			let failedStatus = getFailClosedAuditStatus();
+			// Mechanical repair turn: when the model ends a stage with a failed governed
+			// tool call, force one bounded corrective prompt instead of accepting the
+			// failure. A repaired tool result passes the stage; a second failure closes it.
+			if (failedStatus.kind === "last-error") {
+				const originalFailedTool = failedStatus.toolName;
+				repairState = { toolName: originalFailedTool };
+				response = await promptAnsteelTeamRole(
+					session,
+					`A governed tool call (${originalFailedTool}) in your stage failed and was not successfully retried. Correct the tool input and retry it now before producing your final response.`,
+					Math.min(stageTimeoutMs, ANSTEEL_TEAM_REPAIR_TURN_TIMEOUT_MS),
+				);
+				failedStatus = getFailClosedAuditStatus(true);
+				// Keep the original tool identity when the repair turn produced no
+				// governed tool call at all (the model ignored the repair request).
+				if (failedStatus.kind === "last-error" && failedStatus.toolName === "ansteel governed tool") {
+					failedStatus = { kind: "last-error", toolName: originalFailedTool };
+				}
+			}
+			if (failedStatus.kind !== "ok") throw failClosedError(failedStatus);
 			if (response.trim().length === 0) {
 				throw new AnsteelObservabilityError(
 					"provider-empty-public-output",
@@ -1542,7 +1579,19 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			});
 			return response;
 		} catch (error) {
-			const propagatedError = getFailedCollaborationToolError() ?? error;
+			// The stage audit is authoritative even when the provider also aborts: a
+			// governed tool error in the audit is the governance failure to report.
+			const auditStatus = getFailClosedAuditStatus(repairState !== undefined);
+			let propagatedError: unknown = error;
+			if (auditStatus.kind === "last-error") {
+				propagatedError = failClosedError(
+					repairState !== undefined && auditStatus.toolName === "ansteel governed tool"
+						? { kind: "last-error", toolName: repairState.toolName }
+						: auditStatus,
+				);
+			} else if (auditStatus.kind === "retry-limit") {
+				propagatedError = failClosedError(auditStatus);
+			}
 			const reasonCode = classifyAnsteelRuntimeError(propagatedError);
 			const message = formatAnsteelPublicError(propagatedError);
 			const artifacts =
