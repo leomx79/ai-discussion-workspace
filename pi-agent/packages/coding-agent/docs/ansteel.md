@@ -149,6 +149,8 @@ Use the read-only diagnostic commands from the host session:
 
 Governed collaboration tool input errors are retryable inside the same role stage: the agent loop returns the validation error to the model as a tool result, and a corrected retry can succeed. The stage still fails closed when the final governed-tool attempt in the stage is an error, or when governed-tool input errors repeat beyond the per-stage retry limit (3) even though a later attempt succeeded. Governance violations that cannot succeed on retry therefore still terminate the stage.
 
+When a role ends a stage with a failed governed-tool call, the coordinator additionally forces one bounded mechanical repair turn ("correct the tool input and retry now") before accepting the stage. A repair turn that produces no governed tool call, or that still fails, closes the stage with the original tool identity. Checkpoint `risk` is mechanically derived from the action kind when the model omits it (only `confidence` remains a mandatory model judgment).
+
 `doctor` also performs a strict runtime-segment check. Unlike `trace`, it never rebuilds a missing, stale, or changed `run-index.json` before declaring integrity healthy; segment/index divergence fails closed as `event-chain-invalid`.
 
 ### Signed task and milestone anchors
