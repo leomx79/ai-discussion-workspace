@@ -1,6 +1,6 @@
 # 鞍钢宪法式三 AI 持续协作协议设计
 
-> 状态：第 8 步已完成，远端 GitHub Actions 已通过
+> 状态：L1，迁移步骤 1-10 已实现；真实三提供商 r20 首次完成单任务任务级闭环。L3，真实模型下的多轮稳定收敛与系统级 delivery 验证仍未证明
 > 日期：2026-07-29
 > 适用主线：`pi-agent` 的 `/ansteel-team`
 > 核心决策：固定专业分工、对等质疑权、持续公开协作、风险分级阻断、哈希链审计、末端独立验收
@@ -926,9 +926,9 @@ unclassified-runtime-error
 | 7 | 允许 TL、Staff、QA 分别拥有不同类型任务和不重叠文件。 | 已实现并通过本地机械验收，远端以对应提交 CI 为准 | 状态版本升级到 v9，任务持久化 `architecture`、`integration`、`implementation`、`verification` 类型；非默认角色必须公开 `assignmentReason`。协调器以单个 `tasks-assigned` 事件和 pending transaction 原子提交 2 至 3 个不同 owner、文件不重叠的任务；三个持久会话在 owner wave 中真实并行，所有 owner settle 后才依次进入每任务双独立复审。旧任务或里程碑按不可变 revision 进入全局跨角色复审队列，失败项保留并可从持久状态重建，只重试缺失 reviewer。当前七文件串行回归为 `248 passed / 1 skipped`，构建与静态检查通过；这些确定性证据不等于真实三提供商探针。 |
 | 8 | 把现有双评审改为持续协作后的最终独立验证，而不是主要协作机制。 | 已实现，远端 Actions 通过 | 状态升级到 v10：任务和里程碑在 `submitted` 阶段先要求两名非 owner 的、带证据且按 revision 去重的公开协作更新；协调器检查冻结任务 diff、成功测试、未关闭 blocking/critical 问题后才转入 `final-verification`，再发起原有双独立 `approve/reject`。任务漂移或提交阶段的 blocking/critical 过程问题会退回 owner；旧 v9 `submitted` 迁移为遗留 `final-verification` 且不伪造协作历史。扩展、CLI/RPC、并行延迟队列与重启重建均按协作和最终验证两阶段处理。本地七文件串行回归为 `252 passed / 1 skipped`，`npm run build` 通过；GitHub Actions `Ansteel governance gate` 运行 `30568236446` 结论为 `success`。这些仍是确定性证据，不等于真实三提供商探针。 |
 | 9 | 接入 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 三轴状态。 | 已实现，远端 Actions 通过 | 以只读持久事实投影三轴和 `workflowStatus`，`status --explain` 与工作板共享事件重放门禁。任务批准、动作确认或治理通过均不能推导交付通过；当前没有受信任、可重放的交付证据，因此 `deliveryStatus` 保持 `not-started`。提交 `f5f571140a86e34b6873b465a574fc729bc7b756` 的本地构建、类型检查和六文件串行回归 `325 passed` 已通过；GitHub Actions `Ansteel governance gate` 运行 `30574642567` 与 `Ansteel delivery candidate` 运行 `30574826383` 均为 `success`。后者仅上传候选包，未发布 npm 或 GitHub Release，不能作为 `deliveryStatus: passed` 的证据。 |
-| 10 | 最后启用角色签名、日志段完整性校验和里程碑 Merkle Root 外部锚定。 | 未完成 | 本地事件/日志哈希链和索引校验已经实现，但角色签名、里程碑 Merkle Root 和外部锚定均未实现，不能用现有哈希链宣称本步骤完成。 |
+| 10 | 最后启用角色签名、日志段完整性校验和里程碑 Merkle Root 外部锚定。 | 已实现并完成保护边界验收 | 提交 `2b016a0` 为 tech-lead、staff-engineer、qa-engineer、coordinator 建立独立 Ed25519 身份，按声明角色严格验证域分离 JCS 事件签名；签名清单公开持久化，私钥留在角色不可读的 gitignored 运行目录。`anchor` 对已批准任务或里程碑的不可变事件前缀生成 SHA-256/JCS Merkle Root，绑定签名清单、运行索引及日志段前缀快照后写入并推送专用 Git notes ref；`verify-anchor` 复验远端端点、提交可达性、notes 对象、签名清单和日志前缀，替换、截断、重签或 force-push 均失败关闭。实现时四组回归为 356/356；当前 HEAD 复跑核心 97、可观测性 26、CLI 13、扩展 52，共 188/188 通过。提交 `3caa2748` 记录 GitHub `main` 保护规则已启用删除与非快进保护；GitHub ruleset 不能覆盖 `refs/notes/**`，因此 notes 维度仍依赖显式 `verify-anchor`，不得宣称具有服务端不可删除保证。 |
 
-真实三提供商探针仍未完成。现有三个显式 `provider/model` 配置、确定性 provider 测试和独立会话结构属于配置或测试证据，尚未验证三个真实不同提供商在完整持续协作、风险门禁、恢复和最终验收链路中闭环。
+真实三提供商证据已从配置与确定性测试升级为真实运行。L1：`--ansteel` r7 在耐久租约队列上完成两轮修订、独立验证与 Staff/QA 双会签；`/ansteel-team` r12 完成持久团队启动链，r13-r18 验证并行任务、风险门禁、恢复和失败关闭，双计数修复后的 r20 首次完成 revision 1 submission、两个公开协作更新、最终验证请求与 TL/QA 双 `approve`，任务终态为 `approved`。L3：r20 只是单文件、单任务、单次成功样本，不证明多任务、长任务或多轮真实模型运行已经稳定收敛；任务批准也不能推导系统 `deliveryStatus: passed`，其独立 delivery-verification 仍未启动。完整证据见 `docs/superpowers/reports/2026-07-31-ansteel-team-real-three-provider-probe.md`。
 
 旧状态必须显式迁移。不能从旧 `approved` 推导新 `collaboration-complete` 或 `deliveryStatus: passed`；
 缺少公开过程事件的旧任务最多标记为 `legacy-governance-approved`，依赖是否可用仍按旧版本隔离处理。
