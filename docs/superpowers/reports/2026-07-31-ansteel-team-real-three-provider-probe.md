@@ -1,9 +1,9 @@
 # 鞍钢真实三提供商探针运行报告（耐久租约队列）
 
-> 日期：2026-07-31 至 2026-08-01（`--ansteel` r1-r7；`/ansteel-team` r2-r18）
+> 日期：2026-07-31 至 2026-08-01（`--ansteel` r1-r7；`/ansteel-team` r2-r20）
 > 对应方案：《鞍钢宪法式三 AI 持续协作协议设计》第 20.4 节真实提供商探针
-> 探针项目（gitignored 运行区）：`artifacts/runtime/ansteel-e2e-real-three-provider/`
-> 最终结论：真实治理机制已验证；持久化任务交付闭环未触达，按失败关闭边界收口
+> 探针项目（gitignored 运行区）：`artifacts/runtime/ansteel-e2e-real-three-provider/`、`artifacts/runtime/ansteel-team-dual-counter-r19/`、`artifacts/runtime/ansteel-team-dual-counter-r20/`
+> 最终结论：L1，真实治理机制已验证；双计数修复后的 r20 首次触达持久化任务级交付闭环。该单次成功证明链路可达，不证明真实模型下已稳定收敛
 
 ## 一、三角色 provider/model 映射（L1：真实端点探测与运行连通）
 
@@ -13,7 +13,7 @@
 | staff-engineer | `deepseek-flash/deepseek-v4-flash`（r1-r6）/ `deepseek-v4-pro`（r7） | https://api.deepseek.com/v1 | r2-r7 全部真实完成（修复 401 与空输出后） |
 | qa-engineer | `volcengine-coding/doubao-seed-2.1-turbo` | https://ark.cn-beijing.volces.com/api/coding/v3 | r2-r7 全部真实完成，含 L1 证据否决与会签 |
 
-持久化任务阶段随后轮换了六个显式模型身份：GLM-5.2、DeepSeek v4-pro、DeepSeek v4-flash、Doubao Seed 2.1 Turbo、Kimi K2.7 Code、GPT-5.5。r17-r18 的最终组合为 TL=`micuapi/gpt-5.5`、Staff=`deepseek-flash/deepseek-v4-flash`、QA=`volcengine-coding/kimi-k2.7-code`。这些配置与真实调用记录能证明每轮使用的显式身份和端点响应，不能证明供应商内部没有路由到共享后端。
+持久化任务阶段随后轮换了六个显式模型身份：GLM-5.2、DeepSeek v4-pro、DeepSeek v4-flash、Doubao Seed 2.1 Turbo、Kimi K2.7 Code、GPT-5.5。r17-r20 的最终组合为 TL=`micuapi/gpt-5.5`、Staff=`deepseek-flash/deepseek-v4-flash`、QA=`volcengine-coding/kimi-k2.7-code`。L1：配置、真实调用记录与 r20 状态快照能证明每轮使用的显式身份和端点响应。L3：这些外部证据不能证明供应商内部没有路由到共享后端。
 
 ## 二、运行记录与治理结果
 
@@ -62,13 +62,13 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 
 ## 六、边界声明（不得过度宣称）
 
-- `pi --ansteel` 非交互证据优先评审路径已在 r7 得到 APPROVED 与双会签；`/ansteel-team start` 已在 r12 完整跑通，r13-r18 也真实进入三角色并行任务、检查点、动作评审、过程问题、有限重试和修复回合。两条路径证明不同能力，不能互相替代。
-- 治理结果：r7 `APPROVED`（双会签）；交付结果：`NOT_DELIVERED`（评审不实现任务）。APPROVED 表示规定角色完成规定检查并达成共识，不表示代码已正确交付。
+- L1：`pi --ansteel` 非交互证据优先评审路径已在 r7 得到 APPROVED 与双会签；`/ansteel-team start` 已在 r12 完整跑通，r13-r18 真实进入三角色并行任务、检查点、动作评审、过程问题、有限重试和修复回合，r20 首次完成任务提交至双最终审批。两条路径证明不同能力，不能互相替代。
+- L1：治理评审结果为 r7 `APPROVED`（双会签）；r20 的 `TASK-MINIMAL-DELIVERY` 为 `approved`（任务级双审批）。APPROVED 只表示对应门禁已通过，不能越级解释为系统级 delivery 验证已经完成。
 - 跨模型 L1 证据已升级：三个真实 provider/model 在评审管线中完成完整持续协作循环并获得 APPROVED 共识与会签（r7）。
-- 持久化任务路径的最远证据是任务认领、真实编辑意图、peer 动作评审、过程问题与修复、测试命令尝试和失败关闭；r13-r18 均未形成任务 submission，因此没有进入“两个协作更新 → 最终独立验证 → 双会签”的交付链。其 `deliveryStatus` 必须保持 `not-started`。
+- L1：r13-r18 均未形成任务 submission；双计数修复后的 r20 已形成 revision 1 submission、两个协作更新、最终独立验证请求和 TL/QA 两个 `approve`，任务状态为 `approved`。r20 的系统三轴状态仍将 delivery 显示为 `not-started`，因为未配置独立、可重放的 delivery-verification 证据；任务批准不能伪造成 `deliveryStatus: passed`。
 
 
-## 七、持久化团队 /ansteel-team 真实三提供商验证（RPC 无头驱动 r2-r18）
+## 七、持久化团队 /ansteel-team 真实三提供商验证（RPC 无头驱动 r2-r20）
 
 ### 7.1 运行记录
 
@@ -89,8 +89,10 @@ r7 报告状态原文：`Three revised work cards passed independent three-role 
 | r16 | 终态：任务未交付（no-progress + 工具错误） | TL 换为 GPT-5.5；start 完成 6 份报告、7 个 checkpoint、零失败。任务阶段观察到 201 个事件：TL 的 `TASK-LEASE-CONTRACT` 连续两个 epoch 无受治理交付进展而停止；Staff（DeepSeek v4-pro）在任务协作工具报错后未成功重试；没有形成 submission。 |
 | r17 | 终态：任务未交付（外部配额 + no-progress） | 2b 生效且 Staff 换为 DeepSeek v4-flash；start 完成 6 份报告、7 个 checkpoint、零失败。QA（Kimi）连续 5 次收到 `429 AccountQuotaExceeded`（5 小时配额），Staff/QA 随后触发连续无进展停止；最终观察到 179 个事件。 |
 | **r18** | **终态：已停止；工作流 blocked，交付 not-started** | Kimi 配额探测恢复后启动；start 再次零失败。任务阶段最终落盘 233 个公共事件、25 个 checkpoint、3 个 process-issue、8 次动作评审、1 个 process-resolution、3 个 role-failure；三个任务均保持 claimed，submission/collaboration/final review 均为 0。 |
+| r19 | 无效探针（夹具泄漏，已正式停止） | 驱动文件误放入被审项目 `.pi/`，QA 读取到未来任务 ID 并在任务分配前引用；checkpoint 累计 3 次输入错误后 fail-closed。L1：公共账本只有 31 个事件、1 个 role-failure、tasks=0，源文件无差异；通过受支持 RPC `stop` 后 team=`stopped`、三角色均 idle。该轮不能用于评价双计数。 |
+| **r20** | **成功：任务级持久化交付闭环首次可达** | 外置驱动消除夹具泄漏；start/task/stop 均 `success=true`。`TASK-MINIMAL-DELIVERY` revision 1 从任务分配、两组 peer action review、测试与提交、两个协作更新、最终验证请求走到 TL/QA 双 `approve`，终态 `approved`；零 role-failure。 |
 
-r14-r17 的明细来自本地 Codex 任务 `019fb556-a152-70d0-ba4f-b1d9b30c3f16` 的运行转录；后续轮次会重建同一个 gitignored 探针目录，因此当前文件系统只保留 r18 的完整运行态，不能把 r14-r17 写成可由 GitHub checkout 单独重放的产物。r18 保留签名账本（Ed25519 manifest + 事件链）、team.json、运行日志、角色会话和内容寻址错误产物；无证据表明角色访问了 Oracle 或协调器私有状态。
+r14-r17 的明细来自本地 Codex 任务 `019fb556-a152-70d0-ba4f-b1d9b30c3f16` 的运行转录；后续轮次会重建同一个 gitignored 探针目录，因此不能把 r14-r17 写成可由 GitHub checkout 单独重放的产物。L1：当前文件系统分别保留 r18、r19、r20 的签名账本（Ed25519 manifest + 事件链）、team.json、运行日志与角色会话；r20 另有外置驱动、RPC 转录和汇总 JSON。L3：没有证据表明角色访问了 Oracle 或协调器私有状态，但该否定结论受现有审计面限制。
 
 ### 7.2 已修复的真实根因（均有确定性回归 + 治理门禁）
 
@@ -102,11 +104,12 @@ r14-r17 的明细来自本地 Codex 任务 `019fb556-a152-70d0-ba4f-b1d9b30c3f16
 6. `64393f4`：提示词要求治理工具报错必须修正重试，不得带错收尾
 7. `b54242c`：未分配任务前禁止调用任务/里程碑工具
 8. `6e57592`：**机械修复回合 + 协调器风险推导（2b）**——模型在阶段最后一次治理工具错误后不能直接带错收尾；协调器强制一次定向修复回合，未调用治理工具或再次失败仍按原始工具名失败关闭。checkpoint `risk` 改由协调器按动作机械推导并取不低于模型声明的风险，`confidence` 仍由模型必填。核心、CLI/RPC 与扩展定向回归为 159/159；`dcd8eb4` 同步运行语义文档。
+9. `c99317c`：**交付进展 / 协作进展双计数**——保留严格交付指纹，同时新增绑定当前任务 revision 的协作指纹；task checkpoint、process issue、resolution/review 与 peer action review 可为每次 task 调度提供至多一次协作续跑，但不修改 revision、交付状态、测试、提交或最终评审证据，且 `teamTaskMaxEpochs` 始终是硬上限。L1：核心测试 97/97、扩展测试 52/52、浏览器 smoke 通过；提交已推送至 `origin/main`。L1：相关四个改动文件的独立 Biome 检查通过。L3：仓库全量 `npm run check` 仍受既有 shrinkwrap/install-lock 漂移与两处原有测试空值类型错误影响，因此不能宣称全仓静态检查全绿。
 
 ### 7.3 边界与设计观察（诚实声明）
 
-- 持久化团队 `start` 流程（investigation + 交叉质询）已在 r12 **完整跑通**；三角色并行任务迁移在 r13-r18 **持续产生真实治理动态**。r13 的 peer 以行级证据抓出两个测试缺陷，缺陷修复后 43 个探针测试通过；r14-r18 继续验证了有限重试、模型轮换、机械修复回合、配额失败、过程解决和 epoch 停止，但仍没有任务提交。
-- 工具入参 schema 错误已经从“一次错误立即杀死阶段”修订为“阶段内有限重试”，并在 2b 中增加一次机械修复回合；治理越权和修复失败仍保持 fail-closed。r14-r18 表明该机制改善了可诊断性和协作深度，但不足以稳定产生交付提交。
+- L1：持久化团队 `start` 流程（investigation + 交叉质询）已在 r12 **完整跑通**；三角色并行任务迁移在 r13-r18 **持续产生真实治理动态**。r13 的 peer 以行级证据抓出两个测试缺陷，缺陷修复后 43 个探针测试通过；r14-r18 继续验证了有限重试、模型轮换、机械修复回合、配额失败、过程解决和 epoch 停止，但没有任务提交。
+- L1：双计数并未放宽提交、测试、协作更新、最终评审或 epoch 硬上限，仅使有 revision 绑定的真实协作证据获得一次有界续跑机会。r20 表明该机制下完整任务链可达。L3：当前只有一个成功样本，尚不能量化成功率或证明多任务、长任务和多轮运行能稳定收敛。
 - 恢复语义：`start` 对已存在团队只恢复会话不重跑轮次；续跑用 `ask`，且 `ask` 只在账本存在未决义务时产出新事件（r4 后 openChallenges=0 时空跑属正常）。
 
 ### 7.4 r18 冻结诊断与正式关闭（2026-08-01）
@@ -117,6 +120,15 @@ r14-r17 的明细来自本地 Codex 任务 `019fb556-a152-70d0-ba4f-b1d9b30c3f16
 4. `/ansteel-team doctor RUN-c0e3e032-a57b-4f01-afb8-877e036c9d04` 通过公共事件链、状态投影和运行索引前置完整性检查后，按设计返回 unhealthy：根因为 `task.submit` 序号 214 的 `unclassified-runtime-error`，并检测到 3 个缺少合法终态的 span（`process-orphaned`）。这是可诊断的失败运行，不是健康交付或证据损坏。
 5. 通过受支持的 `/ansteel-team stop` 关闭遗留团队，未手工修改 `team.json`。关闭后的 `status --explain` 明确给出：team=`stopped`、collaboration=`blocked`、governance=`rejected`、delivery=`not-started`、workflow=`blocked`；三角色均为 idle。关闭操作对应的最新诊断运行健康（3 条日志）。
 
+### 7.5 r19 夹具隔离与 r20 首次任务级闭环（2026-08-01）
+
+1. L1：r19 的失败源于探针自身夹具泄漏。驱动放在项目 `.pi/` 后被 QA 当作可读证据，暴露了尚未由协调器分配的任务 ID；QA 连续三次以该 ID 发布 checkpoint，触发 `ansteel_publish_checkpoint exceeded the stage retry limit`。该轮 tasks=0、源码无 diff，不能支持“双计数失败”的结论。
+2. L1：r19 已通过受支持的 RPC `stop` 关闭，team=`stopped`，三角色均 idle；未手工修改状态文件。
+3. L1：r20 将驱动移到被审项目之外，基线提交为 `431e36b`。三角色仍为 TL=`micuapi/gpt-5.5`、Staff=`deepseek-flash/deepseek-v4-flash`、QA=`volcengine-coding/kimi-k2.7-code`，start、task、stop 三个 RPC 均成功。
+4. L1：r20 公共账本共 121 个事件：81 个 `action-assessed`、4 个 `action-review`、17 个 `role-report`、1 个 `task-assigned`、12 个 `work-checkpoint`、1 个 `task-submitted`、2 个 `task-collaboration`、1 个 `task-final-verification-requested`、2 个 `task-review`，role-failure=0。关键序列为 57（分配）、62/78（任务 checkpoint）、72/74 与 91/93（两组 action review）、98（提交）、108/109（双协作）、112（最终验证请求）、117/119（TL/QA APPROVE）。
+5. L1：`TASK-MINIMAL-DELIVERY` 终态为 `approved`、revision=1、testEvidence=2、submissions=1、collaborationUpdates=2、reviews=2；两名 reviewer 分别为 tech-lead 与 qa-engineer，verdict 均为 approve。唯一源码差异为 `deliveryMarker` 从 `"NOT_IMPLEMENTED"` 改为 `"implemented"`，独立复跑 `node --test test/delivery.test.mjs` 为 1/1 通过。
+6. L1：r20 证明“任务提交 → 双协作更新 → 最终独立验证请求 → 双审批”的任务级持久化链路真实可达。L3：单次、单文件、单任务成功不足以证明真实模型下的稳定收敛，也不等同于系统三轴中的独立 delivery-verification 已完成。
+
 ## 八、最终收口决策
 
 ### 8.1 已接受的证据
@@ -124,11 +136,13 @@ r14-r17 的明细来自本地 Codex 任务 `019fb556-a152-70d0-ba4f-b1d9b30c3f16
 - `--ansteel`：真实跨模型评审在 r7 完成双会签并形成 APPROVED 共识。
 - `/ansteel-team start`：r12 完成 investigation 与交叉质询两轮，三角色零失败退出。
 - `/ansteel-team task`：r13-r18 验证并行任务认领、精确文件所有权、checkpoint、peer 动作评审、过程问题与解决、有限重试、机械修复回合、provider 配额失败和 epoch 失败关闭。
-- 确定性门禁：2b 提交的定向回归为 159/159；当前 `dcd8eb4` 的 GitHub Actions `Ansteel governance gate` 运行 `30681263222` 为 success。本次收口前在本机复跑同一六文件治理回归为 336/336，构建、类型检查与 `git diff --check` 均通过。
+- L1：`/ansteel-team task` 的 r20 首次形成可信 submission、双协作更新、最终验证请求与 TL/QA 双审批，任务 revision 1 达到 `approved`；唯一受控源文件差异经独立测试复跑 1/1 通过。
+- L1：确定性门禁方面，2b 定向回归为 159/159；双计数定向回归为核心 97/97、扩展 52/52，浏览器 smoke 通过；`c99317c` 已推送至 `origin/main`。L3：全仓 `npm run check` 的既有锁文件与测试类型漂移仍需另案处理。
 
 ### 8.2 未接受的证据与最终边界
 
-- 没有任何持久化任务轮次形成可信 submission，因此没有证据支持双协作更新、最终独立验证、双会签或 `deliveryStatus: passed`。
+- r20 已补齐任务级 submission、双协作更新、最终验证请求和双审批证据；因此原结论“持久化任务交付闭环未验证”不再成立。L1：可接受的新结论是“单任务持久化交付闭环已验证可达”。
 - 配额恢复后的 r18 仍复现 `owner-no-progress`、阶段超时与工具重试上限，说明阻塞不能只归因于 r17 的临时配额耗尽。
-- 不继续在相同协议和相同任务上无变化重跑。无新假设的成功样本只能证明单次可达，不能证明真实模型下的稳定收敛。
-- 本目标按“治理机制已验证、持久化任务交付闭环未验证”收口。后续若继续研发，应单独设计有硬上限的“协作进展/交付进展”双计数实验，而不是直接放宽阶段超时或无进展阈值；任何变更都必须继续保留交付证据和治理违规的失败关闭。
+- L1：r20 的任务批准不构成独立 delivery-verification，系统状态明确保持 delivery=`not-started`；不得写成 `deliveryStatus: passed`。
+- L3：当前只有一次单任务成功，不能据此证明真实模型下的稳定收敛、成功率、多任务并发可靠性或长任务耐久性。若要回答稳定性问题，下一阶段应使用固定夹具进行多轮重复探针并预先定义成功率与失败分类，而不是继续无指标重跑。
+- 本目标按“治理机制已验证、双计数实现已回归、持久化单任务闭环首次真实可达，但稳定性未证明”收口。任何后续变更都必须继续保留交付证据边界、epoch 硬上限和治理违规的失败关闭。
