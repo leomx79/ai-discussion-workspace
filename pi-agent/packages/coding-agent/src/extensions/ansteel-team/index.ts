@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -25,6 +26,7 @@ import {
 	type AnsteelProcessResolutionInput,
 	type AnsteelProcessResolutionReviewInput,
 	type AnsteelTeamCollaborationUpdate,
+	type AnsteelTeamDeliveryVerification,
 	type AnsteelTeamEventActor,
 	type AnsteelTeamMilestone,
 	type AnsteelTeamMilestoneReview,
@@ -46,12 +48,14 @@ import {
 	beginAnsteelTeamMilestoneFinalVerification,
 	beginAnsteelTeamTaskFinalVerification,
 	claimAnsteelTeamTask,
+	createAnsteelTeamIncidentProjectContext,
 	createAnsteelTeamMilestone,
 	createAnsteelTeamState,
 	getAnsteelTeamActionFileIdentity,
 	getAnsteelTeamMilestoneFinalVerificationReadiness,
 	getAnsteelTeamSharedBoard,
 	getAnsteelTeamStatusAxes,
+	getAnsteelTeamTaskActionApprovalFingerprint,
 	getAnsteelTeamTaskCollaborationFingerprint,
 	getAnsteelTeamTaskFinalVerificationReadiness,
 	getAnsteelTeamTaskProgressFingerprint,
@@ -76,15 +80,20 @@ import {
 	saveAnsteelTeamState,
 	submitAnsteelTeamMilestone,
 	submitAnsteelTeamTask,
+	transitionAnsteelTeamRoleStatus,
+	transitionAnsteelTeamStatus,
 	verifyAnsteelTeamExternalAnchor,
 	verifyAnsteelTeamTaskDelivery,
 } from "../../core/ansteel-team.ts";
 import {
+	type AnsteelIncidentProjectContext,
 	AnsteelObservabilityError,
 	type AnsteelRuntimeLogger,
 	type AnsteelRuntimeReasonCode,
 	type AnsteelRuntimeSpan,
 	abandonOrphanedAnsteelTeamRun,
+	auditAnsteelRuntimeArtifacts,
+	createAnsteelResumedRunContext,
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
 	createAnsteelTeamIncidentBundle,
@@ -149,10 +158,15 @@ function advanceAnsteelTeamTaskEpochProgress(
 	current: AnsteelTeamTaskEpochProgress,
 	beforeDelivery: string,
 	afterDelivery: string,
+	beforeActionApprovals: string,
+	afterActionApprovals: string,
 	beforeCollaboration: string,
 	afterCollaboration: string,
 ): AnsteelTeamTaskEpochProgress {
 	if (afterDelivery !== beforeDelivery) {
+		return { ...current, noProgressEpochs: 0 };
+	}
+	if (afterActionApprovals !== beforeActionApprovals) {
 		return { ...current, noProgressEpochs: 0 };
 	}
 	if (
@@ -211,7 +225,13 @@ export interface AnsteelTeamRoleSession {
 	abort?: () => void | Promise<void>;
 	dispose: () => void | Promise<void>;
 	getLastStageAudit?: () => {
-		events: Array<{ type: string; toolName?: string; isError?: boolean; stopReason?: string }>;
+		events: Array<{
+			type: string;
+			elapsedMs?: number;
+			toolName?: string;
+			isError?: boolean;
+			stopReason?: string;
+		}>;
 	};
 }
 
@@ -229,6 +249,47 @@ export interface CreateAnsteelTeamRoleSessionOptions {
 	allowedTaskOwners: readonly AnsteelRole[];
 	maxToolCallsPerStage: number;
 	taskOperations: AnsteelTeamTaskOperations;
+	/**
+	 * 当机械工具预检阻止执行时，持久化一条不含计数和原始参数的审计事实。拒绝事件故意排除
+	 * 工具参数，防止携带秘密的被拒命令通过审计通道再次泄漏。
+	 */
+	recordAccessDenied?: (input: {
+		toolName: string;
+		toolCallId: string;
+		denialBoundary:
+			| "extension-policy"
+			| "evidence-boundary"
+			| "read-only-command-policy"
+			| "action-authorization"
+			| "mutation-path"
+			| "mutation-identity";
+	}) => void;
+	/**
+	 * 持久化隔离阶段只读工具额度的机械生命周期。回调故意不接收工具参数：预算证据只需要
+	 * 稳定的 toolCallId 与计数器，不应保存模型提供的路径、搜索模式或命令正文。
+	 */
+	recordReadOnlyToolBudget?: (
+		input:
+			| {
+					kind: "reserved";
+					used: number;
+					limit: number;
+					remaining: number;
+			  }
+			| {
+					kind: "consumed" | "exhausted";
+					toolName: string;
+					toolCallId: string;
+					used: number;
+					limit: number;
+					remaining: number;
+			  },
+	) => void;
+	/**
+	 * 记录由 AgentSession 权威发出的重试通知，但不复制触发重试的 provider 错误文本。
+	 * 协调器在回调发生时解析当前活动 provider request，确保 attempt/delay 绑定真实请求。
+	 */
+	recordProviderRetry?: (input: { attempt: number; maxAttempts: number; delayMs: number }) => void;
 }
 
 export interface AnsteelTeamExtensionDependencies {
@@ -282,6 +343,13 @@ interface CoordinatorTaskInput {
 interface ActiveAnsteelObservation {
 	logger: AnsteelRuntimeLogger;
 	root: AnsteelRuntimeSpan;
+	/** 保存当前角色 span，使工具安全事件能够绑定真实父节点而不是退化为命令根。 */
+	activeRoleSpans: Map<AnsteelRole, AnsteelRuntimeSpan>;
+	/** 保存活动 provider 尝试，使隔离会话发出的 retry 事件能够绑定真实 request。 */
+	activeProviderRequests: Map<
+		AnsteelRole,
+		{ span: AnsteelRuntimeSpan; providerRequestId: string; retryCount: number }
+	>;
 	failClosedCollaborationError?: Error;
 }
 
@@ -292,6 +360,7 @@ function classifyAnsteelRuntimeError(error: unknown): AnsteelRuntimeReasonCode {
 	if (message.includes("empty-public-update") || message.includes("empty public")) {
 		return "provider-empty-public-output";
 	}
+	if (message.includes("output-truncated")) return "budget-exhausted";
 	if (message.includes("rate limit") || message.includes("too many requests")) return "provider-rate-limited";
 	if (message.includes("authentication") || message.includes("unauthorized") || message.includes("api key")) {
 		return "provider-authentication-failed";
@@ -443,11 +512,11 @@ function buildRoleSystemPrompt(
 		`You are the Ansteel team ${role}. ${getRoleInstruction(role)}`,
 		"You are a normal project agent: inspect files and tools directly, state uncertainty, and provide actionable work.",
 		`Only the coordinator command /ansteel-team task may create code-change tasks, and it may assign them only to ${allowedTaskOwners.join(", ")}. Never create or rename a task yourself. Only reference a taskId that the coordinator has already assigned: before any assignment, publish checkpoints without taskId, and never invent or guess a task ID. All roles retain independent review responsibility for submitted changes.`,
-		"An assigned task stays blocked until the coordinator observes every predecessor as approved; never claim it is ready yourself.",
+		"An assigned task stays blocked until the coordinator observes every predecessor as delivered by a current-revision trusted verification receipt; governance approval alone does not unlock it, and you must never claim it is ready yourself.",
 		"Responsibilities set your primary focus but never prevent you from questioning another role or proposing a better solution.",
 		"Do not expose private chain-of-thought. Public work reasoning is a concise engineering checkpoint with the goal, current understanding, evidence, assumptions, uncertainties, next action, expected result, risk, and confidence.",
 		"Use ansteel_publish_checkpoint when forming or changing a solution, before yellow or red actions, when a tool result is unexpected, when accepting or refuting a challenge, and before claiming acceptance evidence. Every structured id you publish must follow its required form and use only uppercase letters, digits, and hyphens: checkpoint ids are CP-<UPPERCASE-ID>, process issue ids are PI-<UPPERCASE-ID>, resolution ids are PR-<UPPERCASE-ID>, task ids are TASK-<UPPERCASE-ID>; each new entity needs a new unique id.",
-		"A checkpoint that omits risk or confidence is rejected by the coordinator and ends your stage; always include both fields in every ansteel_publish_checkpoint call.",
+		"A checkpoint that omits risk or confidence is rejected by the coordinator and ends your stage; always include both fields in every ansteel_publish_checkpoint call. nextAction.kind must be exactly one of: read, report, experiment, edit, write, test, commit, publish, decision. Use report for a no-side-effect public update or task-assignment request; reserve decision for choosing a project direction that requires peer governance.",
 		"If any governed tool call (ansteel_*) returns an error, you MUST correct the input and retry it before producing your final response; never finish a stage with an outstanding governed-tool error.",
 		"Before the coordinator assigns any task, do not call task or milestone tools at all (ansteel_publish_task_collaboration, ansteel_review_task, ansteel_submit_change, ansteel_plan_milestone, ansteel_submit_integration, ansteel_publish_integration_collaboration, ansteel_review_integration).",
 		"Project tests and builds cannot run during investigation or cross-examination: bash is read-only inspection only. Execute tests inside an assigned task via ansteel_submit_change after the coordinator assigns that task, or state that execution is not yet available.",
@@ -471,9 +540,9 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 			name: "ansteel_publish_checkpoint",
 			label: "publish work checkpoint",
 			description:
-				"Publish concise public work reasoning before a significant decision or action. This is not private chain-of-thought. id must match the CP-<UPPERCASE-ID> form (uppercase letters, digits, and hyphens only) and must be a new, unique id for this checkpoint.",
+				"Publish concise public work reasoning before a significant decision or action. This is not private chain-of-thought. id must match the CP-<UPPERCASE-ID> form (uppercase letters, digits, and hyphens only) and must be a new, unique id for this checkpoint. nextAction.kind must be exactly one of read, report, experiment, edit, write, test, commit, publish, or decision; use report for findings or task-assignment requests and reserve decision for a governed project choice.",
 			promptSnippet:
-				"Publish a structured checkpoint when understanding changes, before yellow or red work, after unexpected tool results, or before acceptance. The checkpoint must include every required field: id (CP-<UPPERCASE-ID>, unique), goal, currentUnderstanding, assumptions, evidenceRefs, uncertainties, nextAction (kind/target/expectedResult), risk (green/yellow/red), and confidence (L1/L2/L3/L4). Never omit risk or confidence.",
+				"Publish a structured checkpoint when understanding changes, before yellow or red work, after unexpected tool results, or before acceptance. The checkpoint must include every required field: id (CP-<UPPERCASE-ID>, unique), goal, currentUnderstanding, assumptions, evidenceRefs, uncertainties, nextAction (kind/target/expectedResult), risk (green/yellow/red), and confidence (L1/L2/L3/L4). nextAction.kind must be one of read, report, experiment, edit, write, test, commit, publish, or decision. A public findings update or task-assignment request is report; a governed project choice is decision. Never omit risk or confidence.",
 			parameters: Type.Object({
 				id: Type.String(),
 				taskId: Type.Optional(Type.String()),
@@ -485,6 +554,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 				nextAction: Type.Object({
 					kind: Type.Union([
 						Type.Literal("read"),
+						Type.Literal("report"),
 						Type.Literal("experiment"),
 						Type.Literal("edit"),
 						Type.Literal("write"),
@@ -525,6 +595,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 				action: Type.Object({
 					kind: Type.Union([
 						Type.Literal("read"),
+						Type.Literal("report"),
 						Type.Literal("experiment"),
 						Type.Literal("edit"),
 						Type.Literal("write"),
@@ -968,27 +1039,78 @@ async function createDefaultRoleSession(
 		tools: [...(roleConfig.teamTools ?? ANSTEEL_TEAM_TOOLS), ...ANSTEEL_TEAM_TASK_TOOL_NAMES],
 		customTools: [...mutationTools.tools, ...createTeamTaskTools(options.taskOperations)],
 	});
+	// AgentSession 独占重试决策，并且只在已经调度下一次真实 provider 尝试时发出通知。
+	// 运行审计仅保存 attempt/maxAttempts/delay；原始错误文本始终留在审计边界之外。
+	const unsubscribeRuntimeAudit = created.session.subscribe((event) => {
+		if (event.type !== "auto_retry_start") return;
+		options.recordProviderRetry?.({
+			attempt: event.attempt,
+			maxAttempts: event.maxAttempts,
+			delayMs: event.delayMs,
+		});
+	});
 	const previousBeforeToolCall = created.session.agent.beforeToolCall;
 	let readOnlyToolCallsThisStage = 0;
-	const consumeReadOnlyToolBudget = (): { block: true; reason: string } | undefined => {
+	const denyToolCall = (
+		toolName: string,
+		toolCallId: string,
+		reason: string,
+		denialBoundary: Parameters<
+			NonNullable<CreateAnsteelTeamRoleSessionOptions["recordAccessDenied"]>
+		>[0]["denialBoundary"],
+	) => {
+		options.recordAccessDenied?.({ toolName, toolCallId, denialBoundary });
+		return { block: true as const, reason };
+	};
+	const consumeReadOnlyToolBudget = (
+		toolName: string,
+		toolCallId: string,
+	): { block: true; reason: string } | undefined => {
 		if (readOnlyToolCallsThisStage >= options.maxToolCallsPerStage) {
+			options.recordReadOnlyToolBudget?.({
+				kind: "exhausted",
+				toolName,
+				toolCallId,
+				used: readOnlyToolCallsThisStage,
+				limit: options.maxToolCallsPerStage,
+				remaining: 0,
+			});
 			return {
 				block: true,
 				reason: `Ansteel team read-only tool budget exhausted after ${options.maxToolCallsPerStage} calls; make a governed edit/write when authorized or return a concise public update`,
 			};
 		}
 		readOnlyToolCallsThisStage++;
+		options.recordReadOnlyToolBudget?.({
+			kind: "consumed",
+			toolName,
+			toolCallId,
+			used: readOnlyToolCallsThisStage,
+			limit: options.maxToolCallsPerStage,
+			remaining: options.maxToolCallsPerStage - readOnlyToolCallsThisStage,
+		});
 		return undefined;
 	};
 	created.session.agent.toolExecution = "sequential";
 	created.session.agent.beforeToolCall = async (context, signal) => {
 		const previousResult = await previousBeforeToolCall?.(context, signal);
-		if (previousResult?.block) return previousResult;
+		if (previousResult?.block) {
+			return denyToolCall(
+				context.toolCall.name,
+				context.toolCall.id,
+				previousResult.reason ?? "Tool execution was blocked",
+				"extension-policy",
+			);
+		}
 		const evidenceBlockReason = getAnsteelTeamEvidenceBlockReason(options.cwd, context.toolCall.name, context.args);
-		if (evidenceBlockReason !== undefined) return { block: true, reason: evidenceBlockReason };
+		if (evidenceBlockReason !== undefined) {
+			return denyToolCall(context.toolCall.name, context.toolCall.id, evidenceBlockReason, "evidence-boundary");
+		}
 		if (context.toolCall.name === "bash") {
 			const reason = getReadOnlyBashBlockReason(context.args);
-			if (reason !== undefined) return { block: true, reason };
+			if (reason !== undefined) {
+				return denyToolCall(context.toolCall.name, context.toolCall.id, reason, "read-only-command-policy");
+			}
 		}
 		if (
 			context.toolCall.name === "edit" ||
@@ -1001,26 +1123,56 @@ async function createDefaultRoleSession(
 		) {
 			const assessment = await options.taskOperations.assessAction(context.toolCall.name, context.args);
 			if (assessment.blockReason !== undefined) {
-				return { block: true, reason: assessment.blockReason };
+				return denyToolCall(
+					context.toolCall.name,
+					context.toolCall.id,
+					assessment.blockReason,
+					"action-authorization",
+				);
 			}
 			if (context.toolCall.name === "edit" || context.toolCall.name === "write") {
 				if (!isRecord(context.args) || typeof context.args.path !== "string") {
-					return { block: true, reason: "Ansteel team file mutation requires a verifiable path" };
+					return denyToolCall(
+						context.toolCall.name,
+						context.toolCall.id,
+						"Ansteel team file mutation requires a verifiable path",
+						"mutation-path",
+					);
 				}
-				const absolutePath = resolveAnsteelTeamWritePath(options.cwd, context.args.path);
+				let absolutePath: string;
+				try {
+					absolutePath = resolveAnsteelTeamWritePath(options.cwd, context.args.path);
+				} catch (error) {
+					options.recordAccessDenied?.({
+						toolName: context.toolCall.name,
+						toolCallId: context.toolCall.id,
+						denialBoundary: "mutation-path",
+					});
+					throw error;
+				}
 				const identity = getAnsteelTeamActionFileIdentity(assessment.action.version);
 				if (identity === undefined) {
-					return {
-						block: true,
-						reason:
-							"Ansteel team governed mutation requires an existing regular file identity from the approved checkpoint; atomic new-file creation is unavailable",
-					};
+					return denyToolCall(
+						context.toolCall.name,
+						context.toolCall.id,
+						"Ansteel team governed mutation requires an existing regular file identity from the approved checkpoint; atomic new-file creation is unavailable",
+						"mutation-identity",
+					);
 				}
-				mutationTools.authorize(absolutePath, identity);
+				try {
+					mutationTools.authorize(absolutePath, identity);
+				} catch (error) {
+					options.recordAccessDenied?.({
+						toolName: context.toolCall.name,
+						toolCallId: context.toolCall.id,
+						denialBoundary: "mutation-identity",
+					});
+					throw error;
+				}
 				context.args.path = absolutePath;
 				return undefined;
 			}
-			return consumeReadOnlyToolBudget();
+			return consumeReadOnlyToolBudget(context.toolCall.name, context.toolCall.id);
 		}
 		return undefined;
 	};
@@ -1029,6 +1181,12 @@ async function createDefaultRoleSession(
 			readOnlyToolCallsThisStage = 0;
 			created.session.sessionManager.resetLeaf();
 			created.session.agent.state.messages = [];
+			options.recordReadOnlyToolBudget?.({
+				kind: "reserved",
+				used: 0,
+				limit: options.maxToolCallsPerStage,
+				remaining: options.maxToolCallsPerStage,
+			});
 		},
 		prompt: (text) => created.session.prompt(text),
 		subscribeToAssistantMessageEnd: (listener) =>
@@ -1037,7 +1195,10 @@ async function createDefaultRoleSession(
 			}),
 		subscribeToAgentEvent: (listener) => created.session.subscribe((event) => listener(event)),
 		abort: () => created.session.abort(),
-		dispose: () => created.session.dispose(),
+		dispose: () => {
+			unsubscribeRuntimeAudit();
+			return created.session.dispose();
+		},
 	});
 	return {
 		prompt: rawTurnSession.prompt,
@@ -1160,12 +1321,48 @@ function buildActionReviewPrompt(checkpoint: AnsteelWorkCheckpoint): string {
 	return [
 		"You are an independent peer reviewer for one immutable governed action binding.",
 		"Do not rely on another reviewer's response. Inspect the current project with read-only tools when needed.",
+		"This is pre-action authorization: the expected result is not supposed to exist yet. Review whether the proposed action is correctly scoped, evidence-backed, reversible or testable, and acceptable at its declared risk. Do not reject solely because the action has not already changed the target.",
 		"Call ansteel_review_action exactly once with this exact binding. If you identify a blocking or critical concern, first call ansteel_raise_process_issue against this checkpoint, then reject the action.",
 		"Immutable binding:",
 		"```json",
 		JSON.stringify(binding),
 		"```",
 		"Public prose cannot approve, reject, or execute the action.",
+	].join("\n\n");
+}
+
+function buildProcessResolutionReviewPrompt(issue: AnsteelProcessIssue, resolution: AnsteelProcessResolution): string {
+	const immutableReview = {
+		issue: {
+			id: issue.id,
+			targetCheckpointId: issue.targetCheckpointId,
+			author: issue.author,
+			targetRole: issue.targetRole,
+			severity: issue.severity,
+			claim: issue.claim,
+			evidenceRefs: issue.evidenceRefs,
+			suggestedCorrection: issue.suggestedCorrection,
+		},
+		resolution: {
+			id: resolution.id,
+			issueId: resolution.issueId,
+			actor: resolution.actor,
+			outcome: resolution.outcome,
+			summary: resolution.summary,
+			evidenceRefs: resolution.evidenceRefs,
+			replacementCheckpointId: resolution.replacementCheckpointId,
+			experiment: resolution.experiment,
+		},
+	};
+	return [
+		`You are the original author of process issue ${issue.id}. Review its latest immutable resolution proposal independently.`,
+		"This process-resolution review has priority over action review, task collaboration, and final verification. Inspect project evidence with read-only tools when needed; do not edit files and do not review another action or task in this stage.",
+		`Call ansteel_review_process_resolution exactly once for issueId ${issue.id}. Accept only if the proposal resolves or refutes the recorded claim with adequate evidence; otherwise reject it with a precise reason so the issue reopens.`,
+		"Immutable issue and resolution:",
+		"```json",
+		JSON.stringify(immutableReview),
+		"```",
+		"Public prose cannot close the issue; only the structured review tool can change its status.",
 	].join("\n\n");
 }
 
@@ -1212,10 +1409,66 @@ function buildRolePrompt(
 		.join("\n\n");
 }
 
-function buildTaskOwnerPrompt(task: AnsteelTeamTask, epoch: number, maxToolCallsPerStage: number): string {
+function buildTaskOwnerPrompt(
+	state: AnsteelTeamState,
+	task: AnsteelTeamTask,
+	epoch: number,
+	maxToolCallsPerStage: number,
+): string {
 	const latestIssues = task.reviews
 		.filter((review) => review.revision === task.revision && review.verdict === "reject")
 		.map((review) => `- ${review.reviewer}: ${review.issue ?? "Rejection did not include an issue."}`);
+	const taskCheckpointIds = new Set(
+		state.workCheckpoints.filter((checkpoint) => checkpoint.taskId === task.id).map((checkpoint) => checkpoint.id),
+	);
+	const processIssueLines = state.processIssues
+		.filter((issue) => taskCheckpointIds.has(issue.targetCheckpointId) && issue.status !== "closed")
+		.map((issue) => {
+			const latestResolution = issue.resolutions.at(-1);
+			return `- ${issue.id} [${issue.status}/${issue.severity}] against ${issue.targetCheckpointId}: ${issue.claim}. Suggested correction: ${issue.suggestedCorrection}. Latest resolution: ${
+				latestResolution === undefined ? "none" : `${latestResolution.id} (${latestResolution.outcome})`
+			}`;
+		});
+	const approvedActionLines = state.workCheckpoints
+		.filter((checkpoint) => {
+			const action = checkpoint.governedAction;
+			if (
+				checkpoint.taskId !== task.id ||
+				checkpoint.actor !== task.owner ||
+				checkpoint.status !== "active" ||
+				action === null ||
+				action.effectiveRisk === "green" ||
+				!action.version.startsWith(`${task.id}@${task.revision};`)
+			) {
+				return false;
+			}
+			const reviews = state.actionReviews.filter(
+				(review) =>
+					review.checkpointId === checkpoint.id &&
+					review.action.kind === action.kind &&
+					review.action.target === action.target &&
+					review.action.version === action.version,
+			);
+			if (reviews.some((review) => review.verdict === "reject")) return false;
+			if (
+				state.processIssues.some(
+					(issue) =>
+						issue.targetCheckpointId === checkpoint.id &&
+						issue.status !== "closed" &&
+						(issue.severity === "blocking" || issue.severity === "critical"),
+				)
+			) {
+				return false;
+			}
+			return ANSTEEL_ROLES.filter((role) => role !== checkpoint.actor).every((reviewer) =>
+				reviews.some((review) => review.reviewer === reviewer && review.verdict === "approve"),
+			);
+		})
+		.slice(-3)
+		.map((checkpoint) => {
+			const action = checkpoint.governedAction!;
+			return `- ${checkpoint.id}: ${action.kind} ${action.target} @ ${action.version}`;
+		});
 	return [
 		`Execute governed task ${task.id}. This is owner epoch ${epoch}.`,
 		`Owner: ${task.owner}`,
@@ -1228,7 +1481,14 @@ function buildTaskOwnerPrompt(task: AnsteelTeamTask, epoch: number, maxToolCalls
 		`Description: ${task.description}`,
 		`Acceptance criteria: ${task.acceptanceCriteria}`,
 		latestIssues.length === 0 ? "Current review issues: none" : `Current review issues:\n${latestIssues.join("\n")}`,
+		processIssueLines.length === 0
+			? "Current task-bound process issues: none"
+			: `Current task-bound process issues:\n${processIssueLines.join("\n")}\nBefore publishing another replacement or retry checkpoint, call ansteel_resolve_process_issue for every open issue you own. A resolution-proposed issue already awaits its original author's coordinator-scheduled review; do not duplicate that proposal.`,
+		approvedActionLines.length === 0
+			? "Fully peer-approved task actions available for execution: none"
+			: `Fully peer-approved task actions available for execution:\n${approvedActionLines.join("\n")}\nThese exact bindings already satisfy the checkpoint-before-action rule. Execute the applicable approved action before publishing any new checkpoint for the same kind/target/version. A renamed or duplicate checkpoint has no inherited approvals and will be blocked again.`,
 		`Read-only tool budget: ${maxToolCallsPerStage} calls for this isolated epoch. Use exact known paths and batch independent reads; do not repeat directory scans or reread unchanged files.`,
+		`Every ansteel_publish_checkpoint call made while executing this assigned task must include taskId exactly ${task.id}. A checkpoint without that taskId is public context only and cannot govern this task's action.`,
 		"After bounded inspection, use edit/write on the governed files to leave a syntactically valid implementation checkpoint before doing more research. A later epoch can continue from that real Git diff.",
 		"Call ansteel_submit_change with a real supported test command when the acceptance criteria are satisfied.",
 		"Public prose alone is not task progress. Return a concise public update after making the governed state change, or report the concrete tool error that blocked it.",
@@ -1442,9 +1702,40 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 	const activeTeams = new Map<string, ActiveAnsteelTeam>();
 	const activeObservations = new Map<string, ActiveAnsteelObservation>();
 
-	const getPersistenceContext = (cwd: string): AnsteelTeamPersistenceContext | undefined => {
+	const getPersistenceContext = (
+		cwd: string,
+		parentSpan?: AnsteelRuntimeSpan,
+		toolCallId?: string,
+	): AnsteelTeamPersistenceContext | undefined => {
 		const observation = activeObservations.get(cwd);
-		return observation === undefined ? undefined : { logger: observation.logger };
+		return observation === undefined
+			? undefined
+			: {
+					logger: observation.logger,
+					parentSpan: parentSpan ?? observation.root,
+					...(toolCallId === undefined ? {} : { toolCallId }),
+				};
+	};
+
+	const persistRoleStatus = (
+		cwd: string,
+		state: AnsteelTeamState,
+		role: AnsteelRole,
+		status: AnsteelTeamState["roles"][AnsteelRole]["status"],
+		guard: string,
+	): void => {
+		transitionAnsteelTeamRoleStatus(state, role, status, guard);
+		saveAnsteelTeamState(cwd, state, getPersistenceContext(cwd));
+	};
+
+	const persistTeamStatus = (
+		cwd: string,
+		state: AnsteelTeamState,
+		status: AnsteelTeamState["status"],
+		guard: string,
+	): void => {
+		transitionAnsteelTeamStatus(state, status, guard);
+		saveAnsteelTeamState(cwd, state, getPersistenceContext(cwd));
 	};
 
 	const runObservedCommand = async <T>(
@@ -1452,15 +1743,25 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		teamId: string,
 		command: string,
 		action: (logger: AnsteelRuntimeLogger, root: AnsteelRuntimeSpan) => Promise<T>,
+		options: { resume?: boolean; taskId?: string; allowUnindexedDiagnosticWrites?: boolean } = {},
 	): Promise<T> => {
 		if (activeObservations.has(cwd)) {
 			throw new Error("Ansteel team already has an observed command running for this project");
 		}
-		const context = createAnsteelRunContext({ teamId, command });
-		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const context = options.resume
+			? createAnsteelResumedRunContext(cwd, {
+					teamId,
+					command,
+					...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+				})
+			: createAnsteelRunContext({ teamId, command });
+		const logger = createAnsteelRuntimeLogger(cwd, context, {
+			auditRunLease: true,
+			allowUnindexedDiagnosticWrites: options.allowUnindexedDiagnosticWrites,
+		});
 		let root: AnsteelRuntimeSpan;
 		try {
-			root = logger.startSpan("run.started", {
+			root = logger.startSpan("run", {
 				role: "coordinator",
 				message: `Ansteel team command started: ${command}`,
 				data: { command },
@@ -1469,7 +1770,12 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			logger.close();
 			throw error;
 		}
-		const observation: ActiveAnsteelObservation = { logger, root };
+		const observation: ActiveAnsteelObservation = {
+			logger,
+			root,
+			activeRoleSpans: new Map(),
+			activeProviderRequests: new Map(),
+		};
 		activeObservations.set(cwd, observation);
 		try {
 			const result = await action(logger, root);
@@ -1522,12 +1828,92 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			...fields,
 			message: `${role} session stage started`,
 		});
-		const providerSpan = observation.logger.startSpan("provider.request", {
-			role,
-			parent: roleSpan,
-			...fields,
-			message: `${role} provider request started`,
-		});
+		observation.activeRoleSpans.set(role, roleSpan);
+		const modelReference = activeTeams.get(cwd)?.state.roles[role].model;
+		const modelIdentity = modelReference === undefined ? undefined : parseModelReference(modelReference);
+		let providerRequestRound = 0;
+		const promptProvider = async (requestPrompt: string, timeoutMs: number): Promise<string> => {
+			providerRequestRound++;
+			const providerRequestId = `PROVIDER-${randomUUID()}`;
+			const requestStartedAt = Date.now();
+			const providerData = {
+				requestRound: providerRequestRound,
+				// 一次机械治理修复属于新的 request round；AgentSession retry 通知只累计当前
+				// request round 内部实际发生的自动重试，二者不能混为同一计数。
+				retryCount: 0,
+				timeoutStage: "role-stage",
+				timeoutMs,
+				configurationIdentity: modelReference ?? "unavailable",
+				provider: modelIdentity?.provider ?? "unavailable",
+				model: modelIdentity?.modelId ?? "unavailable",
+			};
+			const providerSpan = observation.logger.startSpan("provider.request", {
+				role,
+				parent: roleSpan,
+				providerRequestId,
+				...fields,
+				message: `${role} provider request ${providerRequestRound} started`,
+				data: providerData,
+			});
+			const activeProviderRequest = { span: providerSpan, providerRequestId, retryCount: 0 };
+			observation.activeProviderRequests.set(role, activeProviderRequest);
+			try {
+				const response = await promptAnsteelTeamRole(session, requestPrompt, timeoutMs);
+				if (response.trim().length === 0) {
+					throw new AnsteelObservabilityError(
+						"provider-empty-public-output",
+						"Ansteel role stage failed: empty-public-update",
+					);
+				}
+				providerSpan.end({
+					outcome: "succeeded",
+					message: `${role} provider request ${providerRequestRound} completed`,
+					data: {
+						...providerData,
+						retryCount: activeProviderRequest.retryCount,
+						durationMs: Date.now() - requestStartedAt,
+						firstTokenLatencyMs: null,
+						inputTokens: null,
+						outputTokens: null,
+						tokenCountsAvailable: false,
+						outputLength: response.length,
+						publicOutputEmpty: false,
+						httpStatus: null,
+						sdkErrorCategory: null,
+					},
+				});
+				return response;
+			} catch (error) {
+				const reasonCode = classifyAnsteelRuntimeError(error);
+				const message = formatAnsteelPublicError(error);
+				providerSpan.end({
+					outcome: "failed",
+					reasonCode,
+					message,
+					data: {
+						...providerData,
+						retryCount: activeProviderRequest.retryCount,
+						durationMs: Date.now() - requestStartedAt,
+						firstTokenLatencyMs: null,
+						inputTokens: null,
+						outputTokens: null,
+						tokenCountsAvailable: false,
+						publicOutputEmpty: reasonCode === "provider-empty-public-output",
+						httpStatus: null,
+						sdkErrorCategory: reasonCode,
+					},
+					artifacts:
+						error instanceof Error && error.stack
+							? [{ kind: "exception-stack", content: error.stack }]
+							: undefined,
+				});
+				throw error;
+			} finally {
+				if (observation.activeProviderRequests.get(role) === activeProviderRequest) {
+					observation.activeProviderRequests.delete(role);
+				}
+			}
+		};
 		const getFailClosedAuditStatus = (
 			emptyIsFailure = false,
 		):
@@ -1575,7 +1961,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		};
 		let repairState: { toolName: string } | undefined;
 		try {
-			let response = await promptAnsteelTeamRole(session, prompt, stageTimeoutMs);
+			let response = await promptProvider(prompt, stageTimeoutMs);
 			let failedStatus = getFailClosedAuditStatus();
 			// Mechanical repair turn: when the model ends a stage with a failed governed
 			// tool call, force one bounded corrective prompt instead of accepting the
@@ -1583,8 +1969,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			if (failedStatus.kind === "last-error") {
 				const originalFailedTool = failedStatus.toolName;
 				repairState = { toolName: originalFailedTool };
-				response = await promptAnsteelTeamRole(
-					session,
+				response = await promptProvider(
 					`A governed tool call (${originalFailedTool}) in your stage failed and was not successfully retried. Correct the tool input and retry it now before producing your final response.`,
 					Math.min(stageTimeoutMs, ANSTEEL_TEAM_REPAIR_TURN_TIMEOUT_MS),
 				);
@@ -1596,16 +1981,16 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				}
 			}
 			if (failedStatus.kind !== "ok") throw failClosedError(failedStatus);
-			if (response.trim().length === 0) {
-				throw new AnsteelObservabilityError(
-					"provider-empty-public-output",
-					"Ansteel role stage failed: empty-public-update",
-				);
-			}
-			providerSpan.end({
-				outcome: "succeeded",
-				message: `${role} provider request completed`,
-				data: { outputLength: response.length },
+			observation.logger.write({
+				level: "info",
+				eventName: "role.session.output",
+				outcome: "progress",
+				role,
+				spanId: roleSpan.spanId,
+				...(roleSpan.parentSpanId === undefined ? {} : { parentSpanId: roleSpan.parentSpanId }),
+				...fields,
+				message: `${role} session produced a public output`,
+				data: { outputLength: response.length, publicOutputEmpty: false },
 			});
 			roleSpan.end({
 				outcome: "succeeded",
@@ -1629,13 +2014,31 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			}
 			const reasonCode = classifyAnsteelRuntimeError(propagatedError);
 			const message = formatAnsteelPublicError(propagatedError);
-			const artifacts =
-				propagatedError instanceof Error && propagatedError.stack
-					? [{ kind: "exception-stack", content: propagatedError.stack }]
-					: undefined;
-			providerSpan.end({ outcome: "failed", reasonCode, message, data: {}, artifacts });
+			const truncation = session
+				.getLastStageAudit?.()
+				?.events.find((event) => event.type === "assistant-message-end" && event.stopReason === "length");
+			if (truncation !== undefined) {
+				observation.logger.write({
+					level: "warn",
+					eventName: "role.session.truncated",
+					outcome: "failed",
+					reasonCode: "budget-exhausted",
+					role,
+					spanId: roleSpan.spanId,
+					...(roleSpan.parentSpanId === undefined ? {} : { parentSpanId: roleSpan.parentSpanId }),
+					...fields,
+					message: `${role} session output reached the provider length boundary`,
+					data: {
+						truncationBoundary: "provider-output",
+						stopReason: "length",
+						...(truncation.elapsedMs === undefined ? {} : { elapsedMs: truncation.elapsedMs }),
+					},
+				});
+			}
 			roleSpan.end({ outcome: "failed", reasonCode, message, data: {} });
 			throw propagatedError;
+		} finally {
+			if (observation.activeRoleSpans.get(role) === roleSpan) observation.activeRoleSpans.delete(role);
 		}
 	};
 
@@ -1651,7 +2054,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			parent?: AnsteelRuntimeSpan;
 			data?: Record<string, unknown>;
 		},
-		action: () => T | Promise<T>,
+		action: (span?: AnsteelRuntimeSpan) => T | Promise<T>,
 	): Promise<T> => {
 		const observation = activeObservations.get(cwd);
 		if (!observation) return await action();
@@ -1666,7 +2069,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			data: fields.data ?? {},
 		});
 		try {
-			const result = await action();
+			const result = await action(span);
 			span.end({ outcome: "succeeded", message: `${eventName} completed`, data: fields.data ?? {} });
 			return result;
 		} catch (error) {
@@ -1794,8 +2197,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				reviewers.map(async (reviewer) => {
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
-					activeTeam.state.roles[reviewer].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "working", "task-review-session-started");
 					try {
 						const response = await promptObservedRole(
 							ctx.cwd,
@@ -1805,8 +2207,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							activeTeam.stageTimeoutMs,
 							{ taskId: task.id },
 						);
-						activeTeam.state.roles[reviewer].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "idle", "task-review-session-completed");
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -1819,8 +2220,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						);
 						emitTimelineMessage(pi, `## ${reviewer} task review [${event.sequence}]\n\n${event.content}`);
 					} catch (error) {
-						activeTeam.state.roles[reviewer].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "failed", "task-review-session-failed");
 						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
@@ -1856,8 +2256,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				collaborators.map(async (collaborator) => {
 					const session = activeTeam.sessions.get(collaborator);
 					if (!session) throw new Error(`Ansteel team ${collaborator} session is not active`);
-					activeTeam.state.roles[collaborator].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(
+						ctx.cwd,
+						activeTeam.state,
+						collaborator,
+						"working",
+						"task-collaboration-session-started",
+					);
 					try {
 						const response = await promptObservedRole(
 							ctx.cwd,
@@ -1867,8 +2272,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							activeTeam.stageTimeoutMs,
 							{ taskId: task.id },
 						);
-						activeTeam.state.roles[collaborator].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(
+							ctx.cwd,
+							activeTeam.state,
+							collaborator,
+							"idle",
+							"task-collaboration-session-completed",
+						);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -1880,8 +2290,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							`## ${collaborator} task collaboration [${event.sequence}]\n\n${event.content}`,
 						);
 					} catch (error) {
-						activeTeam.state.roles[collaborator].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(
+							ctx.cwd,
+							activeTeam.state,
+							collaborator,
+							"failed",
+							"task-collaboration-session-failed",
+						);
 						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
@@ -1903,16 +2318,34 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			ctx: ExtensionCommandContext,
 			task: AnsteelTeamTask,
 		): Promise<void> => {
-			const checkpoint = [...activeTeam.state.workCheckpoints]
-				.reverse()
-				.find(
-					(item) =>
-						item.taskId === task.id &&
-						item.actor === task.owner &&
-						item.status === "active" &&
-						item.governedAction !== null &&
-						(item.governedAction.effectiveRisk === "yellow" || item.governedAction.effectiveRisk === "red"),
+			const candidates = [...activeTeam.state.workCheckpoints].reverse().filter((item) => {
+				const action = item.governedAction;
+				if (
+					item.taskId !== task.id ||
+					item.actor !== task.owner ||
+					item.status !== "active" ||
+					action === null ||
+					(action.effectiveRisk !== "yellow" && action.effectiveRisk !== "red") ||
+					!action.version.startsWith(`${task.id}@${task.revision};`)
+				) {
+					return false;
+				}
+				const reviews = activeTeam.state.actionReviews.filter(
+					(review) =>
+						review.checkpointId === item.id &&
+						review.action.kind === action.kind &&
+						review.action.target === action.target &&
+						review.action.version === action.version,
 				);
+				if (reviews.some((review) => review.verdict === "reject")) return false;
+				const requiredReviewers = ANSTEEL_ROLES.filter((role) => role !== item.actor);
+				return !requiredReviewers.every((reviewer) =>
+					reviews.some((review) => review.reviewer === reviewer && review.verdict === "approve"),
+				);
+			});
+			// 保守模型可能把报错后的公共报告标成 yellow；该报告不能替换真正触发执行门禁、
+			// 仍需同伴授权的 edit/test/publish 动作，否则会错误解除高风险动作约束。
+			const checkpoint = candidates.find((item) => item.governedAction?.kind !== "report") ?? candidates[0];
 			if (!checkpoint?.governedAction) return;
 
 			const existingReviews = activeTeam.state.actionReviews.filter(
@@ -1922,7 +2355,6 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					review.action.target === checkpoint.governedAction!.target &&
 					review.action.version === checkpoint.governedAction!.version,
 			);
-			if (existingReviews.some((review) => review.verdict === "reject")) return;
 			const reviewers = ANSTEEL_ROLES.filter(
 				(role) => role !== task.owner && !existingReviews.some((review) => review.reviewer === role),
 			);
@@ -1933,8 +2365,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				reviewers.map(async (reviewer) => {
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
-					activeTeam.state.roles[reviewer].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "working", "action-review-session-started");
 					try {
 						const response = await promptObservedRole(
 							ctx.cwd,
@@ -1944,8 +2375,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							activeTeam.stageTimeoutMs,
 							{ taskId: task.id, checkpointId: checkpoint.id },
 						);
-						activeTeam.state.roles[reviewer].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "idle", "action-review-session-completed");
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -1954,8 +2384,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						);
 						emitTimelineMessage(pi, `## ${reviewer} action review [${event.sequence}]\n\n${event.content}`);
 					} catch (error) {
-						activeTeam.state.roles[reviewer].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "failed", "action-review-session-failed");
 						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
@@ -1966,6 +2395,93 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						emitTimelineMessage(pi, `## ${reviewer} action review failure [${event.sequence}]\n\n${content}`);
 					}
 				}),
+			);
+		};
+
+		/**
+		 * 在审查更新动作或交付阶段前，把每个任务相关 resolution proposal 发回原 issue 作者。
+		 * 评审必须串行：同一角色可能拥有多个 issue，而持久角色会话不能安全并发处理多个 prompt。
+		 */
+		const requestPendingProcessResolutionReviews = async (
+			activeTeam: ActiveAnsteelTeam,
+			ctx: ExtensionCommandContext,
+			task: AnsteelTeamTask,
+		): Promise<boolean> => {
+			const taskCheckpointIds = new Set(
+				activeTeam.state.workCheckpoints
+					.filter((checkpoint) => checkpoint.taskId === task.id)
+					.map((checkpoint) => checkpoint.id),
+			);
+			const pendingIssues = activeTeam.state.processIssues.filter(
+				(issue) => issue.status === "resolution-proposed" && taskCheckpointIds.has(issue.targetCheckpointId),
+			);
+			for (const pendingIssue of pendingIssues) {
+				const issue = activeTeam.state.processIssues.find((item) => item.id === pendingIssue.id);
+				if (!issue || issue.status !== "resolution-proposed") continue;
+				const resolution = [...issue.resolutions].reverse().find((item) => item.review === undefined);
+				if (!resolution) {
+					throw new Error(`Ansteel team process issue ${issue.id} has no unreviewed resolution proposal`);
+				}
+				const reviewer = issue.author;
+				const session = activeTeam.sessions.get(reviewer);
+				if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
+				persistRoleStatus(
+					ctx.cwd,
+					activeTeam.state,
+					reviewer,
+					"working",
+					"process-resolution-review-session-started",
+				);
+				try {
+					const response = await promptObservedRole(
+						ctx.cwd,
+						reviewer,
+						session,
+						buildProcessResolutionReviewPrompt(issue, resolution),
+						activeTeam.stageTimeoutMs,
+						{ taskId: task.id, checkpointId: issue.targetCheckpointId },
+					);
+					persistRoleStatus(
+						ctx.cwd,
+						activeTeam.state,
+						reviewer,
+						"idle",
+						"process-resolution-review-session-completed",
+					);
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{ type: "role-report", role: reviewer, content: response.trim() },
+						getPersistenceContext(ctx.cwd),
+					);
+					emitTimelineMessage(
+						pi,
+						`## ${reviewer} process resolution review [${event.sequence}]\n\n${event.content}`,
+					);
+				} catch (error) {
+					persistRoleStatus(
+						ctx.cwd,
+						activeTeam.state,
+						reviewer,
+						"failed",
+						"process-resolution-review-session-failed",
+					);
+					const content = formatAnsteelPublicError(error);
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{ type: "role-failure", role: reviewer, content },
+						getPersistenceContext(ctx.cwd),
+					);
+					emitTimelineMessage(
+						pi,
+						`## ${reviewer} process resolution review failure [${event.sequence}]\n\n${content}`,
+					);
+				}
+			}
+
+			return !activeTeam.state.processIssues.some(
+				(issue) => issue.status === "resolution-proposed" && taskCheckpointIds.has(issue.targetCheckpointId),
 			);
 		};
 
@@ -1986,8 +2502,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				collaborators.map(async (collaborator) => {
 					const session = activeTeam.sessions.get(collaborator);
 					if (!session) throw new Error(`Ansteel team ${collaborator} session is not active`);
-					activeTeam.state.roles[collaborator].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(
+						ctx.cwd,
+						activeTeam.state,
+						collaborator,
+						"working",
+						"milestone-collaboration-session-started",
+					);
 					try {
 						const response = await promptObservedRole(
 							ctx.cwd,
@@ -1997,8 +2518,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							activeTeam.stageTimeoutMs,
 							{ checkpointId: milestone.id },
 						);
-						activeTeam.state.roles[collaborator].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(
+							ctx.cwd,
+							activeTeam.state,
+							collaborator,
+							"idle",
+							"milestone-collaboration-session-completed",
+						);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -2010,8 +2536,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							`## ${collaborator} integration collaboration [${event.sequence}]\n\n${event.content}`,
 						);
 					} catch (error) {
-						activeTeam.state.roles[collaborator].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(
+							ctx.cwd,
+							activeTeam.state,
+							collaborator,
+							"failed",
+							"milestone-collaboration-session-failed",
+						);
 						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
@@ -2045,8 +2576,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				reviewers.map(async (reviewer) => {
 					const session = activeTeam.sessions.get(reviewer);
 					if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
-					activeTeam.state.roles[reviewer].status = "working";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "working", "milestone-review-session-started");
 					try {
 						const response = await promptObservedRole(
 							ctx.cwd,
@@ -2056,8 +2586,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							activeTeam.stageTimeoutMs,
 							{ checkpointId: milestone.id },
 						);
-						activeTeam.state.roles[reviewer].status = "idle";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "idle", "milestone-review-session-completed");
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -2070,8 +2599,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						);
 						emitTimelineMessage(pi, `## ${reviewer} integration review [${event.sequence}]\n\n${event.content}`);
 					} catch (error) {
-						activeTeam.state.roles[reviewer].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(ctx.cwd, activeTeam.state, reviewer, "failed", "milestone-review-session-failed");
 						const content = formatAnsteelPublicError(error);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
@@ -2097,6 +2625,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			ctx: ExtensionCommandContext,
 			task: AnsteelTeamTask,
 		): Promise<void> => {
+			if (!(await requestPendingProcessResolutionReviews(activeTeam, ctx, task))) return;
 			if (task.status === "submitted") {
 				const submission = task.submissions.at(-1);
 				if (!submission || submission.revision !== task.revision) {
@@ -2506,21 +3035,31 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			},
 			submitTask: async (taskId, testCommand) => {
 				return await runObservedOperation(ctx.cwd, "task.submit", { role, taskId }, async () => {
+					const toolCallId = `task-test:${taskId}:${Date.now()}`;
 					const test = await runObservedOperation(
 						ctx.cwd,
 						"tool.call",
 						{
 							role,
 							taskId,
-							toolCallId: `task-test:${taskId}:${Date.now()}`,
+							toolCallId,
 							data: { command: testCommand },
 						},
-						() => {
-							const evidence = runAnsteelTeamTaskTest(ctx.cwd, activeTeam.state, role, taskId, testCommand);
+						async (toolSpan) => {
+							const evidence = await runAnsteelTeamTaskTest(
+								ctx.cwd,
+								activeTeam.state,
+								role,
+								taskId,
+								testCommand,
+								getPersistenceContext(ctx.cwd, toolSpan, toolCallId),
+							);
 							if (evidence.isError) {
 								const reasonCode = /timed?\s*out|timeout/i.test(evidence.output)
 									? "tool-timeout"
-									: "tool-exit-nonzero";
+									: /output exceeded the governed collection boundary/i.test(evidence.output)
+										? "budget-exhausted"
+										: "tool-exit-nonzero";
 								throw new AnsteelObservabilityError(
 									reasonCode,
 									`Ansteel team task ${taskId} test command failed: ${testCommand}`,
@@ -2613,27 +3152,31 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					"milestone.submit",
 					{ role, checkpointId: milestoneId },
 					async () => {
+						const toolCallId = `milestone-test:${milestoneId}:${Date.now()}`;
 						const test = await runObservedOperation(
 							ctx.cwd,
 							"tool.call",
 							{
 								role,
 								checkpointId: milestoneId,
-								toolCallId: `milestone-test:${milestoneId}:${Date.now()}`,
+								toolCallId,
 								data: { command: testCommand },
 							},
-							() => {
-								const evidence = runAnsteelTeamMilestoneTest(
+							async (toolSpan) => {
+								const evidence = await runAnsteelTeamMilestoneTest(
 									ctx.cwd,
 									activeTeam.state,
 									role,
 									milestoneId,
 									testCommand,
+									getPersistenceContext(ctx.cwd, toolSpan, toolCallId),
 								);
 								if (evidence.isError) {
 									const reasonCode = /timed?\s*out|timeout/i.test(evidence.output)
 										? "tool-timeout"
-										: "tool-exit-nonzero";
+										: /output exceeded the governed collection boundary/i.test(evidence.output)
+											? "budget-exhausted"
+											: "tool-exit-nonzero";
 									throw new AnsteelObservabilityError(
 										reasonCode,
 										`Ansteel team milestone ${milestoneId} integration command failed: ${testCommand}`,
@@ -2762,20 +3305,23 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				const session = activeTeam.sessions.get(task.owner);
 				if (!session) throw new Error(`Ansteel team ${task.owner} session is not active`);
 				const beforeDelivery = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+				const beforeActionApprovals = getAnsteelTeamTaskActionApprovalFingerprint(
+					ctx.cwd,
+					activeTeam.state,
+					task.id,
+				);
 				const beforeCollaboration = getAnsteelTeamTaskCollaborationFingerprint(ctx.cwd, activeTeam.state, task.id);
-				activeTeam.state.roles[task.owner].status = "working";
-				saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+				persistRoleStatus(ctx.cwd, activeTeam.state, task.owner, "working", "task-owner-session-started");
 				try {
 					const response = await promptObservedRole(
 						ctx.cwd,
 						task.owner,
 						session,
-						buildTaskOwnerPrompt(task, epoch, activeTeam.maxToolCallsPerStage),
+						buildTaskOwnerPrompt(activeTeam.state, task, epoch, activeTeam.maxToolCallsPerStage),
 						activeTeam.stageTimeoutMs,
 						{ taskId: task.id },
 					);
-					activeTeam.state.roles[task.owner].status = "idle";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, task.owner, "idle", "task-owner-session-completed");
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
 						activeTeam.state,
@@ -2788,8 +3334,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					);
 					emitTimelineMessage(pi, `## ${task.owner} task epoch ${epoch} [${event.sequence}]\n\n${event.content}`);
 				} catch (error) {
-					activeTeam.state.roles[task.owner].status = "failed";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, task.owner, "failed", "task-owner-session-failed");
 					const content = formatAnsteelPublicError(error);
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
@@ -2809,7 +3354,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 
 				task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 				if (task.status === "approved") return;
-				await requestPendingActionReviews(activeTeam, ctx, task);
+				const processResolutionsCleared = await requestPendingProcessResolutionReviews(activeTeam, ctx, task);
+				if (processResolutionsCleared) await requestPendingActionReviews(activeTeam, ctx, task);
 				task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 				if (task.status === "approved") return;
 				if (task.status === "submitted" || task.status === "final-verification") {
@@ -2819,19 +3365,25 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					if (task.status === "submitted" || task.status === "final-verification") return;
 				}
 				const afterDelivery = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+				const afterActionApprovals = getAnsteelTeamTaskActionApprovalFingerprint(
+					ctx.cwd,
+					activeTeam.state,
+					task.id,
+				);
 				const afterCollaboration = getAnsteelTeamTaskCollaborationFingerprint(ctx.cwd, activeTeam.state, task.id);
 				const progress = advanceAnsteelTeamTaskEpochProgress(
 					{ noProgressEpochs, collaborationContinuations },
 					beforeDelivery,
 					afterDelivery,
+					beforeActionApprovals,
+					afterActionApprovals,
 					beforeCollaboration,
 					afterCollaboration,
 				);
 				noProgressEpochs = progress.noProgressEpochs;
 				collaborationContinuations = progress.collaborationContinuations;
 				if (noProgressEpochs >= activeTeam.taskMaxNoProgressEpochs) {
-					activeTeam.state.roles[task.owner].status = "failed";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, task.owner, "failed", "task-owner-no-progress");
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
 						activeTeam.state,
@@ -2849,8 +3401,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 
 			const task = activeTeam.state.tasks.find((item) => item.id === taskId);
 			if (!task || task.status === "approved") return;
-			activeTeam.state.roles[task.owner].status = "failed";
-			saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+			persistRoleStatus(ctx.cwd, activeTeam.state, task.owner, "failed", "task-epoch-budget-exhausted");
 			const event = appendAnsteelTeamEvent(
 				ctx.cwd,
 				activeTeam.state,
@@ -2918,6 +3469,12 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id),
 							]),
 						);
+						const beforeActionApprovalFingerprints = new Map(
+							runnableTasks.map((task) => [
+								task.id,
+								getAnsteelTeamTaskActionApprovalFingerprint(ctx.cwd, activeTeam.state, task.id),
+							]),
+						);
 						const beforeCollaborationFingerprints = new Map(
 							runnableTasks.map((task) => [
 								task.id,
@@ -2928,19 +3485,29 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							runnableTasks.map(async (task) => {
 								const session = activeTeam.sessions.get(task.owner);
 								if (!session) throw new Error(`Ansteel team ${task.owner} session is not active`);
-								activeTeam.state.roles[task.owner].status = "working";
-								saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+								persistRoleStatus(
+									ctx.cwd,
+									activeTeam.state,
+									task.owner,
+									"working",
+									"parallel-task-owner-session-started",
+								);
 								try {
 									const response = await promptObservedRole(
 										ctx.cwd,
 										task.owner,
 										session,
-										buildTaskOwnerPrompt(task, epoch, activeTeam.maxToolCallsPerStage),
+										buildTaskOwnerPrompt(activeTeam.state, task, epoch, activeTeam.maxToolCallsPerStage),
 										activeTeam.stageTimeoutMs,
 										{ taskId: task.id },
 									);
-									activeTeam.state.roles[task.owner].status = "idle";
-									saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+									persistRoleStatus(
+										ctx.cwd,
+										activeTeam.state,
+										task.owner,
+										"idle",
+										"parallel-task-owner-session-completed",
+									);
 									const event = appendAnsteelTeamEvent(
 										ctx.cwd,
 										activeTeam.state,
@@ -2952,8 +3519,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 										`## ${task.owner} parallel task epoch ${epoch} [${event.sequence}]\n\n${event.content}`,
 									);
 								} catch (error) {
-									activeTeam.state.roles[task.owner].status = "failed";
-									saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+									persistRoleStatus(
+										ctx.cwd,
+										activeTeam.state,
+										task.owner,
+										"failed",
+										"parallel-task-owner-session-failed",
+									);
 									const content = formatAnsteelPublicError(error);
 									const event = appendAnsteelTeamEvent(
 										ctx.cwd,
@@ -2980,7 +3552,12 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						for (const taskId of runnableTasks.map((task) => task.id)) {
 							let task = activeTeam.state.tasks.find((item) => item.id === taskId);
 							if (!task || task.status === "approved") continue;
-							await requestPendingActionReviews(activeTeam, ctx, task);
+							const processResolutionsCleared = await requestPendingProcessResolutionReviews(
+								activeTeam,
+								ctx,
+								task,
+							);
+							if (processResolutionsCleared) await requestPendingActionReviews(activeTeam, ctx, task);
 							task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 							if (task.status === "submitted" || task.status === "final-verification") {
 								await advanceOutstandingTaskPostSubmission(activeTeam, ctx, task);
@@ -2992,6 +3569,11 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							}
 							if (task.status === "approved") continue;
 							const afterDelivery = getAnsteelTeamTaskProgressFingerprint(ctx.cwd, activeTeam.state, task.id);
+							const afterActionApprovals = getAnsteelTeamTaskActionApprovalFingerprint(
+								ctx.cwd,
+								activeTeam.state,
+								task.id,
+							);
 							const afterCollaboration = getAnsteelTeamTaskCollaborationFingerprint(
 								ctx.cwd,
 								activeTeam.state,
@@ -3004,6 +3586,8 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								},
 								beforeDeliveryFingerprints.get(task.id)!,
 								afterDelivery,
+								beforeActionApprovalFingerprints.get(task.id)!,
+								afterActionApprovals,
 								beforeCollaborationFingerprints.get(task.id)!,
 								afterCollaboration,
 							);
@@ -3011,8 +3595,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							collaborationContinuations.set(task.id, progress.collaborationContinuations);
 							const noProgress = progress.noProgressEpochs;
 							if (noProgress >= activeTeam.taskMaxNoProgressEpochs) {
-								activeTeam.state.roles[task.owner].status = "failed";
-								saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+								persistRoleStatus(
+									ctx.cwd,
+									activeTeam.state,
+									task.owner,
+									"failed",
+									"parallel-task-owner-no-progress",
+								);
 								const event = appendAnsteelTeamEvent(
 									ctx.cwd,
 									activeTeam.state,
@@ -3046,8 +3635,13 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						if (stoppedTaskIds.has(taskId)) continue;
 						const task = activeTeam.state.tasks.find((item) => item.id === taskId);
 						if (!task || task.status === "approved" || task.status === "submitted") continue;
-						activeTeam.state.roles[task.owner].status = "failed";
-						saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+						persistRoleStatus(
+							ctx.cwd,
+							activeTeam.state,
+							task.owner,
+							"failed",
+							"parallel-task-epoch-budget-exhausted",
+						);
 						const event = appendAnsteelTeamEvent(
 							ctx.cwd,
 							activeTeam.state,
@@ -3097,8 +3691,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			for (const role of ANSTEEL_ROLES) {
 				const session = activeTeam.sessions.get(role);
 				if (!session) throw new Error(`Ansteel team ${role} session is not active`);
-				activeTeam.state.roles[role].status = "working";
-				saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+				persistRoleStatus(ctx.cwd, activeTeam.state, role, "working", `${phase}-role-session-started`);
 				try {
 					const response = await promptObservedRole(
 						ctx.cwd,
@@ -3107,8 +3700,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						buildRolePrompt(role, work, ledger, phase),
 						activeTeam.stageTimeoutMs,
 					);
-					activeTeam.state.roles[role].status = "idle";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, role, "idle", `${phase}-role-session-completed`);
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
 						activeTeam.state,
@@ -3125,8 +3717,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						firstFailure = error;
 						hasFailure = true;
 					}
-					activeTeam.state.roles[role].status = "failed";
-					saveAnsteelTeamState(ctx.cwd, activeTeam.state, getPersistenceContext(ctx.cwd));
+					persistRoleStatus(ctx.cwd, activeTeam.state, role, "failed", `${phase}-role-session-failed`);
 					const content = formatAnsteelPublicError(error);
 					const event = appendAnsteelTeamEvent(
 						ctx.cwd,
@@ -3194,146 +3785,235 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			if (!hasSameTaskOwnerPolicy(state.taskOwners, configuredTaskOwners)) {
 				throw new Error("Persisted Ansteel team task-owner policy differs from the current configuration");
 			}
-			await runObservedCommand(ctx.cwd, state.id, `start ${topic}`, async (logger) => {
-				const orphanedRuns = listAnsteelRuntimeRuns(ctx.cwd).filter(
-					(run) =>
-						run.runId !== logger.context.runId &&
-						run.teamId === state.id &&
-						diagnoseAnsteelTeamRun(ctx.cwd, run.runId).issues.some(
-							(issue) => issue.reasonCode === "process-orphaned",
-						),
-				);
-				if (orphanedRuns.length > 0) {
-					let abandonedSpanCount = 0;
-					for (const run of orphanedRuns) {
-						const recovery = await abandonOrphanedAnsteelTeamRun(ctx.cwd, run.runId);
-						abandonedSpanCount += recovery.abandonedSpanCount;
-						if (recovery.abandonedSpanCount > 0) {
-							if (recovery.recoveredHeadHash === null) {
-								throw new AnsteelObservabilityError(
-									"event-chain-invalid",
-									`Ansteel runtime recovery for ${recovery.runId} has no recovered chain head`,
+			await runObservedCommand(
+				ctx.cwd,
+				state.id,
+				`start ${topic}`,
+				async (logger) => {
+					const orphanedRuns = listAnsteelRuntimeRuns(ctx.cwd).filter(
+						(run) =>
+							run.runId !== logger.context.runId &&
+							run.teamId === state.id &&
+							diagnoseAnsteelTeamRun(ctx.cwd, run.runId).issues.some(
+								(issue) => issue.reasonCode === "process-orphaned",
+							),
+					);
+					if (orphanedRuns.length > 0) {
+						let abandonedSpanCount = 0;
+						for (const run of orphanedRuns) {
+							const recovery = await abandonOrphanedAnsteelTeamRun(ctx.cwd, run.runId);
+							abandonedSpanCount += recovery.abandonedSpanCount;
+							if (recovery.abandonedSpanCount > 0) {
+								if (recovery.recoveredHeadHash === null) {
+									throw new AnsteelObservabilityError(
+										"event-chain-invalid",
+										`Ansteel runtime recovery for ${recovery.runId} has no recovered chain head`,
+									);
+								}
+								const recoveredAt = new Date().toISOString();
+								appendAnsteelTeamEvent(
+									ctx.cwd,
+									state,
+									{
+										schemaVersion: 2,
+										type: "runtime-recovery",
+										role: "coordinator",
+										reasonCode: "process-orphaned",
+										payload: {
+											kind: "runtime-recovery",
+											runId: recovery.runId,
+											abandonedSpanCount: recovery.abandonedSpanCount,
+											previousHeadHash: recovery.previousHeadHash,
+											recoveredHeadHash: recovery.recoveredHeadHash,
+											recoveredAt,
+										},
+										content: `Coordinator recovered ${recovery.abandonedSpanCount} orphaned runtime span(s) from ${recovery.runId}.`,
+									},
+									getPersistenceContext(ctx.cwd),
 								);
 							}
-							const recoveredAt = new Date().toISOString();
-							appendAnsteelTeamEvent(
-								ctx.cwd,
-								state,
-								{
-									schemaVersion: 2,
-									type: "runtime-recovery",
-									role: "coordinator",
-									reasonCode: "process-orphaned",
-									payload: {
-										kind: "runtime-recovery",
-										runId: recovery.runId,
-										abandonedSpanCount: recovery.abandonedSpanCount,
-										previousHeadHash: recovery.previousHeadHash,
-										recoveredHeadHash: recovery.recoveredHeadHash,
-										recoveredAt,
-									},
-									content: `Coordinator recovered ${recovery.abandonedSpanCount} orphaned runtime span(s) from ${recovery.runId}.`,
-								},
-								getPersistenceContext(ctx.cwd),
-							);
 						}
-					}
-					throw new AnsteelObservabilityError(
-						"process-orphaned",
-						`Ansteel team recovery found ${orphanedRuns.length} orphaned runtime run(s) and finalized ${abandonedSpanCount} span(s) as abandoned; retry start after reviewing the recorded failure`,
-					);
-				}
-				const recoveredRoles = ANSTEEL_ROLES.filter((role) => state.roles[role].status === "working");
-				for (const role of recoveredRoles) state.roles[role].status = "failed";
-				state.status = "active";
-				saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
-				for (const role of recoveredRoles) {
-					const event = appendAnsteelTeamEvent(
-						ctx.cwd,
-						state,
-						{
-							type: "role-failure",
-							role,
-							content:
-								"Ansteel team role was recovered from an interrupted host while its prior stage was still working.",
-						},
-						getPersistenceContext(ctx.cwd),
-					);
-					emitTimelineMessage(pi, `## ${role} recovery failure [${event.sequence}]\n\n${event.content}`);
-				}
-				const sessions = new Map<AnsteelRole, AnsteelTeamRoleSession>();
-				const activeTeam: ActiveAnsteelTeam = {
-					state,
-					sessions,
-					stageTimeoutMs,
-					maxToolCallsPerStage,
-					taskMaxEpochs,
-					taskMaxNoProgressEpochs,
-					crossRolePromptDeferralDepth: 0,
-					deferredCrossRoleReviews: [
-						...state.tasks
-							.filter((task) => task.status === "submitted")
-							.map((task) => ({ kind: "task-collaboration" as const, id: task.id, revision: task.revision })),
-						...state.tasks
-							.filter((task) => task.status === "final-verification")
-							.map((task) => ({
-								kind: "task-final-verification" as const,
-								id: task.id,
-								revision: task.revision,
-							})),
-						...state.milestones
-							.filter((milestone) => milestone.status === "submitted")
-							.map((milestone) => ({
-								kind: "milestone-collaboration" as const,
-								id: milestone.id,
-								revision: milestone.revision,
-							})),
-						...state.milestones
-							.filter((milestone) => milestone.status === "final-verification")
-							.map((milestone) => ({
-								kind: "milestone-final-verification" as const,
-								id: milestone.id,
-								revision: milestone.revision,
-							})),
-					],
-				};
-				try {
-					for (const role of ANSTEEL_ROLES) {
-						sessions.set(
-							role,
-							await (
-								createRoleSession ??
-								((options) => createDefaultRoleSession(options, ctx.modelRegistry.getRuntime()))
-							)({
-								role,
-								cwd: ctx.cwd,
-								sessionFile: state.roles[role].sessionFile,
-								resolvedRole: resolvedRoles[role],
-								allowedTaskOwners: state.taskOwners,
-								maxToolCallsPerStage,
-								taskOperations: createTaskOperations(activeTeam, ctx, role, state.taskOwners),
-							}),
+						throw new AnsteelObservabilityError(
+							"process-orphaned",
+							`Ansteel team recovery found ${orphanedRuns.length} orphaned runtime run(s) and finalized ${abandonedSpanCount} span(s) as abandoned; retry start after reviewing the recorded failure`,
 						);
 					}
-				} catch (error) {
-					await disposeSessions(sessions);
-					state.status = "stopped";
+					const recoveredRoles = ANSTEEL_ROLES.filter((role) => state.roles[role].status === "working");
+					for (const role of recoveredRoles) {
+						transitionAnsteelTeamRoleStatus(state, role, "failed", "interrupted-role-recovered");
+					}
+					transitionAnsteelTeamStatus(state, "active", "team-runtime-resumed");
 					saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
-					throw createAnsteelPublicError(error);
-				}
-				activeTeams.set(ctx.cwd, activeTeam);
-				emitTimelineMessage(pi, `Ansteel team started.\n\n${formatStatus(state)}`);
-				if (existing) await flushQueuedCrossRoleReviews(activeTeam, ctx);
-				if (!existing) {
-					await runRound(activeTeam, ctx, topic, "investigation");
-					await runRound(
-						activeTeam,
-						ctx,
-						"Review every peer's public update for this work item.",
-						"cross-examination",
-					);
-				}
-			});
+					for (const role of recoveredRoles) {
+						const event = appendAnsteelTeamEvent(
+							ctx.cwd,
+							state,
+							{
+								type: "role-failure",
+								role,
+								content:
+									"Ansteel team role was recovered from an interrupted host while its prior stage was still working.",
+							},
+							getPersistenceContext(ctx.cwd),
+						);
+						emitTimelineMessage(pi, `## ${role} recovery failure [${event.sequence}]\n\n${event.content}`);
+					}
+					const sessions = new Map<AnsteelRole, AnsteelTeamRoleSession>();
+					const activeTeam: ActiveAnsteelTeam = {
+						state,
+						sessions,
+						stageTimeoutMs,
+						maxToolCallsPerStage,
+						taskMaxEpochs,
+						taskMaxNoProgressEpochs,
+						crossRolePromptDeferralDepth: 0,
+						deferredCrossRoleReviews: [
+							...state.tasks
+								.filter((task) => task.status === "submitted")
+								.map((task) => ({ kind: "task-collaboration" as const, id: task.id, revision: task.revision })),
+							...state.tasks
+								.filter((task) => task.status === "final-verification")
+								.map((task) => ({
+									kind: "task-final-verification" as const,
+									id: task.id,
+									revision: task.revision,
+								})),
+							...state.milestones
+								.filter((milestone) => milestone.status === "submitted")
+								.map((milestone) => ({
+									kind: "milestone-collaboration" as const,
+									id: milestone.id,
+									revision: milestone.revision,
+								})),
+							...state.milestones
+								.filter((milestone) => milestone.status === "final-verification")
+								.map((milestone) => ({
+									kind: "milestone-final-verification" as const,
+									id: milestone.id,
+									revision: milestone.revision,
+								})),
+						],
+					};
+					try {
+						for (const role of ANSTEEL_ROLES) {
+							sessions.set(
+								role,
+								await (
+									createRoleSession ??
+									((options) => createDefaultRoleSession(options, ctx.modelRegistry.getRuntime()))
+								)({
+									role,
+									cwd: ctx.cwd,
+									sessionFile: state.roles[role].sessionFile,
+									resolvedRole: resolvedRoles[role],
+									allowedTaskOwners: state.taskOwners,
+									maxToolCallsPerStage,
+									taskOperations: createTaskOperations(activeTeam, ctx, role, state.taskOwners),
+									recordAccessDenied: ({ toolName, toolCallId, denialBoundary }) => {
+										const observation = activeObservations.get(ctx.cwd);
+										if (!observation) {
+											throw new AnsteelObservabilityError(
+												"event-fsync-failed",
+												"Ansteel security denial cannot be recorded outside an observed command",
+											);
+										}
+										const parent = observation.activeRoleSpans.get(role) ?? observation.root;
+										const toolSpan = observation.logger.startSpan("tool.call", {
+											role,
+											parent,
+											toolCallId,
+											message: `${role} tool call entered mechanical security preflight`,
+											data: { toolName, denialBoundary },
+										});
+										toolSpan.end({
+											outcome: "failed",
+											reasonCode: "tool-policy-denied",
+											message: `${role} tool call was denied before execution`,
+											data: { toolName, denialBoundary },
+										});
+									},
+									recordReadOnlyToolBudget: (budget) => {
+										const observation = activeObservations.get(ctx.cwd);
+										if (!observation) {
+											throw new AnsteelObservabilityError(
+												"event-fsync-failed",
+												"Ansteel read-only tool budget cannot be recorded outside an observed command",
+											);
+										}
+										const parent = observation.activeRoleSpans.get(role) ?? observation.root;
+										const eventName = `budget.${budget.kind}` as const;
+										observation.logger.write({
+											level: "audit",
+											eventName,
+											outcome: budget.kind === "exhausted" ? "failed" : "progress",
+											...(budget.kind === "exhausted" ? { reasonCode: "budget-exhausted" as const } : {}),
+											role,
+											parentSpanId: parent.spanId,
+											...(budget.kind === "reserved" ? {} : { toolCallId: budget.toolCallId }),
+											message:
+												budget.kind === "reserved"
+													? `${role} reserved its isolated read-only tool budget`
+													: budget.kind === "consumed"
+														? `${role} consumed one read-only tool call`
+														: `${role} exhausted its read-only tool budget before execution`,
+											data: {
+												resourceKind: "read-only-tool-calls",
+												used: budget.used,
+												limit: budget.limit,
+												remaining: budget.remaining,
+												...(budget.kind === "reserved" ? {} : { toolName: budget.toolName }),
+											},
+										});
+									},
+									recordProviderRetry: ({ attempt, maxAttempts, delayMs }) => {
+										const observation = activeObservations.get(ctx.cwd);
+										const activeRequest = observation?.activeProviderRequests.get(role);
+										if (!observation || !activeRequest) {
+											throw new AnsteelObservabilityError(
+												"event-fsync-failed",
+												"Ansteel provider retry cannot be recorded outside an active provider request",
+											);
+										}
+										activeRequest.retryCount = Math.max(activeRequest.retryCount, attempt);
+										observation.logger.write({
+											level: "warn",
+											eventName: "provider.request.retry",
+											outcome: "progress",
+											role,
+											providerRequestId: activeRequest.providerRequestId,
+											parentSpanId: activeRequest.span.spanId,
+											message: `${role} provider request scheduled an automatic retry`,
+											data: {
+												retryBoundary: "agent-session",
+												attempt,
+												maxAttempts,
+												delayMs,
+											},
+										});
+									},
+								}),
+							);
+						}
+					} catch (error) {
+						await disposeSessions(sessions);
+						persistTeamStatus(ctx.cwd, state, "stopped", "role-session-initialization-failed");
+						throw createAnsteelPublicError(error);
+					}
+					activeTeams.set(ctx.cwd, activeTeam);
+					emitTimelineMessage(pi, `Ansteel team started.\n\n${formatStatus(state)}`);
+					if (existing) await flushQueuedCrossRoleReviews(activeTeam, ctx);
+					if (!existing) {
+						await runRound(activeTeam, ctx, topic, "investigation");
+						await runRound(
+							activeTeam,
+							ctx,
+							"Review every peer's public update for this work item.",
+							"cross-examination",
+						);
+					}
+				},
+				{ resume: existing !== undefined },
+			);
 		};
 
 		pi.registerCommand("ansteel-team", {
@@ -3359,74 +4039,80 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						if (argument.length === 0) throw new Error("Usage: /ansteel-team task <JSON|TASK-ID>");
 						const activeTeam = activeTeams.get(ctx.cwd);
 						if (!activeTeam) throw new Error("Ansteel team is not active. Start a team first.");
-						await runObservedCommand(ctx.cwd, activeTeam.state.id, `task ${argument}`, async () => {
-							const parsed = parseCoordinatorTaskArgument(argument);
-							if (parsed.kind === "parallel") {
-								const assignment = await runObservedOperation(
-									ctx.cwd,
-									"task.claim.parallel",
-									{
-										role: "coordinator",
-										data: { taskIds: parsed.inputs.map((input) => input.id) },
-									},
-									() =>
-										assignAnsteelTeamTasks(
-											ctx.cwd,
-											activeTeam.state,
-											parsed.inputs,
-											activeTeam.state.taskOwners,
-											getPersistenceContext(ctx.cwd),
-										),
-								);
-								emitTimelineMessage(
-									pi,
-									`## tasks-assigned [${assignment.event.sequence}]\n\n${assignment.event.content}`,
-								);
-								await runParallelTaskEpochs(
-									activeTeam,
-									ctx,
-									assignment.tasks.map((task) => task.id),
-								);
-								return;
-							}
-							let task: AnsteelTeamTask;
-							if (parsed.kind === "create") {
-								task = await runObservedOperation(
-									ctx.cwd,
-									"task.claim",
-									{ role: "coordinator", taskId: parsed.input.id },
-									() =>
-										claimAnsteelTeamTask(
-											ctx.cwd,
-											activeTeam.state,
-											parsed.input,
-											activeTeam.state.taskOwners,
-										),
-								);
-								publishTaskEvent(
-									ctx,
-									activeTeam.state,
-									"task-assigned",
-									"coordinator",
-									`${task.id} (${task.type}) assigned to ${task.owner}\n\nStatus: ${
-										task.status
-									}\n\nDependencies: ${
-										task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
-									}\n\nFiles: ${task.files.join(", ")}\n\nAssignment reason: ${
-										task.assignmentReason ?? "default role assignment"
-									}\n\nAcceptance: ${task.acceptanceCriteria}`,
-									task.owner,
-								);
-							} else {
-								const existingTask = activeTeam.state.tasks.find((item) => item.id === parsed.taskId);
-								if (!existingTask) throw new Error(`Ansteel team task ${parsed.taskId} does not exist`);
-								if (existingTask.status === "approved") {
-									throw new Error(`Ansteel team task ${parsed.taskId} is already approved`);
+						const parsed = parseCoordinatorTaskArgument(argument);
+						await runObservedCommand(
+							ctx.cwd,
+							activeTeam.state.id,
+							`task ${argument}`,
+							async () => {
+								if (parsed.kind === "parallel") {
+									const assignment = await runObservedOperation(
+										ctx.cwd,
+										"task.claim.parallel",
+										{
+											role: "coordinator",
+											data: { taskIds: parsed.inputs.map((input) => input.id) },
+										},
+										() =>
+											assignAnsteelTeamTasks(
+												ctx.cwd,
+												activeTeam.state,
+												parsed.inputs,
+												activeTeam.state.taskOwners,
+												getPersistenceContext(ctx.cwd),
+											),
+									);
+									emitTimelineMessage(
+										pi,
+										`## tasks-assigned [${assignment.event.sequence}]\n\n${assignment.event.content}`,
+									);
+									await runParallelTaskEpochs(
+										activeTeam,
+										ctx,
+										assignment.tasks.map((task) => task.id),
+									);
+									return;
 								}
-								task = existingTask;
-							}
-							await runTaskEpochs(activeTeam, ctx, task.id);
-						});
+								let task: AnsteelTeamTask;
+								if (parsed.kind === "create") {
+									task = await runObservedOperation(
+										ctx.cwd,
+										"task.claim",
+										{ role: "coordinator", taskId: parsed.input.id },
+										() =>
+											claimAnsteelTeamTask(
+												ctx.cwd,
+												activeTeam.state,
+												parsed.input,
+												activeTeam.state.taskOwners,
+											),
+									);
+									publishTaskEvent(
+										ctx,
+										activeTeam.state,
+										"task-assigned",
+										"coordinator",
+										`${task.id} (${task.type}) assigned to ${task.owner}\n\nStatus: ${
+											task.status
+										}\n\nDependencies: ${
+											task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")
+										}\n\nFiles: ${task.files.join(", ")}\n\nAssignment reason: ${
+											task.assignmentReason ?? "default role assignment"
+										}\n\nAcceptance: ${task.acceptanceCriteria}`,
+										task.owner,
+									);
+								} else {
+									const existingTask = activeTeam.state.tasks.find((item) => item.id === parsed.taskId);
+									if (!existingTask) throw new Error(`Ansteel team task ${parsed.taskId} does not exist`);
+									if (existingTask.status === "approved") {
+										throw new Error(`Ansteel team task ${parsed.taskId} is already approved`);
+									}
+									task = existingTask;
+								}
+								await runTaskEpochs(activeTeam, ctx, task.id);
+							},
+							parsed.kind === "resume" ? { resume: true, taskId: parsed.taskId } : {},
+						);
 						return;
 					}
 					if (command === "anchor") {
@@ -3482,15 +4168,22 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							const persisted = loadAnsteelTeamState(ctx.cwd);
 							if (!persisted)
 								throw new Error("No persisted Ansteel team state exists for delivery verification.");
-							const verification = verifyAnsteelTeamTaskDelivery(
-								ctx.cwd,
-								persisted,
-								taskId,
-								manifestPath,
-								getPersistenceContext(ctx.cwd),
-							);
-							const active = activeTeams.get(ctx.cwd);
-							if (active?.state.id === persisted.id) Object.assign(active.state, persisted);
+							let verification: AnsteelTeamDeliveryVerification;
+							try {
+								verification = await verifyAnsteelTeamTaskDelivery(
+									ctx.cwd,
+									persisted,
+									taskId,
+									manifestPath,
+									getPersistenceContext(ctx.cwd),
+								);
+							} finally {
+								// delivery 失败会先持久化 revision-required 和依赖转换再抛错。无论成功失败都刷新
+								// 活动快照，防止重试读取过期的批准状态。
+								const refreshed = loadAnsteelTeamState(ctx.cwd);
+								const active = activeTeams.get(ctx.cwd);
+								if (refreshed && active?.state.id === refreshed.id) Object.assign(active.state, refreshed);
+							}
 							emitTimelineMessage(
 								pi,
 								`Task delivery verified: ${verification.taskId} revision ${verification.revision}\nVerification: ${verification.id}\nChecks: ${verification.checks.length}\nSource commit: ${verification.sourceCommit}`,
@@ -3608,6 +4301,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 										)
 										.at(-1)?.runId;
 								if (!runId) throw new Error("No completed Ansteel runtime run exists to diagnose.");
+								auditAnsteelRuntimeArtifacts(ctx.cwd, runId, logger);
 								const diagnosis = diagnoseAnsteelTeamRun(ctx.cwd, runId);
 								emitTimelineMessage(pi, formatAnsteelTeamDiagnosis(diagnosis));
 								if (!diagnosis.healthy) {
@@ -3624,18 +4318,60 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 					}
 					if (command === "incident") {
 						if (argument.length === 0) throw new Error("Usage: /ansteel-team incident <runId>");
-						const state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						let state: AnsteelTeamState | undefined;
+						let projectContextUnavailable = false;
+						try {
+							state = activeTeams.get(ctx.cwd)?.state ?? loadAnsteelTeamState(ctx.cwd);
+						} catch {
+							// 协作账本损坏时，事故包生成仍应继续。清单把项目上下文明确标为 unavailable，
+							// 绝不把未经验证的状态混入其余机械证据。
+							projectContextUnavailable = true;
+						}
 						await runObservedCommand(
 							ctx.cwd,
 							state?.id ?? "ansteel-team-uninitialized",
 							`incident ${argument}`,
-							async () => {
-								const bundle = createAnsteelTeamIncidentBundle(ctx.cwd, argument);
+							async (logger) => {
+								try {
+									auditAnsteelRuntimeArtifacts(ctx.cwd, argument, logger);
+								} catch (error) {
+									if (
+										!(error instanceof AnsteelObservabilityError) ||
+										error.reasonCode !== "event-chain-invalid"
+									) {
+										throw error;
+									}
+									// 独立诊断 run 已持久化 chain.invalid。这里继续生成事故包，只保留原始段哈希和
+									// failed 完整性结果，不信任目标记录中的任何字段。
+								}
+								let projectContext: AnsteelIncidentProjectContext;
+								if (projectContextUnavailable) {
+									projectContext = { availability: "unavailable", reasonCode: "team-integrity-unavailable" };
+								} else if (state === undefined) {
+									projectContext = { availability: "unavailable", reasonCode: "team-state-missing" };
+								} else {
+									try {
+										let runtimeEntries: ReturnType<typeof readAnsteelRuntimeLogs> = [];
+										try {
+											runtimeEntries = readAnsteelRuntimeLogs(ctx.cwd, argument);
+										} catch {
+											// 损坏目标链不能提供可信 task/revision 身份，但团队公共账本仍可能独立通过验证。
+										}
+										projectContext = createAnsteelTeamIncidentProjectContext(ctx.cwd, state, runtimeEntries);
+									} catch {
+										projectContext = {
+											availability: "unavailable",
+											reasonCode: "team-integrity-unavailable",
+										};
+									}
+								}
+								const bundle = createAnsteelTeamIncidentBundle(ctx.cwd, argument, projectContext);
 								emitTimelineMessage(
 									pi,
-									`Incident bundle: ${bundle.storageId}\nSHA-256: ${bundle.sha256}\nRun: ${bundle.manifest.runId}`,
+									`Incident bundle: ${bundle.storageId}\nSHA-256: ${bundle.sha256}\nRun: ${bundle.manifest.run.runId}`,
 								);
 							},
+							{ allowUnindexedDiagnosticWrites: true },
 						);
 						return;
 					}
@@ -3648,8 +4384,10 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 								await disposeSessions(activeTeam.sessions);
 								activeTeams.delete(ctx.cwd);
 							}
-							state.status = "stopped";
-							for (const role of ANSTEEL_ROLES) state.roles[role].status = "idle";
+							for (const role of ANSTEEL_ROLES) {
+								transitionAnsteelTeamRoleStatus(state, role, "idle", "team-stop-requested");
+							}
+							transitionAnsteelTeamStatus(state, "stopped", "team-stop-requested");
 							saveAnsteelTeamState(ctx.cwd, state, getPersistenceContext(ctx.cwd));
 							emitTimelineMessage(
 								pi,

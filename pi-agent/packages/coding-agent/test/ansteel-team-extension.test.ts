@@ -15,7 +15,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AnsteelConfig } from "../src/core/ansteel-discussion.ts";
-import { listAnsteelTeamEvents, loadAnsteelTeamState, resolveAnsteelTeamWritePath } from "../src/core/ansteel-team.ts";
+import {
+	listAnsteelTeamEvents,
+	loadAnsteelTeamState,
+	resolveAnsteelTeamWritePath,
+	saveAnsteelTeamState,
+	transitionAnsteelTeamRoleStatus,
+	transitionAnsteelTeamStatus,
+} from "../src/core/ansteel-team.ts";
 import {
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
@@ -227,7 +234,11 @@ afterEach(() => {
 // These tests exercise durable Git and runtime-record workflows rather than a
 // latency target. Keep the protocol's own timeouts unchanged, but allow the
 // complete serial integration group enough outer time on Windows hosts.
-describe("Ansteel team extension", { timeout: 20_000 }, () => {
+// These integration cases create three role sessions, durable ledgers, Git fixtures, and real child
+// processes. This host-side allowance does not change any production stage, epoch, or review timeout.
+const ANSTEEL_EXTENSION_TEST_TIMEOUT_MS = 60_000;
+
+describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS }, () => {
 	it("registers guarded production mutation tools for default role sessions", async () => {
 		const cwd = createTemporaryProject();
 		const outside = createTemporaryProject();
@@ -324,6 +335,8 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 
 		expect(roleSessions.map((entry) => entry.role)).toEqual(["tech-lead", "staff-engineer", "qa-engineer"]);
 		expect(roleSessionOptions.every((options) => options.taskOperations !== undefined)).toBe(true);
+		expect(roleSessionOptions.every((options) => options.recordReadOnlyToolBudget !== undefined)).toBe(true);
+		expect(roleSessionOptions.every((options) => options.recordProviderRetry !== undefined)).toBe(true);
 		expect(prompts).toHaveLength(6);
 		expect(sendMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ customType: "ansteel-team-event", display: true }),
@@ -360,6 +373,43 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		await command("start Review the parser", harness.ctx);
 		const failure = listAnsteelTeamEvents(harness.ctx.cwd).find((event) => event.type === "role-failure");
 		expect(failure).toBeUndefined();
+		const run = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+		expect(run).toBeDefined();
+		const entries = readAnsteelRuntimeLogs(harness.ctx.cwd, run!.runId);
+		const techLeadRequests = entries.filter(
+			(entry) => entry.role === "tech-lead" && entry.eventName === "provider.request.started",
+		);
+		const requestsByRoleSpan = new Map<string | undefined, (typeof techLeadRequests)[number][]>();
+		for (const entry of techLeadRequests) {
+			const requests = requestsByRoleSpan.get(entry.parentSpanId) ?? [];
+			requests.push(entry);
+			requestsByRoleSpan.set(entry.parentSpanId, requests);
+		}
+		const repairedRequests = [...requestsByRoleSpan.values()].find((requests) => requests.length === 2);
+		expect(repairedRequests).toBeDefined();
+		expect(repairedRequests!.map((entry) => entry.providerRequestId)).toEqual([
+			expect.stringMatching(/^PROVIDER-/),
+			expect.stringMatching(/^PROVIDER-/),
+		]);
+		expect(new Set(repairedRequests!.map((entry) => entry.providerRequestId)).size).toBe(2);
+		expect(repairedRequests!.map((entry) => entry.data)).toEqual([
+			expect.objectContaining({ requestRound: 1, retryCount: 0, timeoutStage: "role-stage" }),
+			expect.objectContaining({ requestRound: 2, retryCount: 0, timeoutStage: "role-stage" }),
+		]);
+		const repairedProviderRequestIds = new Set(repairedRequests!.map((entry) => entry.providerRequestId));
+		expect(
+			entries.filter(
+				(entry) =>
+					entry.eventName === "provider.request.completed" &&
+					entry.providerRequestId !== undefined &&
+					repairedProviderRequestIds.has(entry.providerRequestId),
+			),
+		).toHaveLength(2);
+		expect(
+			entries.filter(
+				(entry) => entry.eventName === "role.session.output" && entry.spanId === repairedRequests![0]!.parentSpanId,
+			),
+		).toHaveLength(1);
 	});
 
 	it("fails the stage when the mechanical repair turn cannot fix the governed tool call", async () => {
@@ -978,7 +1028,7 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		});
 		const orphanedLogger = createAnsteelRuntimeLogger(harness.ctx.cwd, orphanedContext);
 		const root = orphanedLogger.startSpan("run.started", { role: "coordinator" });
-		const tool = orphanedLogger.startSpan("tool.call.completed", {
+		const tool = orphanedLogger.startSpan("tool.call", {
 			parent: root,
 			role: "tech-lead",
 			taskId: "TASK-BOARD-ORPHAN-1",
@@ -1022,7 +1072,7 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		const root = forgedLogger.startSpan("run.started", { role: "coordinator" });
 		forgedLogger.write({
 			level: "info",
-			eventName: "run.started",
+			eventName: "run.completed",
 			outcome: "succeeded",
 			spanId: root.spanId,
 			parentSpanId: "forged-child-parent",
@@ -1061,7 +1111,7 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		});
 		const successfulLogger = createAnsteelRuntimeLogger(harness.ctx.cwd, successfulContext);
 		const root = successfulLogger.startSpan("run.started", { role: "coordinator" });
-		const tool = successfulLogger.startSpan("tool.call.completed", {
+		const tool = successfulLogger.startSpan("tool.call", {
 			parent: root,
 			role: "tech-lead",
 			taskId: "TASK-BOARD-HISTORY-1",
@@ -1206,7 +1256,27 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		expect(run).toBeDefined();
 		const entries = readAnsteelRuntimeLogs(harness.ctx.cwd, run!.runId);
 		expect(entries.map((entry) => entry.eventName)).toEqual(
-			expect.arrayContaining(["role.session", "provider.request", "state.persisted", "event.appended"]),
+			expect.arrayContaining([
+				"lease.acquired",
+				"lease.released",
+				"role.session.started",
+				"role.session.output",
+				"role.session.ended",
+				"provider.request.started",
+				"provider.request.completed",
+				"state.persisted",
+				"event.appended",
+			]),
+		);
+		const acquiredLease = entries.find((entry) => entry.eventName === "lease.acquired");
+		const releasedLease = entries.find((entry) => entry.eventName === "lease.released");
+		expect(releasedLease).toMatchObject({
+			outcome: "succeeded",
+			leaseId: acquiredLease?.leaseId,
+			data: { resourceKind: "runtime-run" },
+		});
+		expect(entries.indexOf(releasedLease!)).toBeGreaterThan(
+			entries.findIndex((entry) => entry.eventName === "run.completed"),
 		);
 		expect(entries.every((entry) => entry.traceId === run!.traceId)).toBe(true);
 	});
@@ -1222,6 +1292,18 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		const failedRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
 		expect(failedRun).toBeDefined();
 
+		await command("status --explain", harness.ctx);
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				content: expect.stringMatching(new RegExp(`${failedRun!.runId}.*provider-timeout`, "s")),
+			}),
+			{ triggerTurn: false },
+		);
+		await command(`trace ${failedRun!.runId}`, harness.ctx);
+		expect(harness.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("provider-timeout") }),
+			{ triggerTurn: false },
+		);
 		await expect(command(`doctor ${failedRun!.runId}`, harness.ctx)).rejects.toThrow("is unhealthy");
 		expect(harness.sendMessage).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -1231,11 +1313,40 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		);
 
 		await command(`incident ${failedRun!.runId}`, harness.ctx);
+		await command(`incident ${failedRun!.runId}`, harness.ctx);
 		const incidentDirectory = join(harness.ctx.cwd, ".pi", "ansteel-team", "incidents");
 		expect(existsSync(incidentDirectory)).toBe(true);
-		expect(readdirSync(incidentDirectory)).toEqual([
+		const incidentFiles = readdirSync(incidentDirectory);
+		expect(incidentFiles).toEqual([
 			expect.stringMatching(new RegExp(`^incident-${failedRun!.runId}-[0-9a-f]{64}\\.json$`)),
 		]);
+		const manifest = JSON.parse(readFileSync(join(incidentDirectory, incidentFiles[0]!), "utf8"));
+		expect(manifest).toMatchObject({
+			schemaVersion: 2,
+			evidenceModel: "mechanical-facts-only",
+			run: { runId: failedRun!.runId, traceId: failedRun!.traceId, terminalOutcome: "failed" },
+			rootCause: { reasonCode: "provider-timeout" },
+			finalRuntimeState: { terminalEvent: { eventName: "run.failed", reasonCode: "provider-timeout" } },
+			configurationSummary: {
+				providers: expect.arrayContaining([expect.objectContaining({ provider: "provider-c", model: "model-c" })]),
+			},
+			integrity: {
+				runtimeEventChain: { status: "verified" },
+				logSegments: { status: "verified" },
+				artifacts: { status: "verified", missingCount: 0 },
+			},
+			projectContext: {
+				availability: "verified",
+				publicAuditEventRange: { integrity: "verified" },
+				workspace: { status: "unavailable", reasonCode: "workspace-snapshot-unavailable" },
+				recoveryEntry: { kind: "team-resume" },
+			},
+		});
+		expect(manifest.propagationEvents).toEqual(
+			expect.arrayContaining([expect.objectContaining({ eventName: "run.failed", reasonCode: "provider-timeout" })]),
+		);
+		expect(manifest.spanTree.nodes.length).toBeGreaterThanOrEqual(3);
+		expect(JSON.stringify(manifest)).not.toContain("modelAnalysis");
 	});
 
 	it("finalizes and blocks an orphaned run and records its public recovery audit before resuming", async () => {
@@ -1265,11 +1376,10 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		completedRoot.end({ outcome: "succeeded", message: "root command returned before child cleanup" });
 		await orphanLogger.forceFlush();
 		orphanLogger.close();
-		const statePath = join(firstHost.ctx.cwd, ".pi", "ansteel-team", "team.json");
-		const state = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, any>;
-		state.status = "active";
-		state.roles["staff-engineer"].status = "working";
-		writeFileSync(statePath, `${JSON.stringify(state)}\n`, "utf8");
+		const state = loadAnsteelTeamState(firstHost.ctx.cwd)!;
+		transitionAnsteelTeamStatus(state, "active", "test-interrupted-host-active");
+		transitionAnsteelTeamRoleStatus(state, "staff-engineer", "working", "test-provider-request-interrupted");
+		saveAnsteelTeamState(firstHost.ctx.cwd, state);
 
 		const restartedHost = setup(createConfig(), undefined, firstHost.ctx.cwd);
 		const restartedCommand = restartedHost.commands.get("ansteel-team");
@@ -1278,7 +1388,7 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		expect(diagnoseAnsteelTeamRun(restartedHost.ctx.cwd, orphanContext.runId)).toMatchObject({
 			healthy: false,
 			rootCause: {
-				eventName: "provider.request",
+				eventName: "provider.request.completed",
 				outcome: "abandoned",
 				reasonCode: "process-orphaned",
 				providerRequestId: "PROVIDER-RECOVERY-ORPHAN-1",
@@ -1581,151 +1691,186 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		expect(taskRun).toBeDefined();
 		const operationEntries = readAnsteelRuntimeLogs(harness.ctx.cwd, taskRun!.runId);
 		expect(operationEntries.map((entry) => entry.eventName)).toEqual(
-			expect.arrayContaining(["task.claim", "tool.call", "task.submit", "task.review"]),
+			expect.arrayContaining([
+				"task.claim",
+				"tool.call.started",
+				"tool.call.completed",
+				"task.submit",
+				"task.review",
+			]),
 		);
 		expect(
-			operationEntries.find((entry) => entry.eventName === "tool.call" && entry.outcome === "succeeded"),
+			operationEntries.find((entry) => entry.eventName === "tool.call.completed" && entry.outcome === "succeeded"),
 		).toMatchObject({ taskId: "TASK-1", outcome: "succeeded" });
+		const toolStarted = operationEntries.find(
+			(entry) => entry.eventName === "tool.call.started" && entry.taskId === "TASK-1",
+		);
+		const processStarted = operationEntries.find(
+			(entry) => entry.eventName === "process.spawned" && entry.taskId === "TASK-1",
+		);
+		const processExited = operationEntries.find(
+			(entry) => entry.eventName === "process.exited" && entry.processId === processStarted?.processId,
+		);
+		expect(processStarted).toMatchObject({
+			outcome: "started",
+			parentSpanId: toolStarted?.spanId,
+			toolCallId: toolStarted?.toolCallId,
+			data: { pid: expect.any(Number), policy: "task-test" },
+		});
+		expect(processExited).toMatchObject({
+			outcome: "succeeded",
+			parentSpanId: toolStarted?.spanId,
+			toolCallId: toolStarted?.toolCallId,
+			data: { exitCode: 0, timedOut: false },
+		});
 	});
 
-	it("runs three typed owners in parallel before sequential immutable peer reviews", async () => {
-		const config = createConfig();
-		config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
-		config.teamTaskMaxEpochs = 2;
-		config.teamTaskMaxNoProgressEpochs = 1;
-		const ownerTaskByRole = {
-			"tech-lead": "TASK-ARCHITECTURE",
-			"staff-engineer": "TASK-IMPLEMENTATION",
-			"qa-engineer": "TASK-VERIFICATION",
-		} as const;
-		const ownerFileByRole = {
-			"tech-lead": ["src/architecture.ts", "export const architecture = 'after';\n"],
-			"staff-engineer": ["src/implementation.ts", "export const implementation = 'after';\n"],
-			"qa-engineer": [
-				"test/verification.test.mjs",
-				"import test from 'node:test';\ntest('verification', () => {});\ntest('parallel owner', () => {});\n",
-			],
-		} as const;
-		const startedOwners = new Set<string>();
-		let finishedOwners = 0;
-		let releaseOwnerWave: (() => void) | undefined;
-		const allOwnersStarted = new Promise<void>((resolve) => {
-			releaseOwnerWave = resolve;
-		});
-		let harness: ReturnType<typeof setup>;
-		harness = setup(config, async (role, prompt) => {
-			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
-			if (!roleOptions) throw new Error(`Missing ${role} options`);
-			const ownerTaskId = ownerTaskByRole[role as keyof typeof ownerTaskByRole];
-			if (prompt.includes(`Execute governed task ${ownerTaskId}`)) {
-				startedOwners.add(role);
-				if (startedOwners.size === 3) releaseOwnerWave?.();
-				await allOwnersStarted;
-				const [path, content] = ownerFileByRole[role as keyof typeof ownerFileByRole];
-				writeFileSync(join(harness.ctx.cwd, path), content, "utf8");
-				await roleOptions.taskOperations.submitTask(ownerTaskId, "node --test test/verification.test.mjs");
-				finishedOwners++;
-				return `${role} submitted ${ownerTaskId}.`;
-			}
-			if (prompt.startsWith("You are the independent ")) {
-				expect(finishedOwners).toBe(3);
-				const reviewedTaskId = prompt.match(/reviewer for (TASK-[A-Z0-9-]+) revision/)?.[1];
-				if (!reviewedTaskId) throw new Error("Missing task ID in review prompt");
-				await roleOptions.taskOperations.reviewTask(reviewedTaskId, { verdict: "approve" });
-				return `${role} approved ${reviewedTaskId}.`;
-			}
-			return `${role} completed discussion.`;
-		});
-		initializeGitProject(harness.ctx.cwd);
-		writeFileSync(join(harness.ctx.cwd, "src", "architecture.ts"), "export const architecture = 'before';\n", "utf8");
-		writeFileSync(
-			join(harness.ctx.cwd, "src", "implementation.ts"),
-			"export const implementation = 'before';\n",
-			"utf8",
-		);
-		writeFileSync(
-			join(harness.ctx.cwd, "test", "verification.test.mjs"),
-			"import test from 'node:test';\ntest('verification', () => {});\n",
-			"utf8",
-		);
-		execFileSync("git", ["add", "src/architecture.ts", "src/implementation.ts", "test/verification.test.mjs"], {
-			cwd: harness.ctx.cwd,
-			stdio: "ignore",
-		});
-		execFileSync("git", ["commit", "-m", "parallel baseline"], { cwd: harness.ctx.cwd, stdio: "ignore" });
-		const command = harness.commands.get("ansteel-team");
-		if (!command) throw new Error("Missing ansteel-team command");
-		await command("start Review typed parallel ownership", harness.ctx);
+	it(
+		"runs three typed owners in parallel before sequential immutable peer reviews",
+		async () => {
+			const config = createConfig();
+			config.teamTaskOwners = ["tech-lead", "staff-engineer", "qa-engineer"];
+			config.teamTaskMaxEpochs = 2;
+			config.teamTaskMaxNoProgressEpochs = 1;
+			const ownerTaskByRole = {
+				"tech-lead": "TASK-ARCHITECTURE",
+				"staff-engineer": "TASK-IMPLEMENTATION",
+				"qa-engineer": "TASK-VERIFICATION",
+			} as const;
+			const ownerFileByRole = {
+				"tech-lead": ["src/architecture.ts", "export const architecture = 'after';\n"],
+				"staff-engineer": ["src/implementation.ts", "export const implementation = 'after';\n"],
+				"qa-engineer": [
+					"test/verification.test.mjs",
+					"import test from 'node:test';\ntest('verification', () => {});\ntest('parallel owner', () => {});\n",
+				],
+			} as const;
+			const startedOwners = new Set<string>();
+			let finishedOwners = 0;
+			let releaseOwnerWave: (() => void) | undefined;
+			const allOwnersStarted = new Promise<void>((resolve) => {
+				releaseOwnerWave = resolve;
+			});
+			let harness: ReturnType<typeof setup>;
+			harness = setup(config, async (role, prompt) => {
+				const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+				if (!roleOptions) throw new Error(`Missing ${role} options`);
+				const ownerTaskId = ownerTaskByRole[role as keyof typeof ownerTaskByRole];
+				if (prompt.includes(`Execute governed task ${ownerTaskId}`)) {
+					startedOwners.add(role);
+					if (startedOwners.size === 3) releaseOwnerWave?.();
+					await allOwnersStarted;
+					const [path, content] = ownerFileByRole[role as keyof typeof ownerFileByRole];
+					writeFileSync(join(harness.ctx.cwd, path), content, "utf8");
+					await roleOptions.taskOperations.submitTask(ownerTaskId, "node --test test/verification.test.mjs");
+					finishedOwners++;
+					return `${role} submitted ${ownerTaskId}.`;
+				}
+				if (prompt.startsWith("You are the independent ")) {
+					expect(finishedOwners).toBe(3);
+					const reviewedTaskId = prompt.match(/reviewer for (TASK-[A-Z0-9-]+) revision/)?.[1];
+					if (!reviewedTaskId) throw new Error("Missing task ID in review prompt");
+					await roleOptions.taskOperations.reviewTask(reviewedTaskId, { verdict: "approve" });
+					return `${role} approved ${reviewedTaskId}.`;
+				}
+				return `${role} completed discussion.`;
+			});
+			initializeGitProject(harness.ctx.cwd);
+			writeFileSync(
+				join(harness.ctx.cwd, "src", "architecture.ts"),
+				"export const architecture = 'before';\n",
+				"utf8",
+			);
+			writeFileSync(
+				join(harness.ctx.cwd, "src", "implementation.ts"),
+				"export const implementation = 'before';\n",
+				"utf8",
+			);
+			writeFileSync(
+				join(harness.ctx.cwd, "test", "verification.test.mjs"),
+				"import test from 'node:test';\ntest('verification', () => {});\n",
+				"utf8",
+			);
+			execFileSync("git", ["add", "src/architecture.ts", "src/implementation.ts", "test/verification.test.mjs"], {
+				cwd: harness.ctx.cwd,
+				stdio: "ignore",
+			});
+			execFileSync("git", ["commit", "-m", "parallel baseline"], { cwd: harness.ctx.cwd, stdio: "ignore" });
+			const command = harness.commands.get("ansteel-team");
+			if (!command) throw new Error("Missing ansteel-team command");
+			await command("start Review typed parallel ownership", harness.ctx);
 
-		await command(
-			`task ${JSON.stringify([
-				{
+			await command(
+				`task ${JSON.stringify([
+					{
+						id: "TASK-ARCHITECTURE",
+						owner: "tech-lead",
+						type: "architecture",
+						files: ["src/architecture.ts"],
+						description: "Define the architecture seam.",
+						acceptanceCriteria: "The shared verification test passes.",
+						dependsOn: [],
+					},
+					{
+						id: "TASK-IMPLEMENTATION",
+						owner: "staff-engineer",
+						type: "implementation",
+						files: ["src/implementation.ts"],
+						description: "Implement the product behavior.",
+						acceptanceCriteria: "The shared verification test passes.",
+						dependsOn: [],
+					},
+					{
+						id: "TASK-VERIFICATION",
+						owner: "qa-engineer",
+						type: "verification",
+						files: ["test/verification.test.mjs"],
+						description: "Extend the acceptance automation.",
+						acceptanceCriteria: "The shared verification test passes.",
+						dependsOn: [],
+					},
+				])}`,
+				harness.ctx,
+			);
+
+			expect(startedOwners).toEqual(new Set(["tech-lead", "staff-engineer", "qa-engineer"]));
+			expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual([
+				expect.objectContaining({
 					id: "TASK-ARCHITECTURE",
 					owner: "tech-lead",
 					type: "architecture",
-					files: ["src/architecture.ts"],
-					description: "Define the architecture seam.",
-					acceptanceCriteria: "The shared verification test passes.",
-					dependsOn: [],
-				},
-				{
+					status: "approved",
+				}),
+				expect.objectContaining({
 					id: "TASK-IMPLEMENTATION",
 					owner: "staff-engineer",
 					type: "implementation",
-					files: ["src/implementation.ts"],
-					description: "Implement the product behavior.",
-					acceptanceCriteria: "The shared verification test passes.",
-					dependsOn: [],
-				},
-				{
+					status: "approved",
+				}),
+				expect.objectContaining({
 					id: "TASK-VERIFICATION",
 					owner: "qa-engineer",
 					type: "verification",
-					files: ["test/verification.test.mjs"],
-					description: "Extend the acceptance automation.",
-					acceptanceCriteria: "The shared verification test passes.",
-					dependsOn: [],
-				},
-			])}`,
-			harness.ctx,
-		);
-
-		expect(startedOwners).toEqual(new Set(["tech-lead", "staff-engineer", "qa-engineer"]));
-		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks).toEqual([
-			expect.objectContaining({
-				id: "TASK-ARCHITECTURE",
-				owner: "tech-lead",
-				type: "architecture",
-				status: "approved",
-			}),
-			expect.objectContaining({
-				id: "TASK-IMPLEMENTATION",
-				owner: "staff-engineer",
-				type: "implementation",
-				status: "approved",
-			}),
-			expect.objectContaining({
-				id: "TASK-VERIFICATION",
-				owner: "qa-engineer",
-				type: "verification",
-				status: "approved",
-			}),
-		]);
-		const events = listAnsteelTeamEvents(harness.ctx.cwd);
-		const assignmentEvents = events.filter((event) => event.type === "tasks-assigned");
-		expect(assignmentEvents).toHaveLength(1);
-		expect(assignmentEvents[0]?.content).toContain("TASK-ARCHITECTURE");
-		expect(assignmentEvents[0]?.content).toContain("TASK-IMPLEMENTATION");
-		expect(assignmentEvents[0]?.content).toContain("TASK-VERIFICATION");
-		expect(events.filter((event) => event.type === "task-review")).toHaveLength(6);
-		const parallelRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
-		expect(parallelRun).toBeDefined();
-		expect(
-			readAnsteelRuntimeLogs(harness.ctx.cwd, parallelRun!.runId).some(
-				(entry) => entry.eventName === "task.claim.parallel" && entry.outcome === "succeeded",
-			),
-		).toBe(true);
-	});
+					status: "approved",
+				}),
+			]);
+			const events = listAnsteelTeamEvents(harness.ctx.cwd);
+			const assignmentEvents = events.filter((event) => event.type === "tasks-assigned");
+			expect(assignmentEvents).toHaveLength(1);
+			expect(assignmentEvents[0]?.content).toContain("TASK-ARCHITECTURE");
+			expect(assignmentEvents[0]?.content).toContain("TASK-IMPLEMENTATION");
+			expect(assignmentEvents[0]?.content).toContain("TASK-VERIFICATION");
+			expect(events.filter((event) => event.type === "task-review")).toHaveLength(6);
+			const parallelRun = listAnsteelRuntimeRuns(harness.ctx.cwd).at(-1);
+			expect(parallelRun).toBeDefined();
+			expect(
+				readAnsteelRuntimeLogs(harness.ctx.cwd, parallelRun!.runId).some(
+					(entry) => entry.eventName === "task.claim.parallel" && entry.outcome === "succeeded",
+				),
+			).toBe(true);
+		},
+		ANSTEEL_EXTENSION_TEST_TIMEOUT_MS,
+	);
 
 	it("rejects a parallel assignment event without leaving a partial batch", async () => {
 		const config = createConfig();
@@ -2228,6 +2373,194 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		});
 	});
 
+	it("does not declare owner no-progress when a new exact action binding earns both peer approvals", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 4;
+		config.teamTaskMaxNoProgressEpochs = 2;
+		let taskEpochs = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const options = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!options) throw new Error(`Missing ${role} operations`);
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-ACTION-UNBLOCK")) {
+				taskEpochs++;
+				if (taskEpochs <= 3) {
+					await options.taskOperations.publishCheckpoint({
+						id: `CP-ACTION-UNBLOCK-${String(taskEpochs).padStart(4, "0")}`,
+						taskId: "TASK-ACTION-UNBLOCK",
+						goal: "Apply the exact parser edit after peer review",
+						currentUnderstanding: `Owner epoch ${taskEpochs} is waiting on the immutable action gate`,
+						assumptions: [],
+						evidenceRefs: ["file:src/parser.ts"],
+						uncertainties: [],
+						nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+						confidence: "L2",
+					});
+				} else {
+					writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+				}
+			}
+			if (prompt.includes("independent peer reviewer for one immutable governed action binding")) {
+				const checkpoint = options.taskOperations.state.workCheckpoints.at(-1);
+				if (!checkpoint?.governedAction) throw new Error("Missing action checkpoint");
+				if (checkpoint.id.endsWith("0001") || checkpoint.id.endsWith("0003")) {
+					await options.taskOperations.reviewAction({
+						checkpointId: checkpoint.id,
+						action: {
+							kind: checkpoint.governedAction.kind,
+							target: checkpoint.governedAction.target,
+							version: checkpoint.governedAction.version,
+						},
+						verdict: checkpoint.id.endsWith("0001") && role === "qa-engineer" ? "reject" : "approve",
+						reason: "Deterministic peer action review for the progress counter.",
+					});
+				}
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		await command(
+			'task {"id":"TASK-ACTION-UNBLOCK","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(taskEpochs).toBe(4);
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).some((event) => event.content.includes("owner-no-progress"))).toBe(
+			false,
+		);
+		expect(listAnsteelTeamEvents(harness.ctx.cwd).at(-1)?.content).toContain("task-epoch-limit");
+	});
+
+	it("routes a proposed process resolution to its author before action review and final verification", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 4;
+		config.teamTaskMaxNoProgressEpochs = 2;
+		let taskEpochs = 0;
+		const scheduledStages: string[] = [];
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const options = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!options) throw new Error(`Missing ${role} operations`);
+
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-RESOLUTION-ROUTE")) {
+				taskEpochs++;
+				if (taskEpochs === 1) {
+					await options.taskOperations.publishCheckpoint({
+						id: "CP-RESOLUTION-ROUTE-0001",
+						taskId: "TASK-RESOLUTION-ROUTE",
+						goal: "Apply the parser edit after independent challenge",
+						currentUnderstanding: "The first action proposal is ready for peer review",
+						assumptions: [],
+						evidenceRefs: ["file:src/parser.ts"],
+						uncertainties: ["Whether editing must precede action approval"],
+						nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+						confidence: "L2",
+					});
+				} else if (taskEpochs === 2) {
+					await options.taskOperations.publishCheckpoint({
+						id: "CP-RESOLUTION-ROUTE-0002",
+						taskId: "TASK-RESOLUTION-ROUTE",
+						goal: "Apply the parser edit after independent challenge",
+						currentUnderstanding: "Action approval must precede the governed edit",
+						assumptions: [],
+						evidenceRefs: ["protocol:pre-action-review"],
+						uncertainties: [],
+						nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+						confidence: "L1",
+						supersedesCheckpointId: "CP-RESOLUTION-ROUTE-0001",
+					});
+					await options.taskOperations.resolveProcessIssue({
+						id: "PR-RESOLUTION-ROUTE-0001",
+						issueId: "PI-RESOLUTION-ROUTE-0001",
+						outcome: "REFUTED",
+						summary:
+							"The protocol requires approval before the file edit, so the original ordering concern is inverted.",
+						evidenceRefs: ["protocol:pre-action-review"],
+					});
+				} else if (taskEpochs === 3) {
+					writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+					await options.taskOperations.submitTask("TASK-RESOLUTION-ROUTE", "node --test test/parser.test.mjs");
+				}
+				return `Staff completed task epoch ${taskEpochs}.`;
+			}
+
+			if (prompt.includes("original author of process issue PI-RESOLUTION-ROUTE-0001")) {
+				scheduledStages.push("resolution-review");
+				expect(role).toBe("qa-engineer");
+				await options.taskOperations.reviewProcessResolution("PI-RESOLUTION-ROUTE-0001", {
+					verdict: "accept",
+					reason: "The immutable proposal cites the protocol ordering and directly refutes the claim.",
+				});
+				return "QA accepted the process resolution.";
+			}
+
+			if (prompt.includes("independent peer reviewer for one immutable governed action binding")) {
+				const checkpoint = options.taskOperations.state.workCheckpoints.at(-1);
+				if (!checkpoint?.governedAction) throw new Error("Missing governed action checkpoint");
+				scheduledStages.push(`action-review:${checkpoint.id}:${role}`);
+				if (checkpoint.id === "CP-RESOLUTION-ROUTE-0001" && role === "qa-engineer") {
+					await options.taskOperations.raiseProcessIssue({
+						id: "PI-RESOLUTION-ROUTE-0001",
+						targetCheckpointId: checkpoint.id,
+						severity: "blocking",
+						claim: "The file must be edited before the action can be approved.",
+						evidenceRefs: ["file:src/parser.ts"],
+						suggestedCorrection: "Clarify the required action ordering.",
+					});
+				}
+				await options.taskOperations.reviewAction({
+					checkpointId: checkpoint.id,
+					action: {
+						kind: checkpoint.governedAction.kind,
+						target: checkpoint.governedAction.target,
+						version: checkpoint.governedAction.version,
+					},
+					verdict: checkpoint.id === "CP-RESOLUTION-ROUTE-0001" && role === "qa-engineer" ? "reject" : "approve",
+					reason: "Deterministic action review for process-resolution routing.",
+				});
+				return `${role} reviewed ${checkpoint.id}.`;
+			}
+
+			if (prompt.startsWith("You are the independent ")) {
+				await options.taskOperations.reviewTask("TASK-RESOLUTION-ROUTE", { verdict: "approve" });
+				return `${role} approved TASK-RESOLUTION-ROUTE.`;
+			}
+
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+		await command(
+			'task {"id":"TASK-RESOLUTION-ROUTE","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		expect(taskEpochs).toBe(3);
+		expect(state?.processIssues[0]).toMatchObject({ id: "PI-RESOLUTION-ROUTE-0001", status: "closed" });
+		expect(state?.tasks[0]).toMatchObject({
+			id: "TASK-RESOLUTION-ROUTE",
+			status: "approved",
+			revision: 1,
+		});
+		expect(state?.tasks[0].collaborationUpdates).toHaveLength(2);
+		expect(state?.tasks[0].reviews).toHaveLength(2);
+		expect(scheduledStages.indexOf("resolution-review")).toBeGreaterThan(
+			scheduledStages.findIndex((stage) => stage.startsWith("action-review:CP-RESOLUTION-ROUTE-0001")),
+		);
+		expect(scheduledStages.indexOf("resolution-review")).toBeLessThan(
+			scheduledStages.findIndex((stage) => stage.startsWith("action-review:CP-RESOLUTION-ROUTE-0002")),
+		);
+		expect(
+			harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-RESOLUTION-ROUTE")),
+		).toContain("must include taskId exactly TASK-RESOLUTION-ROUTE");
+	});
+
 	it("never lets collaboration continuation bypass the task epoch ceiling", async () => {
 		const config = createConfig();
 		config.teamTaskMaxEpochs = 1;
@@ -2376,6 +2709,62 @@ describe("Ansteel team extension", { timeout: 20_000 }, () => {
 		expect(harness.sendMessage).toHaveBeenLastCalledWith(
 			expect.objectContaining({ content: expect.stringContaining("already approved") }),
 			{ triggerTurn: false },
+		);
+	});
+
+	it("refreshes active task state after failed delivery verification so the next revision can resume", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 2;
+		config.teamTaskMaxNoProgressEpochs = 2;
+		let ownerEpochs = 0;
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const roleOptions = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!roleOptions) throw new Error(`Missing ${role} options`);
+			if (prompt.startsWith("You are the independent ") && prompt.includes("TASK-VERIFY-RECOVERY revision")) {
+				await roleOptions.taskOperations.reviewTask("TASK-VERIFY-RECOVERY", { verdict: "approve" });
+				return `${role} approved the current recovery revision.`;
+			}
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-VERIFY-RECOVERY")) {
+				ownerEpochs++;
+				if (ownerEpochs === 1) {
+					writeFileSync(join(harness.ctx.cwd, "src", "parser.ts"), "export const parser = 'after';\n", "utf8");
+				}
+				await roleOptions.taskOperations.submitTask("TASK-VERIFY-RECOVERY", "node --test test/parser.test.mjs");
+				return `Staff submitted recovery revision ${ownerEpochs}.`;
+			}
+			return `${role} completed discussion.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Exercise delivery failure recovery", harness.ctx);
+		await command(
+			'task {"id":"TASK-VERIFY-RECOVERY","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Recover after a failed external delivery check","acceptanceCriteria":"The current revision passes parser tests and independent delivery verification","dependsOn":[]}',
+			harness.ctx,
+		);
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ status: "approved", revision: 1 });
+
+		await expect(
+			command(
+				`verify TASK-VERIFY-RECOVERY "${createDeliveryManifest("TASK-VERIFY-RECOVERY", 1, "process.exit(7)")}"`,
+				harness.ctx,
+			),
+		).rejects.toThrow("check-failed");
+		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({
+			status: "revision-required",
+			revision: 1,
+		});
+
+		await command("task TASK-VERIFY-RECOVERY", harness.ctx);
+		const recovered = loadAnsteelTeamState(harness.ctx.cwd);
+		expect(ownerEpochs).toBe(2);
+		expect(recovered?.tasks[0]).toMatchObject({ status: "approved", revision: 2 });
+		expect(recovered?.tasks[0]?.submissions).toHaveLength(2);
+		expect(recovered?.deliveryVerifications).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ taskId: "TASK-VERIFY-RECOVERY", revision: 1, status: "failed" }),
+			]),
 		);
 	});
 

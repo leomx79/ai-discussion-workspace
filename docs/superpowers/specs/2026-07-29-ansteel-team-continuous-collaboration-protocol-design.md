@@ -1,6 +1,6 @@
 # 鞍钢宪法式三 AI 持续协作协议设计
 
-> 状态：L1，迁移步骤 1-10 已实现，状态 v11 的独立任务 delivery 验证已通过本地确定性回归；真实三提供商 r20 首次完成单任务治理闭环。L3，真实模型下的多轮稳定收敛与系统级 delivery 探针仍未证明
+> 状态：L1，迁移步骤 1-10 已实现；状态 v12 已实现可重放的生命周期转换日志，v11 独立 delivery 已通过远端 Actions，真实三提供商 r28-r30 在冻结单任务夹具上 3/3 达到四轴终态，r34 完成双任务失败 delivery 后新 revision 恢复与依赖解锁；真实 RPC 宿主在 TL provider 请求中被强制终止后，已沿同一 trace 完成孤儿 span 归档、失败关闭与显式重试恢复。L3，长任务、存活或 PID 复用进程的安全重接管、任意并发规模和任意模型组合仍未证明
 > 日期：2026-07-29
 > 适用主线：`pi-agent` 的 `/ansteel-team`
 > 核心决策：固定专业分工、对等质疑权、持续公开协作、风险分级阻断、哈希链审计、末端独立验收
@@ -673,7 +673,7 @@ flowchart LR
 | `role`、`sessionId` | 角色身份及具体会话 |
 | `taskId`、`checkpointId`、`issueId` | 协作对象 |
 | `toolCallId`、`providerRequestId`、`processId` | 外部执行对象 |
-| `leaseId` | 角色执行或文件写入租约 |
+| `leaseId` | runtime writer、角色执行或文件写入租约；当前产品事件只接入前者 |
 | `revision`、`diffHash` | 被验证的精确代码状态 |
 | `causeEventId` | 直接导致当前状态或错误的审计/运行事件 |
 
@@ -683,6 +683,27 @@ flowchart LR
 每次 `run.started` 还必须记录产品版本、Git commit、扩展版本、配置文件内容哈希、功能开关、Node.js
 版本、操作系统、架构和项目根目录的稳定标识。配置中的密钥值不参与可见指纹；使用脱敏后的规范配置计算
 `configHash`。事故分析必须能回答“哪一版代码、哪一版配置、哪个运行实例发生了问题”。
+
+当前工作树已实现该基础：持久团队重启只从最近一次非 `board/status/trace/doctor/incident` 的工作运行继承
+`traceId`；显式 `/task TASK-ID` 恢复则按 `taskId` 选择该任务自己的最近运行，避免多任务串线。两者都生成新的
+`runId` 并记录精确恢复序号；每个根 `run.started` 自动写入上述环境字段及总环境
+指纹。配置敏感字段先替换为固定脱敏值，环境变量只记录启用名称，因此密钥值变化不会改变配置或环境指纹，
+也不会进入 JSONL。真实 RPC 探针在 TL provider span 已落盘且仍为 `started` 时强制终止第一个宿主；第二个宿主
+立即接管崩溃遗留锁，以原 `leaseId` 记录 `lease.expired`、以新 `leaseId` 记录 `lease.acquired`，发现 1 个孤儿运行
+并把根、角色和 provider 共 3 个开放 span 追加为 `abandoned/process-orphaned`，最后在真实释放恢复锁后记录
+`lease.released`。该恢复命令先失败关闭，随后一次显式 `start` 和一次真实 `ask` 恢复同一持久团队；
+原运行、恢复运行和成功续跑使用同一 `traceId`，并保存逐段 `resumedFromRunId/resumedFromSequence`，现场日志
+不包含测试密钥值、Bearer 或 `sk-` 形态。内容寻址 artifact 的存储、去重校验和 doctor/incident 重读结果也写入
+同一事件目录，并以源事件哈希或 source run/sequence 关联。运行 writer 在任何持久 I/O 前扫描 message、嵌套
+data 和 artifact；只有确实发现并替换敏感内容时，才在同一批次以源事件哈希派生
+`security.secret-detected` 与 `security.redaction-applied`。真实角色 `beforeToolCall` 的机械权限拒绝则沿角色/tool
+span 产生 `tool-policy-denied` 和 `security.access-denied`。每个隔离角色 stage 的真实 reset 记录
+`budget.reserved`；允许的只读工具 preflight 逐次记录 `budget.consumed`；首个超限请求在执行前记录
+`budget.exhausted/budget-exhausted`。三类记录保留角色 span、工具调用身份与机械计数，但不保存原始工具参数。
+当前定向证据为可观测性 52/52、核心与进程 runner 118/118、扩展 55/55 和 CLI/RPC 18/18，共 243/243；
+该证据还覆盖真实 AgentSession retry、provider 输出长度截断、受控任务进程 heartbeat 派生的工具进展，以及
+损坏目标链的独立 incident 记录。它证明真实宿主退出后的跨进程 trace、run writer lease、内容 artifact、
+Security 和隔离 stage 只读预算基础连续性，不外推为存活子进程的安全重接管或其他预算类型已实现。
 
 ### 17.4 结构化日志格式
 
@@ -748,6 +769,33 @@ token 延迟、总时长、输入输出 token 计数和公开输出是否为空�
 产物哈希、执行前后文件哈希和最后一次进展时间。驱动进程的退出码必须反映最终 outcome，不能只打印布尔
 结果后退出零。
 
+当前工作树已实现第一个可执行目录版本：所有新运行记录写入 `eventCatalogVersion: 1`，writer 在 artifact 落盘
+前、reader 在哈希链接受前都机械校验精确 `eventName × outcome`；未知版本、未知名称和非法组合均以
+`event-chain-invalid` 失败关闭。没有目录版本的旧 schema-v1 JSONL 继续按遗留规则只读，禁止把旧证据静默
+重写成新目录。目录定义覆盖本节全部 37 个协议名称和当前稳定内部事件；当前工作树也已为 37 个协议事件
+全部建立真实产品写路径。process 的
+spawned/heartbeat/exited/orphan-detected 全部接入统一异步 runner 与恢复路径。task、milestone 和 delivery 不再
+各自使用 `spawnSync`；runner 取得 OS PID 后、退出回调前
+写 `process.spawned`，长运行期间写心跳，退出时写退出码、信号、超时、持续时间、最后进展时间、输出字节数、
+截断状态和 stdout/stderr 哈希。恢复发现开放进程 span 时先写 `process.orphan-detected`，再以
+`process.exited/abandoned/process-orphaned` 归档；这只是检测与失败关闭，不代表已验证或接管仍存活的子进程。
+AgentSession 的真实 `auto_retry_start` 在当前活动 provider request 下写 `provider.request.retry`，保留 attempt、
+maxAttempts 与 delay，不复制 provider 原始错误正文；该请求终态写权威 retryCount。机械修复回合的第二次
+provider 调用仍使用独立 `providerRequestId` 和独立 span，不伪造成 transport retry。provider 记录模型身份、请求轮次、权威 retryCount、阶段超时、总时长、
+输出长度和空输出状态，当前 provider 层无法提供的首 token、token 计数和 HTTP 状态明确记录为 `null`，不做
+猜测。runtime run writer 的 acquired/renewed/expired/released 来自真实锁生命周期，但不代表内部 index 锁或
+任务/文件授权租约。artifact stored/verified/missing 来自真实内容存储、磁盘重读或缺失诊断。Security writer
+仅在脱敏值确实变化时写 secret-detected/redaction-applied，已脱敏标记与 input/output token 计量字段不误报；
+access-denied 只由真实工具策略终态派生，三个事件均禁止递归 artifact。Budget 的 reserved 来自隔离 stage reset，
+consumed 来自获准只读工具 preflight，exhausted 来自首个超限请求的执行前阻断；记录只含角色 span、toolCallId、
+工具名与 used/limit/remaining，不含原始参数，且不代表项目总预算、token/时间/磁盘预算或任务/文件租约。
+provider 输出以 `stopReason: length` 结束时写 `role.session.truncated/failed/budget-exhausted`，不会把截断正文当作
+成功角色报告。与工具 span 绑定的受控进程 heartbeat 同批派生 `tool.call.progress`，共享 `toolCallId`、`processId`
+和父子 span。incident 读取损坏目标链时，在显式隔离诊断 run 中写 `event.chain.invalid`；该 run 自身保持哈希链和
+fsync，但绝不重建或替换不可验证的受信索引，普通 writer 仍失败关闭。17.5 的 37/37 产品事件接线已完成，
+但进程事件尚未携带所有动作执行前后文件哈希，provider token/首 token/HTTP 状态仍受底层权威回调限制，
+每事件完整 data schema、轮转与保留也未完成，因此第 17 章整体仍为部分实现。
+
 ### 17.6 状态转换日志
 
 每次状态转换无论成功或拒绝都必须记录：
@@ -768,6 +816,15 @@ token 延迟、总时长、输入输出 token 计数和公开输出是否为空�
 
 状态对象同时保存最后一次转换的 `transitionLogId`。`status`、报告和用户界面只能展示有对应转换日志的
 状态。若派生状态与重放结果不一致，进入 `state-projection-mismatch`，禁止继续执行。
+
+当前工作树已实现该基础：状态 schema v12 在 `team.json` 内保存版本化 `transitionLogs`，每个 team、role、
+challenge、task、milestone、checkpoint、process issue 和 delivery verification 对象保存最后一次 applied
+记录的 `transitionLogId`。生命周期转换写入 attempted/applied 或 attempted/rejected 对，随后批量镜像到现有
+哈希链运行日志；状态加载、`status --explain`、共享工作板和 `doctor` 在展示前重放并校验投影。任务和里程碑
+submission、final-verification readiness 与协作退回等已有对象的 guard 拒绝会持久化稳定原因码；对象创建前
+的格式、身份、授权和命令接纳错误仍作为普通操作失败，不伪造成状态转换。v11 迁移只建立明确的
+`legacy-v11-migration-baseline`，不伪造旧历史。该证据仍不等于第 17 章事件目录、快照、轮转、保留和事故包
+全部完成。
 
 ### 17.7 稳定原因码
 
@@ -792,6 +849,7 @@ event-fsync-failed
 artifact-missing
 state-projection-mismatch
 budget-exhausted
+secret-detected
 no-governed-progress
 coordinator-restarted
 unclassified-runtime-error
@@ -810,6 +868,12 @@ unclassified-runtime-error
 - 恢复时，所有只有 `started` 而没有合法终态的 span 必须追加 `abandoned`；
 - 如果对应子进程仍存在，必须验证 PID、启动时间、命令哈希和工作目录后才能重新接管；
 - 无法确认的进程不得猜测为成功、失败或可安全重试。
+
+当前运行段和索引锁使用协调器私有 owner sidecar 保存 owner ID、PID、进程启动时间以及可执行文件、命令和
+工作目录的 SHA-256，不保存原始命令、目录或密钥值。只有 owner schema 与锁类型均合法、锁目录仍为空且记录
+PID 明确返回 `ESRCH` 时，重启宿主才会提前移除 proper-lockfile 遗留目录；PID 存活、元数据缺失/损坏、权限
+拒绝或锁目录含未知内容均失败关闭。这里仅完成“原 owner 明确不存在”的恢复，并未实现存活进程或 PID 复用
+场景下基于启动时间、命令哈希和工作目录的重接管，因此 17.8 仍为部分实现。
 
 ### 17.9 查询与诊断接口
 
@@ -917,7 +981,7 @@ unclassified-runtime-error
 
 | 步骤 | 原迁移内容 | 实现状态 | 当前证据与边界 |
 |---|---|---|---|
-| 1 | 先定义统一关联 ID、稳定原因码、结构化日志 writer、内容寻址产物和只读 `trace/doctor` 查询。 | 已实现，本阶段完成恢复与索引补强 | `ansteel-team-observability.ts` 已提供关联 ID、稳定原因码、结构化 JSONL、内容寻址产物及 `trace/doctor`；提交 `76c3918` 增加成功恢复审计和可校验 `run-index.json`。`ansteel-team-observability.test.ts` 覆盖链证据、历史选择器、索引重建和损坏链失败关闭；这不是日志轮转、保留自动化或真实 provider 运行验证。 |
+| 1 | 先定义统一关联 ID、稳定原因码、结构化日志 writer、内容寻址产物和只读 `trace/doctor` 查询。 | 已实现，17.3 跨进程与 17.5 全部 37 个事件已机械接线 | `ansteel-team-observability.ts` 已提供关联 ID、稳定原因码、结构化 JSONL、内容寻址产物及 `trace/doctor`；提交 `76c3918` 增加成功恢复审计和可校验 `run-index.json`。当前工作树进一步实现恢复运行的新 `runId`/原 `traceId`、精确恢复点和根环境指纹，密钥值不参与指纹或日志。task、milestone 和 delivery 已共享受控异步 process runner；真实 RPC 任务路径验证 `tool.call -> process.spawned -> process.heartbeat + tool.call.progress -> process.exited`。runtime run writer 精确产生四个 lease 事件，真实 RPC 宿主强杀探针证明原 lease expired、恢复方新 lease 归档开放 span 并真实释放。artifact writer 把源事件与非自引用的 `artifact.stored` 放在同一日志 fsync batch；重复内容和 doctor/incident 校验只有在磁盘 SHA-256 真实匹配后写 verified，缺失或不匹配写 missing/failed。Security writer 在持久化前返回不含值/路径/哈希的计数摘要，同批派生 secret-detected/redaction-applied；真实 RPC 角色读取协调器私有状态被 `beforeToolCall` 阻断，并产生带 tool cause hash 的 access-denied。Security 事件自身携密或附 artifact 时，整个 batch 在任何 artifact I/O 前失败关闭。隔离 stage reset 和只读工具 preflight 精确产生 reserved/consumed/exhausted，真实 RPC 的 5-read 夹具证明第 5 次请求在执行前耗尽且不派生 Security 事件。AgentSession retry、provider 长度截断和损坏链 incident 又补齐 provider retry、role truncated 与独立 chain-invalid 事实。incident schema v2 进一步机械聚合任务/revision、公共审计区间、span 树、脱敏配置摘要、完整性、工作区、最后合法检查点和恢复入口；上下文不可验证时显式标记 unavailable。当前定向回归为可观测性 52/52、核心与进程 runner 118/118、扩展 55/55、CLI/RPC 18/18，共 243/243。仍未实现内部 index 锁与任务/文件租约事件、其他预算类型、日志轮转、保留自动化和存活/PID 复用进程的安全重接管。 |
 | 2 | 扩展当前 `events.jsonl` 为版本化公共协作事件协议，并增加严格重放验证。 | 已实现 | `ansteel-team.ts` 的版本化公共事件、哈希链、状态投影和严格重放已有确定性测试，新增 `action-assessed`、`action-review`、`runtime-recovery` 也进入同一校验路径。证据限于当前单协调器、本地持久化边界。 |
 | 3 | 引入共享工作板投影和公开工作检查点，不改变现有最终交付门禁。 | 已实现 | `ansteel-team.ts` 与扩展已从持久事件机械投影工作板，公开检查点、问题、解决和复核均有状态重放测试；任务与里程碑的最终双同伴评审仍保留，没有被动作确认替代。 |
 | 4 | 给三个持久角色增加检查点、质疑、解决、决定和租约转交工具。 | 已实现，限当前任务所有权模型 | 三个持久角色均可使用检查点、问题、解决、复核和动作确认工具；任务 owner、精确文件 claim、依赖释放和恢复策略由协调器校验。当前“租约转交”仅指协调器分配、不可重叠文件 claim 和受配置约束的 owner 恢复；第 7 步增加了类型化批量分配，但仍不代表任意角色间动态转让。 |
@@ -925,10 +989,10 @@ unclassified-runtime-error
 | 6 | 引入绿色、黄色、红色风险分类和对应阻断规则。 | 已实现并完成远端验收 | 提交 `c09bca6`、`3e3a618`、`5f2059f` 分别建立机械分类、双同伴精确绑定确认和真实工具执行前门禁；提交 `d86ebc58f218f9ca82021f8e58070d3f106796b5` 完成可信根终态、文件原子身份与统一脱敏整改。最终规格与代码质量复审均批准；七文件串行回归为 `241 passed / 1 skipped`，构建与静态检查通过；对应 GitHub Actions `Ansteel governance gate` 运行 `30548808891` 结论为 `success`。动作门禁仍不证明最终交付正确。 |
 | 7 | 允许 TL、Staff、QA 分别拥有不同类型任务和不重叠文件。 | 已实现并通过本地机械验收，远端以对应提交 CI 为准 | 状态版本升级到 v9，任务持久化 `architecture`、`integration`、`implementation`、`verification` 类型；非默认角色必须公开 `assignmentReason`。协调器以单个 `tasks-assigned` 事件和 pending transaction 原子提交 2 至 3 个不同 owner、文件不重叠的任务；三个持久会话在 owner wave 中真实并行，所有 owner settle 后才依次进入每任务双独立复审。旧任务或里程碑按不可变 revision 进入全局跨角色复审队列，失败项保留并可从持久状态重建，只重试缺失 reviewer。当前七文件串行回归为 `248 passed / 1 skipped`，构建与静态检查通过；这些确定性证据不等于真实三提供商探针。 |
 | 8 | 把现有双评审改为持续协作后的最终独立验证，而不是主要协作机制。 | 已实现，远端 Actions 通过 | 状态升级到 v10：任务和里程碑在 `submitted` 阶段先要求两名非 owner 的、带证据且按 revision 去重的公开协作更新；协调器检查冻结任务 diff、成功测试、未关闭 blocking/critical 问题后才转入 `final-verification`，再发起原有双独立 `approve/reject`。任务漂移或提交阶段的 blocking/critical 过程问题会退回 owner；旧 v9 `submitted` 迁移为遗留 `final-verification` 且不伪造协作历史。扩展、CLI/RPC、并行延迟队列与重启重建均按协作和最终验证两阶段处理。本地七文件串行回归为 `252 passed / 1 skipped`，`npm run build` 通过；GitHub Actions `Ansteel governance gate` 运行 `30568236446` 结论为 `success`。这些仍是确定性证据，不等于真实三提供商探针。 |
-| 9 | 接入 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 三轴状态。 | 已实现；v11 独立 delivery 增量待本提交远端 Actions | 三轴和 `workflowStatus` 继续只从校验后的持久事实投影。状态 v11 新增 coordinator-only `/ansteel-team verify`、项目外 version 1 manifest、结构化 argv、环境白名单、内容寻址外部输出、任务 diff/整仓 workspace/Git HEAD/manifest 哈希绑定，以及 `task-delivery-started/check/passed/failed` 签名事件。只有当前 revision 的 passed 收据才能解锁依赖和 milestone；v10 迁移不伪造收据并重新阻断旧解锁状态。核心 105、可观测性 26、扩展 52、CLI/RPC 14，另四个 Ansteel 回归文件 203，共 400 项本地串行回归通过；其中 RPC 同时覆盖成功与 `check-failed` 失败关闭，工作板重放会拒绝被篡改的 delivery 投影，超时、启动失败、task/workspace/HEAD 漂移和证据目录回指项目均失败关闭。此前 GitHub Actions 的候选包成功仍不等于 delivery passed，本增量的远端结论以推送后的 Actions 为准。 |
+| 9 | 接入 `collaborationStatus`、`governanceStatus`、`deliveryStatus` 三轴状态。 | 已实现；v11 远端 Actions 与真实三提供商固定夹具通过 | 三轴和 `workflowStatus` 继续只从校验后的持久事实投影。状态 v11 新增 coordinator-only `/ansteel-team verify`、项目外 version 1 manifest、结构化 argv、环境白名单、内容寻址外部输出、任务 diff/整仓 workspace/Git HEAD/manifest 哈希绑定，以及 `task-delivery-started/check/passed/failed` 签名事件。只有当前 revision 的 passed 收据才能解锁依赖和 milestone；v10 迁移不伪造收据并重新阻断旧解锁状态。核心 105、可观测性 26、扩展 52、CLI/RPC 14，另四个 Ansteel 回归文件 203，共 400 项本地串行回归通过；其中 RPC 同时覆盖成功与 `check-failed` 失败关闭，工作板重放会拒绝被篡改的 delivery 投影，超时、启动失败、task/workspace/HEAD 漂移和证据目录回指项目均失败关闭。提交 `05ca4c8` 对应 GitHub Actions `Ansteel governance gate` 运行 `30697009634` 结论为 `success`。真实三提供商 r27 又以项目外 manifest 完成两项 delivery 检查，并在 stop 前由 `status --explain` 直接给出 collaboration-complete、governance approved、delivery passed、workflow completed。 |
 | 10 | 最后启用角色签名、日志段完整性校验和里程碑 Merkle Root 外部锚定。 | 已实现并完成保护边界验收 | 提交 `2b016a0` 为 tech-lead、staff-engineer、qa-engineer、coordinator 建立独立 Ed25519 身份，按声明角色严格验证域分离 JCS 事件签名；签名清单公开持久化，私钥留在角色不可读的 gitignored 运行目录。`anchor` 对已批准任务或里程碑的不可变事件前缀生成 SHA-256/JCS Merkle Root，绑定签名清单、运行索引及日志段前缀快照后写入并推送专用 Git notes ref；`verify-anchor` 复验远端端点、提交可达性、notes 对象、签名清单和日志前缀，替换、截断、重签或 force-push 均失败关闭。实现时四组回归为 356/356；当前 HEAD 复跑核心 97、可观测性 26、CLI 13、扩展 52，共 188/188 通过。提交 `3caa2748` 记录 GitHub `main` 保护规则已启用删除与非快进保护；GitHub ruleset 不能覆盖 `refs/notes/**`，因此 notes 维度仍依赖显式 `verify-anchor`，不得宣称具有服务端不可删除保证。 |
 
-真实三提供商证据已从配置与确定性测试升级为真实运行。L1：`--ansteel` r7 在耐久租约队列上完成两轮修订、独立验证与 Staff/QA 双会签；`/ansteel-team` r12 完成持久团队启动链，r13-r18 验证并行任务、风险门禁、恢复和失败关闭，双计数修复后的 r20 首次完成 revision 1 submission、两个公开协作更新、最终验证请求与 TL/QA 双 `approve`，任务终态为 `approved`。L3：r20 是 v11 delivery 机制合入前的单文件、单任务、单次成功样本，没有运行项目外 manifest，不能追认为 `deliveryStatus: passed`；多任务、长任务、多轮收敛和真实 coordinator delivery 仍需新的固定夹具探针。完整历史证据见 `docs/superpowers/reports/2026-07-31-ansteel-team-real-three-provider-probe.md`。
+真实三提供商证据已从配置与确定性测试升级为真实运行。L1：`--ansteel` r7 在耐久租约队列上完成两轮修订、独立验证与 Staff/QA 双会签；`/ansteel-team` r12 完成持久团队启动链，r13-r18 验证并行任务、风险门禁、恢复和失败关闭，r20 首次完成 revision 1 submission、两个公开协作更新、最终验证请求与 TL/QA 双 `approve`。v11 固定夹具 r23 与 r26 首次两次取得真实 `deliveryStatus: passed`，并分别暴露旧 revision 与 taskless checkpoint 污染治理投影；修复后的 r27 以 106 个签名公共事件、零 role-failure、唯一源码 diff、公开/隐藏测试和两项 coordinator delivery 检查，直接达到四轴完整终态。冻结同一 HEAD 与原始 diff hash 后，r28-r30 以 3/3 重复该完整终态。r34 又在 255 个签名事件内保留 predecessor revision 1 `check-failed` 回执，通过 revision 2 恢复后才解锁并交付 dependent，最终四轴完整完成。L3：3 次固定单任务样本和 1 次双任务顺序恢复仍不能外推为长任务、任意并发规模或任意模型组合的生产成功率。完整历史证据见 `docs/superpowers/reports/2026-07-31-ansteel-team-real-three-provider-probe.md`。
 
 旧状态必须显式迁移。不能从旧 `approved` 推导新 `collaboration-complete` 或 `deliveryStatus: passed`；
 缺少公开过程事件的旧任务最多标记为 `legacy-governance-approved`，依赖是否可用仍按旧版本隔离处理。
@@ -961,6 +1025,8 @@ unclassified-runtime-error
 - provider 超时、工具非零退出和状态 guard 拒绝均能通过同一 trace 精确定位；
 - `status --explain`、`trace`、`doctor` 和脱敏事故包返回一致原因；
 - CLI、RPC、报告和退出码准确反映失败状态；
+- 历史失败 delivery 回执在新 revision 后仍可重放，但不能满足当前 revision 或回滚依赖状态；
+- `/verify` 成功或失败后活动状态都与持久化状态同步，同一会话可直接恢复 `revision-required`；
 - 任何角色都不能读取协调器私有目录、隐藏 Oracle 或其他角色私有会话。
 
 ### 20.3 对抗测试

@@ -1,4 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import * as nodeFs from "node:fs";
 import {
 	closeSync,
 	existsSync,
@@ -7,12 +9,16 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
+	rmdirSync,
 	statSync,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
+import { arch, platform, release } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { type Span as OpenTelemetrySpan, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
 	BasicTracerProvider,
@@ -21,13 +27,344 @@ import {
 	type SpanExporter,
 } from "@opentelemetry/sdk-trace-base";
 import lockfile from "proper-lockfile";
+import { VERSION } from "../config.ts";
 import { canonicalizeAnsteelAuditValue, hashAnsteelAuditValue } from "./ansteel-team-integrity.ts";
 
 const ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS = 300_000;
 const ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS = 10_000;
 const ANSTEEL_RUNTIME_INDEX_LOCK_STALE_MS = 300_000;
 const ANSTEEL_RUNTIME_INDEX_LOCK_UPDATE_MS = 10_000;
+const ANSTEEL_RUNTIME_LEASE_AUDIT_GATE_STALE_MS = 30_000;
+const ANSTEEL_RUNTIME_LEASE_AUDIT_GATE_UPDATE_MS = 5_000;
+const ANSTEEL_RUNTIME_LOCK_CONTENTION_TIMEOUT_MS = 5_000;
+const ANSTEEL_RUNTIME_LOCK_CONTENTION_RETRY_MS = 10;
 const ANSTEEL_RUNTIME_INDEX_SCHEMA_VERSION = 1;
+const ANSTEEL_TEAM_EXTENSION_VERSION = "3.3";
+const ANSTEEL_RUNTIME_GIT_TIMEOUT_MS = 5_000;
+const ANSTEEL_RUNTIME_DIAGNOSTIC_COMMAND = /^(?:board|status|trace|doctor|incident)(?:\s|$)/;
+const ANSTEEL_RUNTIME_LOCK_OWNER_SCHEMA_VERSION = 1;
+export const ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION = 1 as const;
+
+interface AnsteelRuntimeLockOwner {
+	schemaVersion: typeof ANSTEEL_RUNTIME_LOCK_OWNER_SCHEMA_VERSION;
+	ownerId: string;
+	pid: number;
+	processStartedAtUtc: string;
+	executableHash: string;
+	commandHash: string;
+	workingDirectoryHash: string;
+	lockKind: "index" | "run" | "audit-gate";
+	acquiredAtUtc: string;
+}
+
+const CURRENT_PROCESS_STARTED_AT_UTC = new Date(Date.now() - process.uptime() * 1000).toISOString();
+const ANSTEEL_RUNTIME_LOCK_RETRY_SIGNAL = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+function isAnsteelRuntimeLockContention(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		String((error as { code?: unknown }).code) === "ELOCKED"
+	);
+}
+
+/**
+ * proper-lockfile 的同步 API 不支持 retries。这里使用单调时钟和 Atomics.wait 做很短的同步等待，
+ * 只吸收另一个进程正在完成 fsync、索引替换或 lease 释放回执的正常竞争窗口。等待有明确上限，
+ * 超时后仍把原始 ELOCKED 交给上层失败关闭；因此真实泄漏、活 owner 或权限问题不会被掩盖。
+ */
+function waitForAnsteelRuntimeLockRetry(deadline: number): boolean {
+	const remainingMs = deadline - performance.now();
+	if (remainingMs <= 0) return false;
+	Atomics.wait(
+		ANSTEEL_RUNTIME_LOCK_RETRY_SIGNAL,
+		0,
+		0,
+		Math.min(ANSTEEL_RUNTIME_LOCK_CONTENTION_RETRY_MS, remainingMs),
+	);
+	return true;
+}
+
+function acquireAnsteelRuntimeAuditGate(gatePath: string, deadline: number): () => void {
+	for (;;) {
+		let release: (() => void) | undefined;
+		try {
+			release = lockfile.lockSync(gatePath, {
+				realpath: false,
+				stale: ANSTEEL_RUNTIME_LEASE_AUDIT_GATE_STALE_MS,
+				update: ANSTEEL_RUNTIME_LEASE_AUDIT_GATE_UPDATE_MS,
+			});
+		} catch (error) {
+			if (!isAnsteelRuntimeLockContention(error)) throw error;
+			// 宿主可能在“已取得门、尚未完成索引或 lease 回执”时被强杀。审计门也写入和
+			// run/index 锁相同强度的私有 owner 记录；只有 PID 明确不存在时才提前删除空锁目录。
+			// 无 owner、元数据损坏、活 PID 或权限不确定仍继续视为被占用，最终有界失败关闭。
+			if (recoverDeadAnsteelRuntimeLock(gatePath, "audit-gate") !== undefined) continue;
+			if (!waitForAnsteelRuntimeLockRetry(deadline)) throw error;
+			continue;
+		}
+
+		const owner = createAnsteelRuntimeLockOwner("audit-gate");
+		const ownerPath = getAnsteelRuntimeLockOwnerPath(gatePath);
+		try {
+			if (existsSync(ownerPath)) unlinkSync(ownerPath);
+			writeNewDurableFile(ownerPath, `${JSON.stringify(owner)}\n`);
+		} catch (error) {
+			release();
+			throw error;
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			release!();
+			released = true;
+			const currentOwner = readAnsteelRuntimeLockOwner(gatePath);
+			if (currentOwner?.ownerId === owner.ownerId) unlinkSync(ownerPath);
+		};
+	}
+}
+
+function getAnsteelRuntimeLockOwnerPath(path: string): string {
+	return `${path}.lock-owner.json`;
+}
+
+function getAnsteelRuntimeLockDirectoryPath(path: string): string {
+	return `${path}.lock`;
+}
+
+function getAnsteelRuntimeLeaseAuditGatePath(path: string): string {
+	return `${path}.lease-audit-gate`;
+}
+
+function createAnsteelRuntimeLockOwner(lockKind: AnsteelRuntimeLockOwner["lockKind"]): AnsteelRuntimeLockOwner {
+	return {
+		schemaVersion: ANSTEEL_RUNTIME_LOCK_OWNER_SCHEMA_VERSION,
+		ownerId: randomUUID(),
+		pid: process.pid,
+		processStartedAtUtc: CURRENT_PROCESS_STARTED_AT_UTC,
+		executableHash: hashAnsteelAuditValue(process.execPath),
+		commandHash: hashAnsteelAuditValue(process.argv),
+		workingDirectoryHash: hashAnsteelAuditValue(process.cwd()),
+		lockKind,
+		acquiredAtUtc: new Date().toISOString(),
+	};
+}
+
+function parseAnsteelRuntimeLockOwner(value: unknown): AnsteelRuntimeLockOwner | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const owner = value as Record<string, unknown>;
+	if (
+		owner.schemaVersion !== ANSTEEL_RUNTIME_LOCK_OWNER_SCHEMA_VERSION ||
+		typeof owner.ownerId !== "string" ||
+		!Number.isSafeInteger(owner.pid) ||
+		(owner.pid as number) <= 0 ||
+		typeof owner.processStartedAtUtc !== "string" ||
+		Number.isNaN(Date.parse(owner.processStartedAtUtc)) ||
+		typeof owner.executableHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(owner.executableHash) ||
+		typeof owner.commandHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(owner.commandHash) ||
+		typeof owner.workingDirectoryHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(owner.workingDirectoryHash) ||
+		(owner.lockKind !== "index" && owner.lockKind !== "run" && owner.lockKind !== "audit-gate") ||
+		typeof owner.acquiredAtUtc !== "string" ||
+		Number.isNaN(Date.parse(owner.acquiredAtUtc))
+	) {
+		return undefined;
+	}
+	return owner as unknown as AnsteelRuntimeLockOwner;
+}
+
+function isProcessDefinitelyAbsent(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return false;
+	} catch (error) {
+		return (
+			typeof error === "object" &&
+			error !== null &&
+			"code" in error &&
+			String((error as { code?: unknown }).code) === "ESRCH"
+		);
+	}
+}
+
+/**
+ * 进程崩溃后，proper-lockfile 的锁目录可能一直残留到 stale 周期结束。
+ * 只有协调器写入的 owner 记录格式完整，并且操作系统能够明确证明记录的 PID
+ * 已不存在时，才允许提前回收该锁。PID 仍存活或被复用、元数据缺失、访问被拒绝、
+ * owner 记录损坏等情况一律保持锁定，避免把“不确定”误判为“无人占用”。
+ */
+function readAnsteelRuntimeLockOwner(path: string): AnsteelRuntimeLockOwner | undefined {
+	const ownerPath = getAnsteelRuntimeLockOwnerPath(path);
+	if (!existsSync(ownerPath)) return undefined;
+	try {
+		return parseAnsteelRuntimeLockOwner(JSON.parse(readFileSync(ownerPath, "utf8")));
+	} catch {
+		return undefined;
+	}
+}
+
+function recoverDeadAnsteelRuntimeLock(
+	path: string,
+	lockKind: AnsteelRuntimeLockOwner["lockKind"],
+): AnsteelRuntimeLockOwner | undefined {
+	const ownerPath = getAnsteelRuntimeLockOwnerPath(path);
+	const lockDirectoryPath = getAnsteelRuntimeLockDirectoryPath(path);
+	if (!existsSync(ownerPath) || !existsSync(lockDirectoryPath)) return undefined;
+	const owner = readAnsteelRuntimeLockOwner(path);
+	if (owner?.lockKind !== lockKind || !isProcessDefinitelyAbsent(owner.pid)) return undefined;
+	try {
+		// proper-lockfile 按契约只拥有一个空锁目录。这里故意拒绝递归删除：
+		// 一旦目录中出现意外文件或上游格式变化，恢复动作必须失败关闭，不能扩大删除范围。
+		rmdirSync(lockDirectoryPath);
+		unlinkSync(ownerPath);
+		return owner;
+	} catch {
+		return undefined;
+	}
+}
+
+interface AnsteelRuntimeLockReleaseReceipt {
+	releasedAtUtc: string;
+	renewalCount: number;
+}
+
+interface AnsteelRuntimeLockHandle {
+	owner: AnsteelRuntimeLockOwner;
+	previousOwner?: AnsteelRuntimeLockOwner;
+	resourceHash: string;
+	assertOwned(): void;
+	setRenewedListener(listener: (renewedAtUtc: string, renewalCount: number) => void): void;
+	release(onReleased?: (receipt: AnsteelRuntimeLockReleaseReceipt) => void): void;
+}
+
+function acquireAnsteelRuntimeLock(
+	path: string,
+	lockKind: AnsteelRuntimeLockOwner["lockKind"],
+	stale: number,
+	update: number,
+): AnsteelRuntimeLockHandle {
+	const deadline = performance.now() + ANSTEEL_RUNTIME_LOCK_CONTENTION_TIMEOUT_MS;
+	for (;;) {
+		let owned = false;
+		let renewalCount = 0;
+		let renewedListener: ((renewedAtUtc: string, renewalCount: number) => void) | undefined;
+		let compromisedError: Error | undefined;
+		const leaseFs = {
+			...nodeFs,
+			utimesSync(target: nodeFs.PathLike, atime: string | number | Date, mtime: string | number | Date): void {
+				nodeFs.utimesSync(target, atime, mtime);
+				if (!owned) return;
+				renewalCount++;
+				const completedRenewalCount = renewalCount;
+				const renewedAtUtc = new Date().toISOString();
+				queueMicrotask(() => renewedListener?.(renewedAtUtc, completedRenewalCount));
+			},
+		};
+		const acquire = (): (() => void) =>
+			lockfile.lockSync(path, {
+				realpath: false,
+				stale,
+				update,
+				fs: leaseFs,
+				onCompromised(error) {
+					owned = false;
+					compromisedError = error;
+				},
+			});
+		// 所有协作写入者在替换 owner 旁路文件或释放 run 锁前，都必须通过这个短生命周期审计门。
+		// 它封住“旧 owner 已释放操作系统锁，但释放回执尚未持久化”的竞态窗口，防止新 owner
+		// 在缺少可追溯交接事实时接管同一条运行链。
+		const gatePath = getAnsteelRuntimeLeaseAuditGatePath(path);
+		let releaseAuditGate: (() => void) | undefined;
+		let retryContention = false;
+		let contentionError: unknown;
+		try {
+			releaseAuditGate = acquireAnsteelRuntimeAuditGate(gatePath, deadline);
+			const previousOwner = readAnsteelRuntimeLockOwner(path);
+			let release: (() => void) | undefined;
+			try {
+				release = acquire();
+			} catch (error) {
+				if (!isAnsteelRuntimeLockContention(error) || recoverDeadAnsteelRuntimeLock(path, lockKind) === undefined) {
+					throw error;
+				}
+				release = acquire();
+			}
+			owned = true;
+			const ownerPath = getAnsteelRuntimeLockOwnerPath(path);
+			const owner = createAnsteelRuntimeLockOwner(lockKind);
+			try {
+				if (existsSync(ownerPath)) unlinkSync(ownerPath);
+				writeNewDurableFile(ownerPath, `${JSON.stringify(owner)}\n`);
+			} catch (error) {
+				owned = false;
+				release();
+				throw error;
+			}
+			let released = false;
+			return {
+				owner,
+				...(previousOwner === undefined || previousOwner.ownerId === owner.ownerId ? {} : { previousOwner }),
+				resourceHash: hashAnsteelAuditValue(resolve(path).replace(/\\/g, "/")),
+				assertOwned() {
+					if (!owned || compromisedError !== undefined) {
+						throw new AnsteelObservabilityError(
+							"lease-owner-mismatch",
+							"Ansteel runtime lease is no longer owned by this writer",
+							compromisedError === undefined ? undefined : { cause: compromisedError },
+						);
+					}
+				},
+				setRenewedListener(listener) {
+					renewedListener = listener;
+				},
+				release(onReleased) {
+					if (released) return;
+					const releaseGate = acquireAnsteelRuntimeAuditGate(
+						gatePath,
+						performance.now() + ANSTEEL_RUNTIME_LOCK_CONTENTION_TIMEOUT_MS,
+					);
+					try {
+						if (!owned || compromisedError !== undefined) {
+							throw new AnsteelObservabilityError(
+								"lease-owner-mismatch",
+								"Ansteel runtime lease cannot be released because ownership was lost",
+								compromisedError === undefined ? undefined : { cause: compromisedError },
+							);
+						}
+						// 只有操作系统锁实际消失后，才允许生成成功释放回执。回执 fsync 完成前持续持有
+						// 审计门，因此新 owner 不可能插入“锁已释放”和“回执已落盘”两个事实之间。
+						release!();
+						owned = false;
+						released = true;
+						const receipt = { releasedAtUtc: new Date().toISOString(), renewalCount };
+						onReleased?.(receipt);
+						const currentOwner = readAnsteelRuntimeLockOwner(path);
+						if (currentOwner?.ownerId === owner.ownerId) unlinkSync(getAnsteelRuntimeLockOwnerPath(path));
+					} finally {
+						releaseGate();
+					}
+				},
+			};
+		} catch (error) {
+			// 资源锁被另一个活进程持有时，绝不能拿着审计门等待：旧 owner 释放资源也必须
+			// 经过同一扇门。这里只记录需要重试，finally 先释放门，再在循环尾部短暂等待，
+			// 从结构上排除“竞争者持门等资源、owner 持资源等门”的跨进程死锁。
+			if (isAnsteelRuntimeLockContention(error) && performance.now() < deadline) {
+				retryContention = true;
+				contentionError = error;
+			} else throw error;
+		} finally {
+			releaseAuditGate?.();
+		}
+		if (!retryContention || !waitForAnsteelRuntimeLockRetry(deadline)) {
+			throw contentionError;
+		}
+	}
+}
 
 const ANSTEEL_RUNTIME_INDEX_SELECTOR_FIELDS = [
 	"traceId",
@@ -63,12 +400,137 @@ export const ANSTEEL_RUNTIME_REASON_CODES = [
 	"artifact-missing",
 	"state-projection-mismatch",
 	"budget-exhausted",
+	"secret-detected",
 	"no-governed-progress",
 	"coordinator-restarted",
 	"unclassified-runtime-error",
 ] as const;
 
 export type AnsteelRuntimeReasonCode = (typeof ANSTEEL_RUNTIME_REASON_CODES)[number];
+
+export type AnsteelRuntimeOutcome = "started" | "progress" | "succeeded" | "failed" | "cancelled" | "abandoned";
+
+export const ANSTEEL_PROTOCOL_RUNTIME_EVENT_NAMES = [
+	"run.started",
+	"run.resumed",
+	"run.completed",
+	"run.failed",
+	"role.session.started",
+	"role.session.output",
+	"role.session.truncated",
+	"role.session.ended",
+	"provider.request.started",
+	"provider.request.retry",
+	"provider.request.completed",
+	"tool.call.started",
+	"tool.call.progress",
+	"tool.call.completed",
+	"process.spawned",
+	"process.heartbeat",
+	"process.exited",
+	"process.orphan-detected",
+	"state.transition.attempted",
+	"state.transition.applied",
+	"state.transition.rejected",
+	"lease.acquired",
+	"lease.renewed",
+	"lease.expired",
+	"lease.released",
+	"event.appended",
+	"event.fsync.completed",
+	"event.chain.invalid",
+	"artifact.stored",
+	"artifact.verified",
+	"artifact.missing",
+	"budget.reserved",
+	"budget.consumed",
+	"budget.exhausted",
+	"security.access-denied",
+	"security.redaction-applied",
+	"security.secret-detected",
+] as const;
+
+const ANSTEEL_RUNTIME_SPAN_OUTCOMES = ["started", "succeeded", "failed", "cancelled", "abandoned"] as const;
+const ANSTEEL_RUNTIME_TERMINAL_OUTCOMES = ["succeeded", "failed", "cancelled", "abandoned"] as const;
+
+/**
+ * v1 事件目录是强制白名单，不是说明性文档。它同时覆盖协议规定的 37 个事件和已经跨越
+ * 持久化边界的稳定内部事件。新增事件名必须显式修改目录与测试，防止拼写错误或临时杜撰的
+ * 遥测字段静默进入审计证据。
+ */
+export const ANSTEEL_RUNTIME_EVENT_CATALOG = {
+	"run.started": ["started"],
+	"run.resumed": ["progress"],
+	"run.completed": ["succeeded"],
+	"run.failed": ["failed", "cancelled", "abandoned"],
+	"role.session.started": ["started"],
+	"role.session.output": ["progress"],
+	"role.session.truncated": ["progress", "failed"],
+	"role.session.ended": ANSTEEL_RUNTIME_TERMINAL_OUTCOMES,
+	"provider.request.started": ["started"],
+	"provider.request.retry": ["progress"],
+	"provider.request.completed": ANSTEEL_RUNTIME_TERMINAL_OUTCOMES,
+	"tool.call.started": ["started"],
+	"tool.call.progress": ["progress"],
+	"tool.call.completed": ANSTEEL_RUNTIME_TERMINAL_OUTCOMES,
+	"process.spawned": ["started"],
+	"process.heartbeat": ["progress"],
+	"process.exited": ANSTEEL_RUNTIME_TERMINAL_OUTCOMES,
+	"process.orphan-detected": ["abandoned"],
+	"state.transition.attempted": ["progress"],
+	"state.transition.applied": ["succeeded"],
+	"state.transition.rejected": ["failed"],
+	"lease.acquired": ["succeeded"],
+	"lease.renewed": ["progress"],
+	"lease.expired": ["failed"],
+	"lease.released": ["succeeded"],
+	"event.appended": ["succeeded"],
+	"event.fsync.completed": ["succeeded"],
+	"event.chain.invalid": ["failed"],
+	"artifact.stored": ["succeeded"],
+	"artifact.verified": ["succeeded"],
+	"artifact.missing": ["failed"],
+	"budget.reserved": ["progress"],
+	"budget.consumed": ["progress"],
+	"budget.exhausted": ["failed"],
+	"security.access-denied": ["failed"],
+	"security.redaction-applied": ["succeeded"],
+	"security.secret-detected": ["failed"],
+	"runtime-index-rebuilt": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"state.persisted": ["succeeded"],
+	"transaction.persisted": ["succeeded"],
+	"event.ledger.rewritten": ["succeeded"],
+	"action.assess": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"action.review": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"checkpoint.publish": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"milestone.collaboration.publish": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"milestone.create": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"milestone.final-verification.begin": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"milestone.review": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"milestone.submit": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"process.issue": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"process.resolve": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"process.review": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.claim": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.claim.parallel": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.collaboration.publish": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.collaboration.return": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.final-verification.begin": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.review": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	"task.submit": ANSTEEL_RUNTIME_SPAN_OUTCOMES,
+	// 这些通用 task 事件目前保留给确定性的日志段/索引夹具和后续任务进度接线；
+	// 生产编排当前使用上方粒度更细的 task 操作 span，避免同一动作出现两套含义重叠的事实。
+	"task.started": ["started"],
+	"task.progress": ["progress"],
+	"task.completed": ANSTEEL_RUNTIME_TERMINAL_OUTCOMES,
+} as const satisfies Record<string, readonly AnsteelRuntimeOutcome[]>;
+
+export type AnsteelRuntimeEventName = keyof typeof ANSTEEL_RUNTIME_EVENT_CATALOG;
+
+export function isAnsteelRuntimeEventCombination(eventName: string, outcome: string): boolean {
+	const allowed = (ANSTEEL_RUNTIME_EVENT_CATALOG as Record<string, readonly string[]>)[eventName];
+	return allowed?.includes(outcome) ?? false;
+}
 
 export interface AnsteelRunContext {
 	runId: string;
@@ -80,6 +542,22 @@ export interface AnsteelRunContext {
 	resumedFromSequence?: number;
 }
 
+export interface AnsteelRuntimeEnvironmentFingerprint {
+	productVersion: string;
+	extensionVersion: string;
+	gitCommit: string | null;
+	configStatus: "missing" | "parsed" | "invalid";
+	configFingerprint: string;
+	featureFlags: Record<string, boolean | number | string | string[]>;
+	nodeVersion: string;
+	osPlatform: string;
+	osRelease: string;
+	architecture: string;
+	projectRootId: string;
+	enabledEnvironmentVariables: string[];
+	environmentFingerprint: string;
+}
+
 export interface AnsteelRuntimeArtifactRef {
 	kind: string;
 	sha256: string;
@@ -88,12 +566,14 @@ export interface AnsteelRuntimeArtifactRef {
 
 export interface AnsteelRuntimeLogEntry {
 	schemaVersion: 1;
+	/** 仅在事件目录开始强制校验之前写入的旧 schema-v1 记录中允许缺失。 */
+	eventCatalogVersion?: typeof ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION;
 	timestampUtc: string;
 	monotonicElapsedNs: string;
 	sequence: number;
 	level: "debug" | "info" | "warn" | "error" | "audit";
 	eventName: string;
-	outcome: "started" | "progress" | "succeeded" | "failed" | "cancelled" | "abandoned";
+	outcome: AnsteelRuntimeOutcome;
 	reasonCode?: AnsteelRuntimeReasonCode;
 	runId: string;
 	traceId: string;
@@ -122,6 +602,7 @@ export interface AnsteelRuntimeLogEntry {
 export type AnsteelRuntimeLogInput = Omit<
 	AnsteelRuntimeLogEntry,
 	| "schemaVersion"
+	| "eventCatalogVersion"
 	| "timestampUtc"
 	| "monotonicElapsedNs"
 	| "sequence"
@@ -173,6 +654,7 @@ export interface AnsteelRuntimeSpanStartOptions {
 export interface AnsteelRuntimeLogger {
 	readonly context: AnsteelRunContext;
 	write(input: AnsteelRuntimeLogInput): AnsteelRuntimeLogEntry;
+	writeBatch(inputs: readonly AnsteelRuntimeLogInput[]): AnsteelRuntimeLogEntry[];
 	startSpan(eventName: string, options?: AnsteelRuntimeSpanStartOptions): AnsteelRuntimeSpan;
 	forceFlush(): Promise<void>;
 	close(): void;
@@ -271,18 +753,57 @@ export function createAnsteelRunContext(input: {
 	teamId: string;
 	command: string;
 	now?: Date;
+	traceId?: string;
 	resumedFromRunId?: string;
 	resumedFromSequence?: number;
 }): AnsteelRunContext {
 	return {
 		runId: `RUN-${randomUUID()}`,
-		traceId: randomBytes(16).toString("hex"),
+		traceId: input.traceId ?? randomBytes(16).toString("hex"),
 		teamId: input.teamId,
 		command: input.command,
 		startedAt: (input.now ?? new Date()).toISOString(),
 		...(input.resumedFromRunId === undefined ? {} : { resumedFromRunId: input.resumedFromRunId }),
 		...(input.resumedFromSequence === undefined ? {} : { resumedFromSequence: input.resumedFromSequence }),
 	};
+}
+
+/**
+ * 只从同一持久团队最近一次业务操作命令恢复。只读诊断命令即使紧邻 Pi 重启前执行，
+ * 也不能成为后续工作的因果父节点，否则 status/trace/doctor/incident 会污染真实执行链。
+ */
+export function createAnsteelResumedRunContext(
+	cwd: string,
+	input: { teamId: string; command: string; now?: Date; taskId?: string },
+): AnsteelRunContext {
+	const resumePoint = listAnsteelRuntimeRuns(cwd)
+		.filter((run) => run.teamId === input.teamId)
+		.map((run) => ({ run, entries: readAnsteelRuntimeLogs(cwd, run.runId) }))
+		.filter(({ entries }) => {
+			const command = entries.find(
+				(entry) =>
+					entry.eventName === "run.started" && entry.outcome === "started" && entry.parentSpanId === undefined,
+			)?.data.command;
+			return (
+				typeof command === "string" &&
+				!ANSTEEL_RUNTIME_DIAGNOSTIC_COMMAND.test(command) &&
+				(input.taskId === undefined ||
+					command === `task ${input.taskId}` ||
+					entries.some((entry) => entry.taskId === input.taskId))
+			);
+		})
+		.at(-1);
+	if (resumePoint === undefined) return createAnsteelRunContext(input);
+	const lastEntry = resumePoint.entries.at(-1);
+	if (lastEntry === undefined || resumePoint.run.traceId === undefined) return createAnsteelRunContext(input);
+	return createAnsteelRunContext({
+		teamId: input.teamId,
+		command: input.command,
+		...(input.now === undefined ? {} : { now: input.now }),
+		traceId: resumePoint.run.traceId,
+		resumedFromRunId: resumePoint.run.runId,
+		resumedFromSequence: lastEntry.sequence,
+	});
 }
 
 function getAnsteelTeamRuntimeDirectory(cwd: string): string {
@@ -329,39 +850,215 @@ function getAnsteelRuntimeLogPath(cwd: string, runId: string, segment = 1): stri
 	return join(getAnsteelRuntimeLogDirectory(cwd), `run-${runId}-${String(segment).padStart(4, "0")}.jsonl`);
 }
 
-const SENSITIVE_FIELD = /authorization|api[_-]?key|token|cookie|secret|password|private[_-]?key/i;
+// 匹配可能携带凭据的字段名，包括 provider 前缀、snake_case、kebab-case 和常见 camelCase。
+// 末尾锚点刻意排除 inputTokens、maxTokens、tokenCountsAvailable 等无敏感值的正常遥测字段。
+const SENSITIVE_FIELD_SUFFIX =
+	/(?:^|_)(?:authorization|api_?key|(?:access|refresh|session|security|id|auth)?_?token|cookie|(?:client_?)?secret(?:_?(?:access_?)?(?:key|value))?|password(?:_?hash)?|private_?key|credentials?)$/;
 
-/**
- * Remove credentials before text crosses either the runtime-log boundary or
- * the public collaboration/UI boundary. The assignment rule accepts `=` and
- * `:` plus quoted JSON keys/values; scheme credentials are handled first so an
- * `Authorization: Basic <value>` suffix cannot survive a shorter key match.
- */
-export function redactAnsteelSensitiveText(value: string): string {
+function isAnsteelSensitiveFieldName(key: string): boolean {
+	const normalized = key
+		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+		.replace(/-/g, "_")
+		.toLowerCase();
+	return SENSITIVE_FIELD_SUFFIX.test(normalized);
+}
+
+export interface AnsteelSensitiveRedactionResult<T> {
+	value: T;
+	findingCount: number;
+	sensitiveFieldCount: number;
+	sensitiveTextMatchCount: number;
+}
+
+interface MutableAnsteelSensitiveRedactionSummary {
+	findingCount: number;
+	sensitiveFieldCount: number;
+	sensitiveTextMatchCount: number;
+}
+
+function isRedactionMarker(value: unknown): boolean {
+	return typeof value === "string" && /^\[?REDACTED\]?$/i.test(value.trim().replace(/^['"]|['"]$/g, ""));
+}
+
+function redactAnsteelSensitiveTextInto(value: string, summary: MutableAnsteelSensitiveRedactionSummary): string {
 	return value
 		.replace(
 			/((?:"|')?([A-Za-z_][A-Za-z0-9_-]*)(?:"|')?\s*[:=]\s*)((?:Bearer|Basic)\s+[^\s"',;}\]]+|"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
-			(match, prefix: string, key: string) => (SENSITIVE_FIELD.test(key) ? `${prefix}[REDACTED]` : match),
+			(match, prefix: string, key: string, credential: string) => {
+				if (!isAnsteelSensitiveFieldName(key) || isRedactionMarker(credential) || /^\[REDACTED/i.test(credential)) {
+					return match;
+				}
+				summary.findingCount++;
+				summary.sensitiveTextMatchCount++;
+				return `${prefix}[REDACTED]`;
+			},
 		)
-		.replace(/\b(Bearer|Basic)\s+[^\s"',;}\]]+/gi, "$1 [REDACTED]")
-		.replace(/\bsk-[A-Za-z0-9._-]+\b/g, "sk-[REDACTED]");
+		.replace(/\b(Bearer|Basic)\s+([^\s"',;}]+)/gi, (match, scheme: string, credential: string) => {
+			if (isRedactionMarker(credential) || /^\[REDACTED/i.test(credential)) return match;
+			summary.findingCount++;
+			summary.sensitiveTextMatchCount++;
+			return `${scheme} [REDACTED]`;
+		})
+		.replace(/\bsk-[A-Za-z0-9._-]+\b/g, (match) => {
+			if (match === "sk-[REDACTED]") return match;
+			summary.findingCount++;
+			summary.sensitiveTextMatchCount++;
+			return "sk-[REDACTED]";
+		});
 }
 
-export function redactAnsteelSensitiveValue(value: unknown, seen = new WeakSet<object>()): unknown {
-	if (typeof value === "string") return redactAnsteelSensitiveText(value);
-	if (Array.isArray(value)) return value.map((item) => redactAnsteelSensitiveValue(item, seen));
+function redactAnsteelSensitiveValueInto(
+	value: unknown,
+	summary: MutableAnsteelSensitiveRedactionSummary,
+	seen: WeakSet<object>,
+): unknown {
+	if (typeof value === "string") return redactAnsteelSensitiveTextInto(value, summary);
+	if (Array.isArray(value)) return value.map((item) => redactAnsteelSensitiveValueInto(item, summary, seen));
 	if (typeof value !== "object" || value === null) return value;
 	if (seen.has(value)) return "[Circular]";
 	seen.add(value);
 	const result = Object.create(null) as Record<string, unknown>;
 	for (const [key, entry] of Object.entries(value)) {
-		result[key] = SENSITIVE_FIELD.test(key) ? "[REDACTED]" : redactAnsteelSensitiveValue(entry, seen);
+		if (isAnsteelSensitiveFieldName(key)) {
+			result[key] = "[REDACTED]";
+			if (!isRedactionMarker(entry)) {
+				summary.findingCount++;
+				summary.sensitiveFieldCount++;
+			}
+			continue;
+		}
+		result[key] = redactAnsteelSensitiveValueInto(entry, summary, seen);
 	}
 	return result;
 }
 
+/**
+ * 同时返回脱敏后的安全文本和“仅计数”的发现摘要。摘要绝不包含命中值、字段路径，
+ * 也不保存可能被用作低熵秘密离线猜测 Oracle 的可逆或稳定哈希。
+ */
+export function inspectAndRedactAnsteelSensitiveText(value: string): AnsteelSensitiveRedactionResult<string> {
+	const summary: MutableAnsteelSensitiveRedactionSummary = {
+		findingCount: 0,
+		sensitiveFieldCount: 0,
+		sensitiveTextMatchCount: 0,
+	};
+	return { value: redactAnsteelSensitiveTextInto(value, summary), ...summary };
+}
+
+/** 对结构化值递归执行同一套“仅计数、不泄漏命中内容”的安全扫描。 */
+export function inspectAndRedactAnsteelSensitiveValue(value: unknown): AnsteelSensitiveRedactionResult<unknown> {
+	const summary: MutableAnsteelSensitiveRedactionSummary = {
+		findingCount: 0,
+		sensitiveFieldCount: 0,
+		sensitiveTextMatchCount: 0,
+	};
+	return { value: redactAnsteelSensitiveValueInto(value, summary, new WeakSet<object>()), ...summary };
+}
+
+/**
+ * 文本跨越运行日志或公共协作/UI 边界之前先移除凭据。赋值规则同时识别 `=`、`:` 和带引号的
+ * JSON 键值；认证 scheme 必须优先处理，避免 `Authorization: Basic <value>` 的尾部凭据因较短
+ * 字段规则先命中而残留。
+ */
+export function redactAnsteelSensitiveText(value: string): string {
+	return inspectAndRedactAnsteelSensitiveText(value).value;
+}
+
+export function redactAnsteelSensitiveValue(value: unknown): unknown {
+	return inspectAndRedactAnsteelSensitiveValue(value).value;
+}
+
 function redactRecord(value: Record<string, unknown>): Record<string, unknown> {
 	return redactAnsteelSensitiveValue(value) as Record<string, unknown>;
+}
+
+function readAnsteelRuntimeConfiguration(cwd: string): {
+	status: AnsteelRuntimeEnvironmentFingerprint["configStatus"];
+	fingerprint: string;
+	featureFlags: AnsteelRuntimeEnvironmentFingerprint["featureFlags"];
+} {
+	const path = join(resolve(cwd), ".pi", "ansteel.json");
+	if (!existsSync(path)) {
+		return {
+			status: "missing",
+			fingerprint: hashAnsteelAuditValue({ status: "missing" }),
+			featureFlags: {},
+		};
+	}
+	let value: unknown;
+	try {
+		value = JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		// 非法配置只对“invalid”状态做指纹，不哈希任意损坏文本；否则其中夹带的凭据可能把
+		// 配置指纹变成可离线枚举的密码 Oracle。
+		return {
+			status: "invalid",
+			fingerprint: hashAnsteelAuditValue({ status: "invalid" }),
+			featureFlags: {},
+		};
+	}
+	const record = isRecord(value) ? value : {};
+	const adaptiveBudgetPolicy = isRecord(record.adaptiveBudgetPolicy) ? record.adaptiveBudgetPolicy : undefined;
+	const taskOwners = Array.isArray(record.teamTaskOwners)
+		? record.teamTaskOwners.filter((role): role is string => typeof role === "string")
+		: [];
+	const featureFlags: AnsteelRuntimeEnvironmentFingerprint["featureFlags"] = {
+		allowProviderFallback: record.allowProviderFallback === true,
+		allowSingleModel: record.allowSingleModel === true,
+		adaptiveBudget: adaptiveBudgetPolicy?.enabled === true,
+		reviewRoot: record.reviewRoot === "git-root" ? "git-root" : "cwd",
+		teamTaskOwners: taskOwners,
+	};
+	for (const field of ["teamTaskMaxEpochs", "teamTaskMaxNoProgressEpochs", "stageTimeoutMs", "maxToolCallsPerStage"]) {
+		const fieldValue = record[field];
+		if (typeof fieldValue === "number" && Number.isFinite(fieldValue)) featureFlags[field] = fieldValue;
+	}
+	return {
+		status: "parsed",
+		fingerprint: hashAnsteelAuditValue(redactAnsteelSensitiveValue(value)),
+		featureFlags,
+	};
+}
+
+function readAnsteelGitCommit(cwd: string): string | null {
+	const result = spawnSync("git", ["-C", cwd, "rev-parse", "HEAD"], {
+		encoding: "utf8",
+		timeout: ANSTEEL_RUNTIME_GIT_TIMEOUT_MS,
+		windowsHide: true,
+	});
+	const commit = result.status === 0 ? result.stdout.trim().toLowerCase() : "";
+	return /^[0-9a-f]{40,64}$/.test(commit) ? commit : null;
+}
+
+/** 为一次根执行构造不可变、无凭据的环境描述。 */
+export function createAnsteelRuntimeEnvironmentFingerprint(cwd: string): AnsteelRuntimeEnvironmentFingerprint {
+	const configuration = readAnsteelRuntimeConfiguration(cwd);
+	let canonicalRoot = resolve(cwd);
+	try {
+		canonicalRoot = realpathSync(canonicalRoot);
+	} catch {
+		// 日志器会在其他边界拒绝不可用的项目目录；这里保留规范化失败前的 resolve 结果，
+		// 仍可为同一失败环境生成确定性指纹，而不把原始路径写入日志。
+	}
+	canonicalRoot = canonicalRoot.replace(/\\/g, "/");
+	if (process.platform === "win32") canonicalRoot = canonicalRoot.toLowerCase();
+	const unsigned = {
+		productVersion: VERSION,
+		extensionVersion: ANSTEEL_TEAM_EXTENSION_VERSION,
+		gitCommit: readAnsteelGitCommit(cwd),
+		configStatus: configuration.status,
+		configFingerprint: configuration.fingerprint,
+		featureFlags: configuration.featureFlags,
+		nodeVersion: process.version,
+		osPlatform: platform(),
+		osRelease: release(),
+		architecture: arch(),
+		projectRootId: createHash("sha256").update(canonicalRoot, "utf8").digest("hex"),
+		enabledEnvironmentVariables: Object.keys(process.env)
+			.filter((name) => name.startsWith("ANSTEEL_") || name === "PI_OFFLINE" || name === "PI_SKIP_VERSION_CHECK")
+			.sort(),
+	};
+	return { ...unsigned, environmentFingerprint: hashAnsteelAuditValue(unsigned) };
 }
 
 function writeBuffer(fd: number, content: Buffer): void {
@@ -379,25 +1076,71 @@ function writeNewDurableFile(path: string, content: string): void {
 	}
 }
 
-function storeArtifact(cwd: string, artifact: { kind: string; content: string }): AnsteelRuntimeArtifactRef {
+interface AnsteelStoredArtifact {
+	ref: AnsteelRuntimeArtifactRef;
+	storageResult: "created" | "deduplicated-and-verified";
+	contentByteLength: number;
+}
+
+interface AnsteelArtifactInspection {
+	verificationResult: "verified" | "missing" | "hash-mismatch" | "unreadable";
+	actualHash?: string;
+}
+
+function storeArtifact(cwd: string, artifact: { kind: string; content: string }): AnsteelStoredArtifact {
 	const content = redactAnsteelSensitiveText(artifact.content);
 	const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
 	const directory = getAnsteelRuntimeArtifactDirectory(cwd);
 	mkdirSync(directory, { recursive: true });
 	const storageId = join(directory, sha256);
+	let storageResult: AnsteelStoredArtifact["storageResult"];
 	if (!existsSync(storageId)) {
 		writeNewDurableFile(storageId, content);
-	} else if (createHash("sha256").update(readFileSync(storageId)).digest("hex") !== sha256) {
-		throw new AnsteelObservabilityError(
-			"artifact-missing",
-			"Ansteel runtime artifact content does not match its hash",
-		);
+		storageResult = "created";
+	} else {
+		const inspection = inspectAnsteelRuntimeArtifact({ kind: artifact.kind, sha256, storageId });
+		if (inspection.verificationResult !== "verified") {
+			throw new AnsteelObservabilityError(
+				"artifact-missing",
+				"Ansteel runtime artifact content does not match its hash",
+			);
+		}
+		storageResult = "deduplicated-and-verified";
 	}
-	return { kind: artifact.kind, sha256, storageId };
+	return {
+		ref: { kind: artifact.kind, sha256, storageId },
+		storageResult,
+		contentByteLength: Buffer.byteLength(content, "utf8"),
+	};
+}
+
+function inspectAnsteelRuntimeArtifact(artifact: AnsteelRuntimeArtifactRef): AnsteelArtifactInspection {
+	if (!existsSync(artifact.storageId)) return { verificationResult: "missing" };
+	try {
+		const actualHash = createHash("sha256").update(readFileSync(artifact.storageId)).digest("hex");
+		return actualHash === artifact.sha256
+			? { verificationResult: "verified", actualHash }
+			: { verificationResult: "hash-mismatch", actualHash };
+	} catch {
+		return { verificationResult: "unreadable" };
+	}
 }
 
 function hashRuntimeLogEntry(entry: Omit<AnsteelRuntimeLogEntry, "hash">): string {
 	return createHash("sha256").update(JSON.stringify(entry), "utf8").digest("hex");
+}
+
+function assertAnsteelRuntimeEventCombination(eventName: unknown, outcome: unknown): asserts eventName is string {
+	if (
+		typeof eventName !== "string" ||
+		typeof outcome !== "string" ||
+		!isAnsteelRuntimeEventCombination(eventName, outcome)
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime event catalog rejects ${String(eventName)} with outcome ${String(outcome)}`,
+		);
+	}
 }
 
 function parseRuntimeLogEntry(value: unknown): AnsteelRuntimeLogEntry {
@@ -407,6 +1150,16 @@ function parseRuntimeLogEntry(value: unknown): AnsteelRuntimeLogEntry {
 	const entry = value as AnsteelRuntimeLogEntry;
 	if (entry.schemaVersion !== 1 || !Number.isSafeInteger(entry.sequence) || entry.sequence < 1) {
 		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has invalid metadata");
+	}
+	const catalogVersion = (value as Record<string, unknown>).eventCatalogVersion;
+	if (catalogVersion !== undefined && catalogVersion !== ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime event catalog version ${String(catalogVersion)} is unsupported`,
+		);
+	}
+	if (catalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION) {
+		assertAnsteelRuntimeEventCombination(entry.eventName, entry.outcome);
 	}
 	if (
 		typeof entry.runId !== "string" ||
@@ -745,6 +1498,7 @@ function startRuntimeIndexRebuildAudit(
 	const spanId = randomBytes(8).toString("hex");
 	const unsigned = {
 		schemaVersion: 1 as const,
+		eventCatalogVersion: ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION,
 		timestampUtc: rebuiltAt,
 		monotonicElapsedNs: "0",
 		sequence: 1,
@@ -786,6 +1540,7 @@ function completeRuntimeIndexRebuildAudit(
 ): void {
 	const unsigned = {
 		schemaVersion: 1 as const,
+		eventCatalogVersion: ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION,
 		timestampUtc: new Date().toISOString(),
 		monotonicElapsedNs: "0",
 		sequence: 2,
@@ -1250,13 +2005,14 @@ function replaceRuntimeIndexRunLocked(cwd: string, index: AnsteelRuntimeIndex, r
 function withRuntimeIndexLock<T>(cwd: string, action: () => T): T {
 	const path = getAnsteelRuntimeIndexPath(cwd);
 	mkdirSync(getAnsteelTeamRuntimeDirectory(cwd), { recursive: true });
-	let releaseIndexLock: (() => void) | undefined;
+	let indexLock: AnsteelRuntimeLockHandle | undefined;
 	try {
-		releaseIndexLock = lockfile.lockSync(path, {
-			realpath: false,
-			stale: ANSTEEL_RUNTIME_INDEX_LOCK_STALE_MS,
-			update: ANSTEEL_RUNTIME_INDEX_LOCK_UPDATE_MS,
-		});
+		indexLock = acquireAnsteelRuntimeLock(
+			path,
+			"index",
+			ANSTEEL_RUNTIME_INDEX_LOCK_STALE_MS,
+			ANSTEEL_RUNTIME_INDEX_LOCK_UPDATE_MS,
+		);
 	} catch (error) {
 		throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime index lock could not be acquired", {
 			cause: error,
@@ -1265,7 +2021,7 @@ function withRuntimeIndexLock<T>(cwd: string, action: () => T): T {
 	try {
 		return action();
 	} finally {
-		releaseIndexLock();
+		indexLock.release();
 	}
 }
 
@@ -1296,20 +2052,240 @@ export interface AnsteelRuntimeRunSummary {
 	terminalOutcome?: AnsteelRuntimeLogEntry["outcome"];
 }
 
+export interface AnsteelIncidentEventRef {
+	sequence: number;
+	timestampUtc: string;
+	eventName: string;
+	outcome: AnsteelRuntimeOutcome;
+	reasonCode?: AnsteelRuntimeReasonCode;
+	spanId: string;
+	parentSpanId?: string;
+	causeEventId?: string;
+	hash: string;
+}
+
+export interface AnsteelIncidentSpanNode {
+	spanId: string;
+	parentSpanId?: string;
+	eventSequences: number[];
+	childSpanIds: string[];
+	startEvent?: AnsteelIncidentEventRef;
+	terminalEvent?: AnsteelIncidentEventRef;
+}
+
+export interface AnsteelIncidentTaskIdentity {
+	taskId: string;
+	runtimeRevisions: number[];
+	currentRevision?: number;
+	currentStatus?: string;
+}
+
+export interface AnsteelIncidentProjectContextVerified {
+	availability: "verified";
+	teamId: string;
+	taskIdentities: AnsteelIncidentTaskIdentity[];
+	publicAuditEventRange: {
+		firstSequence: number | null;
+		lastSequence: number | null;
+		eventCount: number;
+		headHash: string | null;
+		integrity: "verified";
+	};
+	teamState: {
+		status: string;
+		collaborationStatus: string;
+		governanceStatus: string;
+		deliveryStatus: string;
+		workflowStatus: string;
+	};
+	lastValidCheckpoint: {
+		checkpointId: string;
+		taskId?: string;
+		actor: string;
+		status: string;
+		createdAt: string;
+		risk: string;
+		confidence: string;
+		nextAction: { kind: string; target: string; expectedResult: string };
+		checkpointHash: string;
+		eventSequence?: number;
+	} | null;
+	workspace:
+		| {
+				status: "captured";
+				hash: string;
+				trackedDiffHash: string;
+				untracked: Array<{ file: string; sha256: string }>;
+		  }
+		| { status: "unavailable"; reasonCode: "workspace-snapshot-unavailable" };
+	recoveryEntry: {
+		kind: "checkpoint" | "task-revision" | "team-resume" | "manual";
+		command: string;
+		checkpointId?: string;
+		taskId?: string;
+		revision?: number;
+	};
+}
+
+export interface AnsteelIncidentProjectContextUnavailable {
+	availability: "unavailable";
+	reasonCode: "team-state-missing" | "team-integrity-unavailable";
+}
+
+/**
+ * 可观测性层拥有事故包 schema，团队层拥有生成“已验证项目上下文”所需的状态事实。
+ * 通过显式参数传入上下文，可以保持现有 team -> observability 单向运行时依赖，避免循环导入；
+ * 同时，纯运行故障在没有团队状态时能够如实标记上下文缺失，而不是伪造任务或 revision。
+ */
+export type AnsteelIncidentProjectContext =
+	| AnsteelIncidentProjectContextVerified
+	| AnsteelIncidentProjectContextUnavailable;
+
 export interface AnsteelIncidentBundle {
 	storageId: string;
 	sha256: string;
 	manifest: {
-		schemaVersion: 1;
-		runId: string;
-		traceId?: string;
-		createdAt: string;
+		schemaVersion: 2;
+		evidenceModel: "mechanical-facts-only";
+		run: {
+			runId: string;
+			traceId?: string;
+			teamId?: string;
+			startedAt?: string;
+			endedAt?: string;
+			terminalOutcome?: AnsteelRuntimeOutcome;
+		};
 		healthy: boolean;
 		rootCause?: AnsteelRuntimeLogEntry;
+		propagationEvents: AnsteelIncidentEventRef[];
+		finalRuntimeState: {
+			terminalEvent?: AnsteelIncidentEventRef;
+			lastObservedEvent?: AnsteelIncidentEventRef;
+		};
 		issues: AnsteelRuntimeDiagnosisIssue[];
-		logHashes: string[];
+		spanTree: { rootSpanIds: string[]; nodes: AnsteelIncidentSpanNode[] };
+		logSegments: Array<{
+			fileName: string;
+			expectedSha256?: string;
+			actualSha256?: string;
+			byteLength?: number;
+			verificationResult: "verified" | "missing" | "hash-mismatch" | "unindexed";
+		}>;
 		artifactRefs: AnsteelRuntimeArtifactRef[];
+		configurationSummary: {
+			runtimeEnvironment?: {
+				productVersion: string;
+				extensionVersion: string;
+				gitCommit: string | null;
+				configStatus: string;
+				configFingerprint: string;
+				environmentFingerprint: string;
+				featureFlags: Record<string, boolean | number | string | string[]>;
+				enabledEnvironmentVariables: string[];
+			};
+			providers: Array<{
+				providerRequestId: string;
+				role?: AnsteelRuntimeLogEntry["role"];
+				provider: string;
+				model: string;
+				configurationIdentity: string;
+				timeoutMs: number | null;
+				retryCount: number;
+			}>;
+			tools: Array<{
+				toolCallId: string;
+				role?: AnsteelRuntimeLogEntry["role"];
+				toolName: string;
+				policyBoundary: string;
+			}>;
+		};
+		integrity: {
+			runtimeEventChain: {
+				status: "verified" | "failed";
+				entryCount: number;
+				headHash?: string;
+				reasonCode?: AnsteelRuntimeReasonCode;
+				message?: string;
+			};
+			logSegments: { status: "verified" | "failed"; runIndexHash?: string };
+			artifacts: {
+				status: "verified" | "failed" | "unavailable";
+				verifiedCount: number;
+				missingCount: number;
+				results: Array<{
+					kind: string;
+					sha256: string;
+					verificationResult: "verified" | "missing" | "hash-mismatch";
+					actualHash?: string;
+				}>;
+			};
+		};
+		projectContext: AnsteelIncidentProjectContext;
 	};
+}
+
+function getAnsteelRuntimeSpanStartEventName(spanName: string): string {
+	switch (spanName) {
+		case "run":
+		case "run.started":
+			return "run.started";
+		case "role.session":
+		case "role.session.started":
+			return "role.session.started";
+		case "provider.request":
+		case "provider.request.started":
+			return "provider.request.started";
+		case "tool.call":
+		case "tool.call.started":
+			return "tool.call.started";
+		case "process":
+		case "process.spawned":
+			return "process.spawned";
+		default:
+			return spanName;
+	}
+}
+
+function getAnsteelRuntimeSpanTerminalEventName(
+	startEventName: string,
+	outcome: AnsteelRuntimeSpanEndInput["outcome"],
+): string {
+	switch (startEventName) {
+		case "run.started":
+			return outcome === "succeeded" ? "run.completed" : "run.failed";
+		case "role.session.started":
+			return "role.session.ended";
+		case "provider.request.started":
+			return "provider.request.completed";
+		case "tool.call.started":
+			return "tool.call.completed";
+		case "process.spawned":
+			return "process.exited";
+		default:
+			return startEventName;
+	}
+}
+
+function isAnsteelRuntimeTerminalOutcome(
+	outcome: AnsteelRuntimeOutcome,
+): outcome is AnsteelRuntimeSpanEndInput["outcome"] {
+	return (ANSTEEL_RUNTIME_TERMINAL_OUTCOMES as readonly AnsteelRuntimeOutcome[]).includes(outcome);
+}
+
+function isAnsteelRuntimeTerminalForStart(start: AnsteelRuntimeLogEntry, terminal: AnsteelRuntimeLogEntry): boolean {
+	if (
+		terminal.sequence <= start.sequence ||
+		terminal.spanId !== start.spanId ||
+		terminal.parentSpanId !== start.parentSpanId ||
+		!isAnsteelRuntimeTerminalOutcome(terminal.outcome)
+	) {
+		return false;
+	}
+	const expectedEventName =
+		start.eventCatalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION
+			? getAnsteelRuntimeSpanTerminalEventName(start.eventName, terminal.outcome)
+			: start.eventName;
+	return terminal.eventName === expectedEventName;
 }
 
 function getRuntimeTerminalOutcome(
@@ -1320,17 +2296,7 @@ function getRuntimeTerminalOutcome(
 	);
 	if (rootStarts.length !== 1) return undefined;
 	const rootStart = rootStarts[0]!;
-	const terminals = entries.filter(
-		(entry) =>
-			entry.sequence > rootStart.sequence &&
-			entry.eventName === rootStart.eventName &&
-			entry.spanId === rootStart.spanId &&
-			entry.parentSpanId === rootStart.parentSpanId &&
-			(entry.outcome === "succeeded" ||
-				entry.outcome === "failed" ||
-				entry.outcome === "cancelled" ||
-				entry.outcome === "abandoned"),
-	);
+	const terminals = entries.filter((entry) => isAnsteelRuntimeTerminalForStart(rootStart, entry));
 	return terminals.length === 1 ? terminals[0]!.outcome : undefined;
 }
 
@@ -1342,6 +2308,21 @@ export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] 
 				const entries = readAnsteelRuntimeLogs(cwd, runId);
 				const first = entries[0];
 				const last = entries.at(-1);
+				let lastOperational: AnsteelRuntimeLogEntry | undefined;
+				for (let index = entries.length - 1; index >= 0; index--) {
+					const entry = entries[index]!;
+					// 成功的 lease/artifact/security 生命周期回执描述的是审计底座，而不是它们保护的
+					// 业务命令结果。跳过这些回执，确保释放锁、存储产物或成功脱敏后，最后业务终态仍可见。
+					if (
+						entry.eventName.startsWith("lease.") ||
+						entry.eventName.startsWith("artifact.") ||
+						entry.eventName.startsWith("security.")
+					) {
+						continue;
+					}
+					lastOperational = entry;
+					break;
+				}
 				const terminalOutcome = getRuntimeTerminalOutcome(entries);
 				return {
 					runId,
@@ -1350,7 +2331,7 @@ export function listAnsteelRuntimeRuns(cwd: string): AnsteelRuntimeRunSummary[] 
 					...(first?.timestampUtc === undefined ? {} : { startedAt: first.timestampUtc }),
 					...(last?.timestampUtc === undefined ? {} : { endedAt: last.timestampUtc }),
 					entryCount: entries.length,
-					...(last?.outcome === undefined ? {} : { lastOutcome: last.outcome }),
+					...(lastOperational?.outcome === undefined ? {} : { lastOutcome: lastOperational.outcome }),
 					...(terminalOutcome === undefined ? {} : { terminalOutcome }),
 				};
 			})
@@ -1404,7 +2385,7 @@ export function traceAnsteelTeamRuntime(cwd: string, selector: string): AnsteelR
 function getOrphanedRuntimeSpans(entries: readonly AnsteelRuntimeLogEntry[]): AnsteelRuntimeLogEntry[] {
 	const openSpans = new Map<string, AnsteelRuntimeLogEntry[]>();
 	for (const entry of entries) {
-		const key = `${entry.spanId}\0${entry.eventName}\0${entry.parentSpanId ?? ""}`;
+		const key = `${entry.spanId}\0${entry.parentSpanId ?? ""}`;
 		if (entry.outcome === "started") {
 			const starts = openSpans.get(key);
 			if (starts === undefined) openSpans.set(key, [entry]);
@@ -1417,7 +2398,11 @@ function getOrphanedRuntimeSpans(entries: readonly AnsteelRuntimeLogEntry[]): An
 			entry.outcome === "cancelled" ||
 			entry.outcome === "abandoned"
 		) {
-			openSpans.delete(key);
+			const starts = openSpans.get(key);
+			if (starts === undefined) continue;
+			const remaining = starts.filter((start) => !isAnsteelRuntimeTerminalForStart(start, entry));
+			if (remaining.length === 0) openSpans.delete(key);
+			else openSpans.set(key, remaining);
 		}
 	}
 	return [...openSpans.values()].flat();
@@ -1435,24 +2420,33 @@ export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string):
 		};
 	}
 	const first = observedEntries[0]!;
-	const logger = createAnsteelRuntimeLogger(cwd, {
-		runId,
-		traceId: first.traceId,
-		teamId: first.teamId,
-		command: typeof first.data.command === "string" ? first.data.command : "recovered interrupted command",
-		startedAt: first.timestampUtc,
-	});
+	const observedRoot = observedEntries.find(
+		(entry) => entry.eventName === "run.started" && entry.outcome === "started" && entry.parentSpanId === undefined,
+	);
+	const logger = createAnsteelRuntimeLogger(
+		cwd,
+		{
+			runId,
+			traceId: first.traceId,
+			teamId: first.teamId,
+			command:
+				typeof observedRoot?.data.command === "string"
+					? observedRoot.data.command
+					: "recovered interrupted command",
+			startedAt: first.timestampUtc,
+		},
+		{ auditRunLease: true },
+	);
 	let abandonedSpanCount = 0;
-	let previousHeadHash = observedHeadHash;
+	const previousHeadHash = observedHeadHash;
 	let recoveredHeadHash = observedHeadHash;
 	try {
 		// The run lock is now held. Re-read the chain so recovery never appends
 		// from a stale sequence/hash snapshot.
 		const lockedEntries = readAnsteelRuntimeLogs(cwd, runId);
-		previousHeadHash = lockedEntries.at(-1)?.hash ?? null;
 		const orphanedSpans = getOrphanedRuntimeSpans(lockedEntries);
 		if (orphanedSpans.length === 0) {
-			recoveredHeadHash = previousHeadHash;
+			recoveredHeadHash = lockedEntries.at(-1)?.hash ?? previousHeadHash;
 			return {
 				runId,
 				abandonedSpanCount: 0,
@@ -1462,9 +2456,37 @@ export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string):
 		}
 		abandonedSpanCount = orphanedSpans.length;
 		for (const start of orphanedSpans) {
+			if (
+				start.eventCatalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION &&
+				start.eventName === "process.spawned"
+			) {
+				logger.write({
+					level: "error",
+					eventName: "process.orphan-detected",
+					outcome: "abandoned",
+					reasonCode: "process-orphaned",
+					spanId: start.spanId,
+					...(start.parentSpanId === undefined ? {} : { parentSpanId: start.parentSpanId }),
+					...(start.role === undefined ? {} : { role: start.role }),
+					...(start.taskId === undefined ? {} : { taskId: start.taskId }),
+					...(start.checkpointId === undefined ? {} : { checkpointId: start.checkpointId }),
+					...(start.toolCallId === undefined ? {} : { toolCallId: start.toolCallId }),
+					...(start.processId === undefined ? {} : { processId: start.processId }),
+					causeEventId: start.hash,
+					message: "Ansteel governed subprocess was orphaned when its coordinator stopped",
+					data: {
+						recoveredFromSequence: start.sequence,
+						recoveredFromEventHash: start.hash,
+						pid: start.data.pid ?? null,
+					},
+				});
+			}
 			const recovered = logger.write({
 				level: "error",
-				eventName: start.eventName,
+				eventName:
+					start.eventCatalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION
+						? getAnsteelRuntimeSpanTerminalEventName(start.eventName, "abandoned")
+						: start.eventName,
 				outcome: "abandoned",
 				reasonCode: "process-orphaned",
 				spanId: start.spanId,
@@ -1493,6 +2515,7 @@ export async function abandonOrphanedAnsteelTeamRun(cwd: string, runId: string):
 	} finally {
 		logger.close();
 	}
+	recoveredHeadHash = readAnsteelRuntimeLogs(cwd, runId).at(-1)?.hash ?? recoveredHeadHash;
 	return {
 		runId,
 		abandonedSpanCount,
@@ -1534,10 +2557,8 @@ export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRunti
 	const issues: AnsteelRuntimeDiagnosisIssue[] = [];
 	for (const entry of entries) {
 		for (const artifact of entry.artifactRefs) {
-			const actualHash = existsSync(artifact.storageId)
-				? createHash("sha256").update(readFileSync(artifact.storageId)).digest("hex")
-				: undefined;
-			if (actualHash !== artifact.sha256) {
+			const inspection = inspectAnsteelRuntimeArtifact(artifact);
+			if (inspection.verificationResult !== "verified") {
 				issues.push({
 					reasonCode: "artifact-missing",
 					message: `Ansteel runtime artifact ${artifact.sha256} is missing or does not match`,
@@ -1568,6 +2589,92 @@ export function diagnoseAnsteelTeamRun(cwd: string, runId: string): AnsteelRunti
 	};
 }
 
+/**
+ * 从磁盘重新读取目标 run 引用的每个产物，并把机械校验结果写入调用方独立的诊断 run。
+ * 校验事件与被校验证据分离，避免检查动作反过来修改目标 run；生命周期事件只携带哈希和
+ * source run/sequence 坐标，不允许形成自引用。
+ */
+export function auditAnsteelRuntimeArtifacts(
+	cwd: string,
+	runId: string,
+	logger: AnsteelRuntimeLogger,
+): { verifiedCount: number; missingCount: number } {
+	let entries: AnsteelRuntimeLogEntry[];
+	try {
+		entries = readAnsteelRuntimeLogs(cwd, runId);
+	} catch (error) {
+		if (error instanceof AnsteelObservabilityError && error.reasonCode === "event-chain-invalid") {
+			// 损坏的目标链不能为自身损坏作证。把机械读取失败写入调用方独立的 doctor/incident
+			// 诊断 run；除用户提供且已校验格式的 runId 外，不信任也不复制目标记录中的任何字段。
+			logger.write({
+				level: "error",
+				eventName: "event.chain.invalid",
+				outcome: "failed",
+				reasonCode: "event-chain-invalid",
+				role: "coordinator",
+				message: `Ansteel runtime chain verification failed for ${runId}`,
+				data: {
+					resourceKind: "runtime-log-chain",
+					sourceRunId: runId,
+					verificationBoundary: "diagnostic-target-read",
+				},
+			});
+		}
+		throw error;
+	}
+	if (entries.length === 0) {
+		logger.write({
+			level: "error",
+			eventName: "artifact.missing",
+			outcome: "failed",
+			reasonCode: "artifact-missing",
+			role: "coordinator",
+			message: `Ansteel runtime run ${runId} has no persisted log artifact`,
+			data: { resourceKind: "runtime-log", sourceRunId: runId, verificationResult: "missing" },
+		});
+		return { verifiedCount: 0, missingCount: 1 };
+	}
+	let verifiedCount = 0;
+	let missingCount = 0;
+	for (const entry of entries) {
+		for (const artifact of entry.artifactRefs) {
+			const inspection = inspectAnsteelRuntimeArtifact(artifact);
+			const verified = inspection.verificationResult === "verified";
+			if (verified) verifiedCount++;
+			else missingCount++;
+			logger.write({
+				level: verified ? "audit" : "error",
+				eventName: verified ? "artifact.verified" : "artifact.missing",
+				outcome: verified ? "succeeded" : "failed",
+				...(verified ? {} : { reasonCode: "artifact-missing" as const }),
+				role: "coordinator",
+				...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
+				...(entry.checkpointId === undefined ? {} : { checkpointId: entry.checkpointId }),
+				...(entry.issueId === undefined ? {} : { issueId: entry.issueId }),
+				...(entry.toolCallId === undefined ? {} : { toolCallId: entry.toolCallId }),
+				...(entry.providerRequestId === undefined ? {} : { providerRequestId: entry.providerRequestId }),
+				...(entry.processId === undefined ? {} : { processId: entry.processId }),
+				...(entry.revision === undefined ? {} : { revision: entry.revision }),
+				...(entry.diffHash === undefined ? {} : { diffHash: entry.diffHash }),
+				causeEventId: entry.hash,
+				message: verified
+					? `Ansteel runtime artifact ${artifact.sha256} was verified`
+					: `Ansteel runtime artifact ${artifact.sha256} is missing or does not match`,
+				data: {
+					resourceKind: "content-addressed-artifact",
+					sourceRunId: runId,
+					sourceSequence: entry.sequence,
+					artifactKind: artifact.kind,
+					sha256: artifact.sha256,
+					verificationResult: inspection.verificationResult,
+					...(inspection.actualHash === undefined ? {} : { actualHash: inspection.actualHash }),
+				},
+			});
+		}
+	}
+	return { verifiedCount, missingCount };
+}
+
 export function formatAnsteelTeamDiagnosis(diagnosis: AnsteelRuntimeDiagnosis): string {
 	const lines = [
 		`Run: ${diagnosis.runId}`,
@@ -1584,25 +2691,375 @@ export function formatAnsteelTeamDiagnosis(diagnosis: AnsteelRuntimeDiagnosis): 
 	return lines.join("\n");
 }
 
-export function createAnsteelTeamIncidentBundle(cwd: string, runId: string): AnsteelIncidentBundle {
+function toAnsteelIncidentEventRef(entry: AnsteelRuntimeLogEntry): AnsteelIncidentEventRef {
+	return {
+		sequence: entry.sequence,
+		timestampUtc: entry.timestampUtc,
+		eventName: entry.eventName,
+		outcome: entry.outcome,
+		...(entry.reasonCode === undefined ? {} : { reasonCode: entry.reasonCode }),
+		spanId: entry.spanId,
+		...(entry.parentSpanId === undefined ? {} : { parentSpanId: entry.parentSpanId }),
+		...(entry.causeEventId === undefined ? {} : { causeEventId: entry.causeEventId }),
+		hash: entry.hash,
+	};
+}
+
+function createAnsteelIncidentSpanTree(
+	entries: readonly AnsteelRuntimeLogEntry[],
+): AnsteelIncidentBundle["manifest"]["spanTree"] {
+	const grouped = new Map<string, AnsteelRuntimeLogEntry[]>();
+	for (const entry of entries) {
+		const group = grouped.get(entry.spanId);
+		if (group === undefined) grouped.set(entry.spanId, [entry]);
+		else group.push(entry);
+	}
+	const nodes = [...grouped.entries()]
+		.map(([spanId, spanEntries]): AnsteelIncidentSpanNode => {
+			const ordered = [...spanEntries].sort((left, right) => left.sequence - right.sequence);
+			const parentSpanId = ordered.find((entry) => entry.parentSpanId !== undefined)?.parentSpanId;
+			const start = ordered.find((entry) => entry.outcome === "started");
+			const terminal = [...ordered]
+				.reverse()
+				.find(
+					(entry) =>
+						entry.outcome === "succeeded" ||
+						entry.outcome === "failed" ||
+						entry.outcome === "cancelled" ||
+						entry.outcome === "abandoned",
+				);
+			return {
+				spanId,
+				...(parentSpanId === undefined ? {} : { parentSpanId }),
+				eventSequences: ordered.map((entry) => entry.sequence),
+				childSpanIds: [],
+				...(start === undefined ? {} : { startEvent: toAnsteelIncidentEventRef(start) }),
+				...(terminal === undefined ? {} : { terminalEvent: toAnsteelIncidentEventRef(terminal) }),
+			};
+		})
+		.sort(
+			(left, right) => left.eventSequences[0]! - right.eventSequences[0]! || left.spanId.localeCompare(right.spanId),
+		);
+	const byId = new Map(nodes.map((node) => [node.spanId, node]));
+	for (const node of nodes) {
+		if (node.parentSpanId === undefined) continue;
+		byId.get(node.parentSpanId)?.childSpanIds.push(node.spanId);
+	}
+	for (const node of nodes) {
+		node.childSpanIds.sort(
+			(left, right) =>
+				byId.get(left)!.eventSequences[0]! - byId.get(right)!.eventSequences[0]! || left.localeCompare(right),
+		);
+	}
+	return {
+		rootSpanIds: nodes
+			.filter((node) => node.parentSpanId === undefined || !byId.has(node.parentSpanId))
+			.map((node) => node.spanId),
+		nodes,
+	};
+}
+
+function inspectAnsteelIncidentLogSegments(
+	cwd: string,
+	runId: string,
+): {
+	segments: AnsteelIncidentBundle["manifest"]["logSegments"];
+	status: "verified" | "failed";
+	runIndexHash?: string;
+} {
+	const directory = getAnsteelRuntimeLogDirectory(cwd);
+	const prefix = `run-${runId}-`;
+	const actualNames = existsSync(directory)
+		? readdirSync(directory)
+				.filter((name) => name.startsWith(prefix) && name.endsWith(".jsonl"))
+				.sort()
+		: [];
+	let index: AnsteelRuntimeIndex | undefined;
+	try {
+		index = parseRuntimeIndex(cwd);
+	} catch {
+		// 即使索引不可用，清单仍记录原始日志段的字节哈希，便于取证比对；但这些未被索引
+		// 绑定的字节绝不解析为可信事件，也不能提供 task、revision 或 trace 身份。
+	}
+	const expected = new Map((index?.runs[runId]?.segments ?? []).map((segment) => [segment.fileName, segment.sha256]));
+	const names = [...new Set([...actualNames, ...expected.keys()])].sort();
+	const segments = names.map((fileName) => {
+		const expectedSha256 = expected.get(fileName);
+		const path = join(directory, fileName);
+		if (!existsSync(path)) {
+			return {
+				fileName,
+				...(expectedSha256 === undefined ? {} : { expectedSha256 }),
+				verificationResult: "missing" as const,
+			};
+		}
+		const content = readFileSync(path);
+		const actualSha256 = createHash("sha256").update(content).digest("hex");
+		return {
+			fileName,
+			...(expectedSha256 === undefined ? {} : { expectedSha256 }),
+			actualSha256,
+			byteLength: content.length,
+			verificationResult:
+				expectedSha256 === undefined
+					? ("unindexed" as const)
+					: expectedSha256 === actualSha256
+						? ("verified" as const)
+						: ("hash-mismatch" as const),
+		};
+	});
+	const status =
+		index !== undefined &&
+		index.runs[runId] !== undefined &&
+		segments.length > 0 &&
+		segments.every((segment) => segment.verificationResult === "verified")
+			? "verified"
+			: "failed";
+	const indexedRun = index?.runs[runId];
+	return {
+		segments,
+		status,
+		// 只绑定目标 run 的索引切片。incident 命令自身会产生独立诊断
+		// run；若使用全局索引哈希，同一目标证据会因无关诊断记录而失去
+		// 内容寻址稳定性。
+		...(indexedRun === undefined ? {} : { runIndexHash: hashAnsteelAuditValue(indexedRun) }),
+	};
+}
+
+function readAnsteelIncidentRuntimeEnvironment(
+	entries: readonly AnsteelRuntimeLogEntry[],
+): AnsteelIncidentBundle["manifest"]["configurationSummary"]["runtimeEnvironment"] {
+	const root = entries.find(
+		(entry) => entry.eventName === "run.started" && entry.outcome === "started" && entry.parentSpanId === undefined,
+	);
+	const value = root?.data.runtimeEnvironment;
+	if (!isRecord(value)) return undefined;
+	if (
+		typeof value.productVersion !== "string" ||
+		typeof value.extensionVersion !== "string" ||
+		(value.gitCommit !== null && typeof value.gitCommit !== "string") ||
+		typeof value.configStatus !== "string" ||
+		typeof value.configFingerprint !== "string" ||
+		typeof value.environmentFingerprint !== "string" ||
+		!isRecord(value.featureFlags) ||
+		!Array.isArray(value.enabledEnvironmentVariables) ||
+		!value.enabledEnvironmentVariables.every((name) => typeof name === "string")
+	) {
+		return undefined;
+	}
+	const featureFlags: Record<string, boolean | number | string | string[]> = {};
+	for (const [name, featureValue] of Object.entries(value.featureFlags)) {
+		if (
+			typeof featureValue === "boolean" ||
+			typeof featureValue === "number" ||
+			typeof featureValue === "string" ||
+			(Array.isArray(featureValue) && featureValue.every((item) => typeof item === "string"))
+		) {
+			featureFlags[name] = featureValue as boolean | number | string | string[];
+		}
+	}
+	return {
+		productVersion: value.productVersion,
+		extensionVersion: value.extensionVersion,
+		gitCommit: value.gitCommit,
+		configStatus: value.configStatus,
+		configFingerprint: value.configFingerprint,
+		environmentFingerprint: value.environmentFingerprint,
+		featureFlags,
+		enabledEnvironmentVariables: [...value.enabledEnvironmentVariables].sort() as string[],
+	};
+}
+
+function createAnsteelIncidentConfigurationSummary(
+	entries: readonly AnsteelRuntimeLogEntry[],
+): AnsteelIncidentBundle["manifest"]["configurationSummary"] {
+	const providers = entries
+		.filter(
+			(entry) =>
+				entry.eventName === "provider.request.started" &&
+				entry.outcome === "started" &&
+				entry.providerRequestId !== undefined,
+		)
+		.map((start) => {
+			const related = entries.filter((entry) => entry.providerRequestId === start.providerRequestId);
+			const retryCount = related.reduce((count, entry) => {
+				const attempt = typeof entry.data.attempt === "number" ? entry.data.attempt : 0;
+				const terminalCount = typeof entry.data.retryCount === "number" ? entry.data.retryCount : 0;
+				return Math.max(count, attempt, terminalCount);
+			}, 0);
+			return {
+				providerRequestId: start.providerRequestId!,
+				...(start.role === undefined ? {} : { role: start.role }),
+				provider: typeof start.data.provider === "string" ? start.data.provider : "unavailable",
+				model: typeof start.data.model === "string" ? start.data.model : "unavailable",
+				configurationIdentity:
+					typeof start.data.configurationIdentity === "string"
+						? redactAnsteelSensitiveText(start.data.configurationIdentity)
+						: "unavailable",
+				timeoutMs: typeof start.data.timeoutMs === "number" ? start.data.timeoutMs : null,
+				retryCount,
+			};
+		});
+	const tools = entries
+		.filter(
+			(entry) =>
+				entry.eventName === "tool.call.started" && entry.outcome === "started" && entry.toolCallId !== undefined,
+		)
+		.map((entry) => ({
+			toolCallId: entry.toolCallId!,
+			...(entry.role === undefined ? {} : { role: entry.role }),
+			toolName:
+				typeof entry.data.toolName === "string"
+					? redactAnsteelSensitiveText(entry.data.toolName)
+					: Object.hasOwn(entry.data, "command")
+						? "governed-command"
+						: "unavailable",
+			policyBoundary: typeof entry.data.denialBoundary === "string" ? entry.data.denialBoundary : "governed-runtime",
+		}));
+	const runtimeEnvironment = readAnsteelIncidentRuntimeEnvironment(entries);
+	return {
+		...(runtimeEnvironment === undefined ? {} : { runtimeEnvironment }),
+		providers,
+		tools,
+	};
+}
+
+export function createAnsteelTeamIncidentBundle(
+	cwd: string,
+	runId: string,
+	projectContext: AnsteelIncidentProjectContext = {
+		availability: "unavailable",
+		reasonCode: "team-state-missing",
+	},
+): AnsteelIncidentBundle {
 	const diagnosis = diagnoseAnsteelTeamRun(cwd, runId);
-	const entries = readAnsteelRuntimeLogs(cwd, runId);
+	let entries: AnsteelRuntimeLogEntry[] = [];
+	let chainError: unknown;
+	try {
+		entries = readAnsteelRuntimeLogs(cwd, runId);
+	} catch (error) {
+		chainError = error;
+	}
+	const segmentInspection = inspectAnsteelIncidentLogSegments(cwd, runId);
 	const artifactRefs = new Map<string, AnsteelRuntimeArtifactRef>();
 	for (const entry of entries) {
 		for (const artifact of entry.artifactRefs) artifactRefs.set(`${artifact.kind}:${artifact.sha256}`, artifact);
 	}
+	const artifactResults = [...artifactRefs.values()]
+		.sort((left, right) => left.kind.localeCompare(right.kind) || left.sha256.localeCompare(right.sha256))
+		.map((artifact) => {
+			const inspection = inspectAnsteelRuntimeArtifact(artifact);
+			return {
+				kind: artifact.kind,
+				sha256: artifact.sha256,
+				verificationResult:
+					inspection.verificationResult === "verified"
+						? ("verified" as const)
+						: inspection.verificationResult === "hash-mismatch"
+							? ("hash-mismatch" as const)
+							: ("missing" as const),
+				...(inspection.actualHash === undefined ? {} : { actualHash: inspection.actualHash }),
+			};
+		});
+	const verifiedArtifactCount = artifactResults.filter((result) => result.verificationResult === "verified").length;
+	const missingArtifactCount = artifactResults.length - verifiedArtifactCount;
+	const rootCauseIndex =
+		diagnosis.rootCause === undefined ? -1 : entries.findIndex((entry) => entry.hash === diagnosis.rootCause!.hash);
+	const propagationEvents =
+		rootCauseIndex < 0
+			? []
+			: entries
+					.slice(rootCauseIndex + 1)
+					.filter(
+						(entry) =>
+							entry.outcome === "failed" || entry.outcome === "cancelled" || entry.outcome === "abandoned",
+					)
+					.map(toAnsteelIncidentEventRef);
+	const rootStart = entries.find(
+		(entry) => entry.eventName === "run.started" && entry.outcome === "started" && entry.parentSpanId === undefined,
+	);
+	const terminalEntry =
+		rootStart === undefined
+			? undefined
+			: entries.find(
+					(entry) => entry.sequence > rootStart.sequence && isAnsteelRuntimeTerminalForStart(rootStart, entry),
+				);
+	const lastObservedEntry = entries.at(-1);
+	const chainMessage =
+		chainError === undefined
+			? undefined
+			: redactAnsteelSensitiveText(chainError instanceof Error ? chainError.message : String(chainError));
 	const manifest: AnsteelIncidentBundle["manifest"] = {
-		schemaVersion: 1,
-		runId,
-		...(diagnosis.traceId === undefined ? {} : { traceId: diagnosis.traceId }),
-		createdAt: new Date().toISOString(),
+		schemaVersion: 2,
+		evidenceModel: "mechanical-facts-only",
+		run: {
+			runId,
+			...(diagnosis.traceId === undefined ? {} : { traceId: diagnosis.traceId }),
+			...(entries[0]?.teamId === undefined ? {} : { teamId: entries[0].teamId }),
+			...(entries[0]?.timestampUtc === undefined ? {} : { startedAt: entries[0].timestampUtc }),
+			...(entries.at(-1)?.timestampUtc === undefined ? {} : { endedAt: entries.at(-1)!.timestampUtc }),
+			...(terminalEntry === undefined ? {} : { terminalOutcome: terminalEntry.outcome }),
+		},
 		healthy: diagnosis.healthy,
 		...(diagnosis.rootCause === undefined ? {} : { rootCause: diagnosis.rootCause }),
+		propagationEvents,
+		finalRuntimeState: {
+			...(terminalEntry === undefined ? {} : { terminalEvent: toAnsteelIncidentEventRef(terminalEntry) }),
+			...(lastObservedEntry === undefined
+				? {}
+				: { lastObservedEvent: toAnsteelIncidentEventRef(lastObservedEntry) }),
+		},
 		issues: diagnosis.issues,
-		logHashes: entries.map((entry) => entry.hash),
-		artifactRefs: [...artifactRefs.values()],
+		spanTree: createAnsteelIncidentSpanTree(entries),
+		logSegments: segmentInspection.segments,
+		artifactRefs: [...artifactRefs.values()].sort(
+			(left, right) => left.kind.localeCompare(right.kind) || left.sha256.localeCompare(right.sha256),
+		),
+		configurationSummary: createAnsteelIncidentConfigurationSummary(entries),
+		integrity: {
+			runtimeEventChain:
+				chainError === undefined && entries.length > 0
+					? {
+							status: "verified",
+							entryCount: entries.length,
+							...(entries.at(-1)?.hash === undefined ? {} : { headHash: entries.at(-1)!.hash }),
+						}
+					: {
+							status: "failed",
+							entryCount: 0,
+							reasonCode:
+								chainError === undefined
+									? ("artifact-missing" as const)
+									: chainError instanceof AnsteelObservabilityError
+										? chainError.reasonCode
+										: ("event-chain-invalid" as const),
+							...(chainError === undefined
+								? { message: `Ansteel runtime run ${runId} has no persisted logs` }
+								: chainMessage === undefined
+									? {}
+									: { message: chainMessage }),
+						},
+			logSegments: {
+				status: segmentInspection.status,
+				...(segmentInspection.runIndexHash === undefined ? {} : { runIndexHash: segmentInspection.runIndexHash }),
+			},
+			artifacts: {
+				status:
+					chainError !== undefined || entries.length === 0
+						? "unavailable"
+						: missingArtifactCount === 0
+							? "verified"
+							: "failed",
+				verifiedCount: verifiedArtifactCount,
+				missingCount: missingArtifactCount,
+				results: artifactResults,
+			},
+		},
+		projectContext,
 	};
-	const content = `${JSON.stringify(manifest, null, "\t")}\n`;
+	// JCS 保证相同证据的重复请求产生完全一致的字节、SHA-256 和存储路径。事故文件位于
+	// `.pi` 下，而工作区指纹明确排除该协调器私有目录，因此生成事故包不会扰动包内工作区哈希。
+	const content = `${canonicalizeAnsteelAuditValue(manifest)}\n`;
 	const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
 	const directory = join(getAnsteelTeamRuntimeDirectory(cwd), "incidents");
 	mkdirSync(directory, { recursive: true });
@@ -1664,7 +3121,25 @@ class AnsteelRuntimeSpanExporter implements SpanExporter {
 	async forceFlush(): Promise<void> {}
 }
 
-export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunContext): AnsteelRuntimeLogger {
+export interface AnsteelRuntimeLoggerOptions {
+	/**
+	 * 记录外部可见的 run writer 锁生命周期。内部 index 锁和审计门仍是实现细节，
+	 * 否则“记录一次 lease 事件”本身又需要新的被审计 lease，会形成递归依赖。
+	 */
+	auditRunLease?: boolean;
+	/**
+	 * 当损坏的历史链导致共享索引不可读时，允许独立诊断 run 将自身哈希链记录持久化。
+	 * 该路径绝不修复、覆盖或重新签署损坏索引；普通业务 run 仍必须失败关闭，只有显式诊断
+	 * 写入可以进入这个隔离边界。
+	 */
+	allowUnindexedDiagnosticWrites?: boolean;
+}
+
+export function createAnsteelRuntimeLogger(
+	cwd: string,
+	context: AnsteelRunContext,
+	options: AnsteelRuntimeLoggerOptions = {},
+): AnsteelRuntimeLogger {
 	assertRunId(context.runId);
 	if (!/^[0-9a-f]{32}$/.test(context.traceId)) {
 		throw new AnsteelObservabilityError("unclassified-runtime-error", "Ansteel runtime trace ID is invalid");
@@ -1672,13 +3147,14 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 	const directory = getAnsteelRuntimeLogDirectory(cwd);
 	mkdirSync(directory, { recursive: true });
 	const runLockPath = getAnsteelRuntimeLogPath(cwd, context.runId);
-	let releaseRunLock: (() => void) | undefined;
+	let runLock: AnsteelRuntimeLockHandle;
 	try {
-		releaseRunLock = lockfile.lockSync(runLockPath, {
-			realpath: false,
-			stale: ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS,
-			update: ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS,
-		});
+		runLock = acquireAnsteelRuntimeLock(
+			runLockPath,
+			"run",
+			ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS,
+			ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS,
+		);
 	} catch (error) {
 		const code =
 			typeof error === "object" && error !== null && "code" in error
@@ -1700,43 +3176,248 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 		const appendPath = lastSegment === undefined ? runLockPath : join(directory, lastSegment);
 		fd = openSync(appendPath, "a");
 	} catch (error) {
-		releaseRunLock();
+		runLock.release();
 		throw error;
 	}
 	let sequence = existing.length + 1;
 	let previousHash = existing.at(-1)?.hash ?? null;
 	const startedAt = process.hrtime.bigint();
+	const runtimeEnvironment = createAnsteelRuntimeEnvironmentFingerprint(cwd);
 	let closed = false;
+	let writingReleaseReceipt = false;
+	let leaseAuditFailure: Error | undefined;
 
-	const write = (input: AnsteelRuntimeLogInput): AnsteelRuntimeLogEntry => {
+	const writeBatch = (inputs: readonly AnsteelRuntimeLogInput[]): AnsteelRuntimeLogEntry[] => {
 		if (closed) {
 			throw new AnsteelObservabilityError("event-fsync-failed", "Ansteel runtime logger is closed");
 		}
-		if (input.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(input.reasonCode)) {
-			throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime reason code is invalid");
+		if (options.auditRunLease && !writingReleaseReceipt) runLock.assertOwned();
+		if (leaseAuditFailure !== undefined) throw leaseAuditFailure;
+		if (inputs.length === 0) return [];
+		let nextSequence = sequence;
+		let nextPreviousHash = previousHash;
+		const persistedEntries: AnsteelRuntimeLogEntry[] = [];
+		const sourceEntries: AnsteelRuntimeLogEntry[] = [];
+		interface PreparedRuntimeLogInput {
+			input: AnsteelRuntimeLogInput;
+			security: {
+				findingCount: number;
+				sensitiveFieldCount: number;
+				sensitiveTextMatchCount: number;
+				surfaces: Array<"message" | "data" | "artifact">;
+			};
 		}
-		const artifactRefs = (input.artifacts ?? []).map((artifact) => storeArtifact(cwd, artifact));
-		const { artifacts: _artifacts, spanId: inputSpanId, data, ...fields } = input;
-		const unsigned = {
-			schemaVersion: 1 as const,
-			timestampUtc: new Date().toISOString(),
-			monotonicElapsedNs: (process.hrtime.bigint() - startedAt).toString(),
-			sequence,
-			...fields,
-			runId: context.runId,
-			traceId: context.traceId,
-			spanId: inputSpanId ?? randomBytes(8).toString("hex"),
-			teamId: context.teamId,
-			message: redactAnsteelSensitiveText(input.message),
-			data: redactRecord(data),
-			artifactRefs,
-			previousHash,
+		const validateInput = (input: AnsteelRuntimeLogInput): void => {
+			assertAnsteelRuntimeEventCombination(input.eventName, input.outcome);
+			if (input.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(input.reasonCode)) {
+				throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime reason code is invalid");
+			}
+			if (
+				(input.eventName.startsWith("artifact.") || input.eventName.startsWith("security.")) &&
+				(input.artifacts?.length ?? 0) > 0
+			) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					"Ansteel artifact and security lifecycle events cannot recursively attach artifacts",
+				);
+			}
 		};
-		const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
-		withRuntimeIndexLock(cwd, () => {
-			const index = readOrRebuildRuntimeIndexLocked(cwd, false);
+		const prepareInput = (input: AnsteelRuntimeLogInput): PreparedRuntimeLogInput => {
+			const message = inspectAndRedactAnsteelSensitiveText(input.message);
+			const data = inspectAndRedactAnsteelSensitiveValue(input.data);
+			const surfaces = new Set<"message" | "data" | "artifact">();
+			if (message.findingCount > 0) surfaces.add("message");
+			if (data.findingCount > 0) surfaces.add("data");
+			let findingCount = message.findingCount + data.findingCount;
+			let sensitiveFieldCount = message.sensitiveFieldCount + data.sensitiveFieldCount;
+			let sensitiveTextMatchCount = message.sensitiveTextMatchCount + data.sensitiveTextMatchCount;
+			const artifacts = input.artifacts?.map((artifact) => {
+				const content = inspectAndRedactAnsteelSensitiveText(artifact.content);
+				if (content.findingCount > 0) surfaces.add("artifact");
+				findingCount += content.findingCount;
+				sensitiveFieldCount += content.sensitiveFieldCount;
+				sensitiveTextMatchCount += content.sensitiveTextMatchCount;
+				return { ...artifact, content: content.value };
+			});
+			return {
+				input: {
+					...input,
+					message: message.value,
+					data: data.value as Record<string, unknown>,
+					...(artifacts === undefined ? {} : { artifacts }),
+				},
+				security: {
+					findingCount,
+					sensitiveFieldCount,
+					sensitiveTextMatchCount,
+					surfaces: [...surfaces],
+				},
+			};
+		};
+		// 在创建第一个内容寻址文件前先校验整批输入。security 事件自身若仍含秘密必须直接拒绝；
+		// 若对 security 事件再次静默脱敏，会递归产生新的 security 事件并破坏明确因果链。
+		const preparedInputs = inputs.map((input) => {
+			validateInput(input);
+			const prepared = prepareInput(input);
+			if (input.eventName.startsWith("security.") && prepared.security.findingCount > 0) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					"Ansteel security lifecycle events must already contain only non-sensitive metadata",
+				);
+			}
+			return prepared;
+		});
+		const appendEntry = (
+			input: AnsteelRuntimeLogInput,
+			artifactRefs: AnsteelRuntimeArtifactRef[],
+		): AnsteelRuntimeLogEntry => {
+			validateInput(input);
+			const { artifacts: _artifacts, spanId: inputSpanId, data, ...fields } = input;
+			const unsigned = {
+				schemaVersion: 1 as const,
+				eventCatalogVersion: ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION,
+				timestampUtc: new Date().toISOString(),
+				monotonicElapsedNs: (process.hrtime.bigint() - startedAt).toString(),
+				sequence: nextSequence,
+				...fields,
+				runId: context.runId,
+				traceId: context.traceId,
+				spanId: inputSpanId ?? randomBytes(8).toString("hex"),
+				teamId: context.teamId,
+				message: redactAnsteelSensitiveText(input.message),
+				data: redactRecord(data),
+				artifactRefs,
+				previousHash: nextPreviousHash,
+			};
+			const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+			nextSequence++;
+			nextPreviousHash = entry.hash;
+			persistedEntries.push(entry);
+			return entry;
+		};
+		const relatedFields = (source: AnsteelRuntimeLogEntry) => ({
+			...(source.sessionId === undefined ? {} : { sessionId: source.sessionId }),
+			...(source.taskId === undefined ? {} : { taskId: source.taskId }),
+			...(source.checkpointId === undefined ? {} : { checkpointId: source.checkpointId }),
+			...(source.issueId === undefined ? {} : { issueId: source.issueId }),
+			...(source.toolCallId === undefined ? {} : { toolCallId: source.toolCallId }),
+			...(source.providerRequestId === undefined ? {} : { providerRequestId: source.providerRequestId }),
+			...(source.processId === undefined ? {} : { processId: source.processId }),
+			...(source.leaseId === undefined ? {} : { leaseId: source.leaseId }),
+			...(source.revision === undefined ? {} : { revision: source.revision }),
+			...(source.diffHash === undefined ? {} : { diffHash: source.diffHash }),
+		});
+		const appendSecurityEvents = (
+			source: AnsteelRuntimeLogEntry,
+			security: PreparedRuntimeLogInput["security"],
+		): void => {
+			if (
+				source.eventName === "tool.call.completed" &&
+				source.outcome === "failed" &&
+				source.reasonCode === "tool-policy-denied"
+			) {
+				appendEntry(
+					{
+						level: "audit",
+						eventName: "security.access-denied",
+						outcome: "failed",
+						reasonCode: "tool-policy-denied",
+						role: source.role ?? "coordinator",
+						parentSpanId: source.spanId,
+						...relatedFields(source),
+						causeEventId: source.hash,
+						message: "Ansteel tool access was denied by a mechanical policy boundary",
+						data: {
+							sourceEventName: source.eventName,
+							sourceSequence: source.sequence,
+							denialBoundary:
+								typeof source.data.denialBoundary === "string" ? source.data.denialBoundary : "tool-policy",
+						},
+					},
+					[],
+				);
+			}
+			if (source.eventName.startsWith("security.") || security.findingCount === 0) return;
+			const auditData = {
+				sourceEventName: source.eventName,
+				sourceSequence: source.sequence,
+				redactionBoundary: "runtime-persistence",
+				findingCount: security.findingCount,
+				sensitiveFieldCount: security.sensitiveFieldCount,
+				sensitiveTextMatchCount: security.sensitiveTextMatchCount,
+				surfaces: security.surfaces,
+			};
+			appendEntry(
+				{
+					level: "audit",
+					eventName: "security.secret-detected",
+					outcome: "failed",
+					reasonCode: "secret-detected",
+					role: source.role ?? "coordinator",
+					parentSpanId: source.spanId,
+					...relatedFields(source),
+					causeEventId: source.hash,
+					message: "Ansteel detected sensitive content before runtime persistence",
+					data: auditData,
+				},
+				[],
+			);
+			appendEntry(
+				{
+					level: "audit",
+					eventName: "security.redaction-applied",
+					outcome: "succeeded",
+					role: source.role ?? "coordinator",
+					parentSpanId: source.spanId,
+					...relatedFields(source),
+					causeEventId: source.hash,
+					message: "Ansteel applied redaction before runtime persistence",
+					data: auditData,
+				},
+				[],
+			);
+		};
+		for (const prepared of preparedInputs) {
+			const { input, security } = prepared;
+			const storedArtifacts = (input.artifacts ?? []).map((artifact) => storeArtifact(cwd, artifact));
+			const source = appendEntry(
+				input,
+				storedArtifacts.map((artifact) => artifact.ref),
+			);
+			sourceEntries.push(source);
+			appendSecurityEvents(source, security);
+			for (const artifact of storedArtifacts) {
+				const stored = artifact.storageResult === "created";
+				appendEntry(
+					{
+						level: "audit",
+						eventName: stored ? "artifact.stored" : "artifact.verified",
+						outcome: "succeeded",
+						role: "coordinator",
+						...relatedFields(source),
+						causeEventId: source.hash,
+						message: stored
+							? `Ansteel runtime artifact ${artifact.ref.sha256} was durably stored`
+							: `Ansteel runtime artifact ${artifact.ref.sha256} already existed and was verified`,
+						data: {
+							resourceKind: "content-addressed-artifact",
+							sourceSequence: source.sequence,
+							artifactKind: artifact.ref.kind,
+							sha256: artifact.ref.sha256,
+							contentByteLength: artifact.contentByteLength,
+							storageResult: artifact.storageResult,
+						},
+					},
+					[],
+				);
+			}
+		}
+		const persistEntries = (): void => {
 			try {
-				writeBuffer(fd, Buffer.from(`${JSON.stringify(entry)}\n`, "utf8"));
+				writeBuffer(
+					fd,
+					Buffer.from(`${persistedEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8"),
+				);
 				fsyncSync(fd);
 			} catch (error) {
 				throw new AnsteelObservabilityError(
@@ -1745,15 +3426,119 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 					{ cause: error },
 				);
 			}
-			// The record is already durable. Advance the in-process chain even
-			// when the subsequent index replacement fails so a retry cannot
-			// duplicate its sequence or previousHash.
-			sequence++;
-			previousHash = entry.hash;
+			// 事件批次已经 fsync 落盘。即随后替换索引失败，也必须推进进程内 sequence 和
+			// previousHash，防止重试复用旧游标并写出重复序号或错误前驱哈希。
+			sequence = nextSequence;
+			previousHash = nextPreviousHash;
+		};
+		withRuntimeIndexLock(cwd, () => {
+			let index: AnsteelRuntimeIndex;
+			try {
+				index = readOrRebuildRuntimeIndexLocked(cwd, false);
+			} catch (error) {
+				if (
+					!options.allowUnindexedDiagnosticWrites ||
+					!(error instanceof AnsteelObservabilityError) ||
+					error.reasonCode !== "event-chain-invalid"
+				) {
+					throw error;
+				}
+				// 调用方显式开启了独立诊断 run：其日志段依靠自身哈希链验证并已经 fsync，
+				// 但故意不插入当前不可受信的共享索引，避免诊断动作掩盖原始索引损坏。
+				persistEntries();
+				return;
+			}
+			persistEntries();
 			writeRuntimeIndexAtomic(cwd, replaceRuntimeIndexRunLocked(cwd, index, context.runId));
 		});
-		return entry;
+		return sourceEntries;
 	};
+	const write = (input: AnsteelRuntimeLogInput): AnsteelRuntimeLogEntry => writeBatch([input])[0]!;
+
+	if (options.auditRunLease) {
+		const previousOwner = runLock.previousOwner;
+		// 残留 owner 旁路文件本身不能证明 lease 已过期。先重放已验证 run，避免重复生成既有
+		// release/expiry 回执；只有确实找不到该 owner 的持久终态事实时才按 lease-expired 失败关闭。
+		if (
+			previousOwner !== undefined &&
+			!existing.some(
+				(entry) =>
+					entry.leaseId === previousOwner.ownerId &&
+					(entry.eventName === "lease.released" || entry.eventName === "lease.expired"),
+			)
+		) {
+			write({
+				level: "error",
+				eventName: "lease.expired",
+				outcome: "failed",
+				reasonCode: "lease-expired",
+				role: "coordinator",
+				leaseId: previousOwner.ownerId,
+				message: "A previous Ansteel runtime writer lease ended without a durable release receipt",
+				data: {
+					resourceKind: "runtime-run",
+					resourceHash: runLock.resourceHash,
+					lockKind: previousOwner.lockKind,
+					ownerPid: previousOwner.pid,
+					ownerProcessStartedAtUtc: previousOwner.processStartedAtUtc,
+					ownerExecutableHash: previousOwner.executableHash,
+					ownerCommandHash: previousOwner.commandHash,
+					ownerWorkingDirectoryHash: previousOwner.workingDirectoryHash,
+					acquiredAtUtc: previousOwner.acquiredAtUtc,
+					detectedAtUtc: new Date().toISOString(),
+					replacementLeaseId: runLock.owner.ownerId,
+				},
+			});
+		}
+		write({
+			level: "audit",
+			eventName: "lease.acquired",
+			outcome: "succeeded",
+			role: "coordinator",
+			leaseId: runLock.owner.ownerId,
+			message: "Ansteel runtime writer lease was acquired",
+			data: {
+				resourceKind: "runtime-run",
+				resourceHash: runLock.resourceHash,
+				lockKind: runLock.owner.lockKind,
+				ownerPid: runLock.owner.pid,
+				ownerProcessStartedAtUtc: runLock.owner.processStartedAtUtc,
+				ownerExecutableHash: runLock.owner.executableHash,
+				ownerCommandHash: runLock.owner.commandHash,
+				ownerWorkingDirectoryHash: runLock.owner.workingDirectoryHash,
+				acquiredAtUtc: runLock.owner.acquiredAtUtc,
+				staleAfterMs: ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS,
+				renewEveryMs: ANSTEEL_RUNTIME_LOG_LOCK_UPDATE_MS,
+				expiresAtUtc: new Date(
+					Date.parse(runLock.owner.acquiredAtUtc) + ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS,
+				).toISOString(),
+			},
+		});
+		runLock.setRenewedListener((renewedAtUtc, renewalCount) => {
+			if (closed || writingReleaseReceipt || leaseAuditFailure !== undefined) return;
+			try {
+				write({
+					level: "audit",
+					eventName: "lease.renewed",
+					outcome: "progress",
+					role: "coordinator",
+					leaseId: runLock.owner.ownerId,
+					message: "Ansteel runtime writer lease was renewed by the lock owner",
+					data: {
+						resourceKind: "runtime-run",
+						resourceHash: runLock.resourceHash,
+						ownerPid: runLock.owner.pid,
+						renewedAtUtc,
+						renewalCount,
+						expiresAtUtc: new Date(Date.parse(renewedAtUtc) + ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS).toISOString(),
+					},
+				});
+			} catch (error) {
+				leaseAuditFailure =
+					error instanceof Error ? error : new AnsteelObservabilityError("event-fsync-failed", String(error));
+			}
+		});
+	}
 
 	const pendingEnds = new Map<string, PendingSpanEnd>();
 	const exporter = new AnsteelRuntimeSpanExporter(pendingEnds, write);
@@ -1777,20 +3562,51 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 			parentSpan?.openTelemetrySpan === undefined
 				? ROOT_CONTEXT
 				: trace.setSpan(ROOT_CONTEXT, parentSpan.openTelemetrySpan);
+		const startEventName = getAnsteelRuntimeSpanStartEventName(eventName);
 		const openTelemetrySpan = tracer.startSpan(eventName, undefined, parentContext);
 		const spanContext = openTelemetrySpan.spanContext();
 		const parentSpanId = options.parent?.spanId;
 		const { parent: _parent, message, data, ...fields } = options;
-		write({
-			level: "info",
-			eventName,
-			outcome: "started",
-			...fields,
-			spanId: spanContext.spanId,
-			...(parentSpanId === undefined ? {} : { parentSpanId }),
-			message: message ?? `${eventName} started`,
-			data: data ?? {},
-		});
+		const rootData =
+			startEventName === "run.started" && options.parent === undefined
+				? {
+						...(data ?? {}),
+						runtimeEnvironment,
+						...(context.resumedFromRunId === undefined
+							? {}
+							: {
+									resumedFromRunId: context.resumedFromRunId,
+									resumedFromSequence: context.resumedFromSequence,
+								}),
+					}
+				: (data ?? {});
+		const startInputs: AnsteelRuntimeLogInput[] = [
+			{
+				level: "info",
+				eventName: startEventName,
+				outcome: "started",
+				...fields,
+				spanId: spanContext.spanId,
+				...(parentSpanId === undefined ? {} : { parentSpanId }),
+				message: message ?? `${eventName} started`,
+				data: rootData,
+			},
+		];
+		if (startEventName === "run.started" && options.parent === undefined && context.resumedFromRunId !== undefined) {
+			startInputs.push({
+				level: "info",
+				eventName: "run.resumed",
+				outcome: "progress",
+				...fields,
+				spanId: spanContext.spanId,
+				message: "Ansteel team command resumed from a durable runtime boundary",
+				data: {
+					resumedFromRunId: context.resumedFromRunId,
+					resumedFromSequence: context.resumedFromSequence,
+				},
+			});
+		}
+		writeBatch(startInputs);
 		let ended = false;
 		const runtimeSpan: AnsteelRuntimeSpan & { readonly openTelemetrySpan: OpenTelemetrySpan } = {
 			traceId: spanContext.traceId,
@@ -1805,7 +3621,12 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 					);
 				}
 				ended = true;
-				pendingEnds.set(spanContext.spanId, { eventName, fields, parentSpanId, input });
+				pendingEnds.set(spanContext.spanId, {
+					eventName: getAnsteelRuntimeSpanTerminalEventName(startEventName, input.outcome),
+					fields,
+					parentSpanId,
+					input,
+				});
 				openTelemetrySpan.setStatus({
 					code: input.outcome === "failed" ? SpanStatusCode.ERROR : SpanStatusCode.OK,
 					message: input.message,
@@ -1819,20 +3640,56 @@ export function createAnsteelRuntimeLogger(cwd: string, context: AnsteelRunConte
 	return {
 		context,
 		write,
+		writeBatch,
 		startSpan,
 		forceFlush: () => provider.forceFlush(),
 		close() {
 			if (closed) return;
+			let closeError: unknown;
 			try {
 				fsyncSync(fd);
+				if (leaseAuditFailure !== undefined) throw leaseAuditFailure;
+				if (options.auditRunLease) {
+					runLock.release((receipt) => {
+						writingReleaseReceipt = true;
+						try {
+							write({
+								level: "audit",
+								eventName: "lease.released",
+								outcome: "succeeded",
+								role: "coordinator",
+								leaseId: runLock.owner.ownerId,
+								message: "Ansteel runtime writer lease was released",
+								data: {
+									resourceKind: "runtime-run",
+									resourceHash: runLock.resourceHash,
+									ownerPid: runLock.owner.pid,
+									releasedAtUtc: receipt.releasedAtUtc,
+									renewalCount: receipt.renewalCount,
+									heldDurationMs: Math.max(
+										0,
+										Date.parse(receipt.releasedAtUtc) - Date.parse(runLock.owner.acquiredAtUtc),
+									),
+								},
+							});
+						} finally {
+							writingReleaseReceipt = false;
+						}
+					});
+				} else {
+					runLock.release();
+				}
+			} catch (error) {
+				closeError = error;
 			} finally {
 				try {
 					closeSync(fd);
-				} finally {
-					closed = true;
-					releaseRunLock();
+				} catch (error) {
+					closeError ??= error;
 				}
+				closed = true;
 			}
+			if (closeError !== undefined) throw closeError;
 		},
 	};
 }

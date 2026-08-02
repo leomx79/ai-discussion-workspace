@@ -253,6 +253,39 @@ function formatValidationPath(error: TLocalizedValidationError): string {
 	return path || "root";
 }
 
+function formatValidationErrors(errors: TLocalizedValidationError[]): string {
+	const literalValuesByPath = new Map<string, unknown[]>();
+	for (const error of errors) {
+		if (error.keyword !== "const") continue;
+		const allowedValue = (error.params as { allowedValue?: unknown }).allowedValue;
+		const path = formatValidationPath(error);
+		const values = literalValuesByPath.get(path) ?? [];
+		if (!values.some((value) => Object.is(value, allowedValue))) values.push(allowedValue);
+		literalValuesByPath.set(path, values);
+	}
+
+	const formatted: string[] = [];
+	const emittedLiteralPaths = new Set<string>();
+	for (const error of errors) {
+		const path = formatValidationPath(error);
+		const literalValues = literalValuesByPath.get(path);
+		if (literalValues !== undefined) {
+			if (error.keyword === "const" && !emittedLiteralPaths.has(path)) {
+				formatted.push(
+					`  - ${path}: must be one of ${literalValues.map((value) => JSON.stringify(value)).join(", ")}`,
+				);
+				emittedLiteralPaths.add(path);
+			}
+			// TypeBox 会为联合类型的每个成员各产生一条 const 错误，最后再追加 anyOf 摘要。
+			// 上方单条“允许值”提示已经提供等价且可执行的信息；过滤重复项可避免模型把有限的
+			// 修复次数浪费在同一字段的重复报错上。
+			if (error.keyword === "const" || error.keyword === "anyOf") continue;
+		}
+		formatted.push(`  - ${path}: ${error.message}`);
+	}
+	return formatted.join("\n") || "Unknown validation error";
+}
+
 /**
  * Finds a tool by name and validates the tool call arguments against its TypeBox schema
  * @param tools Array of tool definitions
@@ -298,11 +331,7 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): any {
 		return args;
 	}
 
-	const errors =
-		validator
-			.Errors(args)
-			.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
-			.join("\n") || "Unknown validation error";
+	const errors = formatValidationErrors([...validator.Errors(args)]);
 
 	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(toolCall.arguments, null, 2)}`;
 

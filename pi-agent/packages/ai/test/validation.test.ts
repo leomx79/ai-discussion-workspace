@@ -113,4 +113,32 @@ describe("validateToolArguments", () => {
 			expect(() => validateToolArguments(tool, toolCall)).toThrow("Validation failed");
 		}
 	});
+
+	it("reports literal union choices once so a model can repair invalid tool input", () => {
+		const tool: Tool = {
+			name: "checkpoint",
+			description: "Publish a checkpoint",
+			parameters: Type.Object({
+				nextAction: Type.Object({
+					kind: Type.Union([Type.Literal("read"), Type.Literal("experiment"), Type.Literal("decision")]),
+				}),
+			}),
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "tool-union-repair",
+			name: "checkpoint",
+			arguments: { nextAction: { kind: "report" } },
+		};
+
+		expect(() => validateToolArguments(tool, toolCall)).toThrow(
+			'nextAction.kind: must be one of "read", "experiment", "decision"',
+		);
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			expect((error as Error).message.match(/nextAction\.kind:/g)).toHaveLength(1);
+			expect((error as Error).message).not.toContain("must be equal to constant");
+		}
+	});
 });

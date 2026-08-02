@@ -29,15 +29,21 @@ import {
 	verifyAnsteelTeamAuditEventSignatures,
 } from "./ansteel-team-integrity.ts";
 import {
+	ANSTEEL_RUNTIME_REASON_CODES,
+	type AnsteelIncidentProjectContextVerified,
 	type AnsteelRuntimeLogEntry,
 	type AnsteelRuntimeLogger,
+	type AnsteelRuntimeLogInput,
+	type AnsteelRuntimeReasonCode,
+	type AnsteelRuntimeSpan,
 	captureAnsteelRuntimeAnchorSnapshot,
 	redactAnsteelSensitiveValue,
 	verifyAnsteelRuntimeAnchorSnapshot,
 	verifyAnsteelRuntimeLogIntegrity,
 } from "./ansteel-team-observability.ts";
+import { runAnsteelGovernedProcess } from "./ansteel-team-process.ts";
 
-const ANSTEEL_TEAM_STATE_VERSION = 11;
+const ANSTEEL_TEAM_STATE_VERSION = 12;
 // Local diffs and explicit anchor traffic share one bounded Git execution
 // budget. In particular, an unavailable remote or credential helper must not
 // leave the coordinator command waiting indefinitely.
@@ -47,8 +53,10 @@ const ANSTEEL_GIT_COMMAND_TIMEOUT_MS = 30_000;
 // implementation in ansteel-team-integrity.ts. The marker makes the cutover
 // replayable without silently changing historical event hashes.
 const ANSTEEL_TEAM_EVENT_HASH_ALGORITHM = "sha256-jcs-v1" as const;
+const mirroredTransitionLogIdsByLogger = new WeakMap<AnsteelRuntimeLogger, Set<string>>();
 const MAX_PUBLIC_EVENT_CONTENT_LENGTH = 16_384;
 const ANSTEEL_TEAM_TEST_TIMEOUT_MS = 60_000;
+const ANSTEEL_TEAM_TEST_OUTPUT_MAX_BYTES = 4 * 1024 * 1024;
 const ANSTEEL_TEAM_DELIVERY_MANIFEST_MAX_BYTES = 64 * 1024;
 const ANSTEEL_TEAM_DELIVERY_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
 const ANSTEEL_TEAM_DELIVERY_ALLOWED_EXECUTABLES = new Set([
@@ -97,6 +105,43 @@ export type AnsteelCollaborationStatus =
 export type AnsteelGovernanceStatus = "not-required" | "pending" | "approved" | "rejected";
 export type AnsteelDeliveryStatus = "not-started" | "verifying" | "passed" | "failed";
 export type AnsteelWorkflowStatus = "in-progress" | "blocked" | "completed";
+
+export const ANSTEEL_STATE_TRANSITION_EVENT_NAMES = [
+	"state.transition.attempted",
+	"state.transition.applied",
+	"state.transition.rejected",
+] as const;
+
+export type AnsteelStateTransitionEventName = (typeof ANSTEEL_STATE_TRANSITION_EVENT_NAMES)[number];
+export type AnsteelStateObjectKind =
+	| "team"
+	| "role"
+	| "challenge"
+	| "task"
+	| "milestone"
+	| "checkpoint"
+	| "process-issue"
+	| "delivery-verification";
+
+/**
+ * 一条可持久化的状态机事实。attempt 与 result 记录共享同一个 transitionId；
+ * 只有 applied 结果允许推进目标对象投影，rejected 只能留下失败证据而不能改状态。
+ */
+export interface AnsteelStateTransitionLog {
+	logId: string;
+	transitionId: string;
+	eventName: AnsteelStateTransitionEventName;
+	objectKind: AnsteelStateObjectKind;
+	objectId: string;
+	from: string | null;
+	to: string;
+	guard: string;
+	guardResult: boolean;
+	triggerEventId: string;
+	reasonCode?: AnsteelRuntimeReasonCode;
+	causeEventId?: string;
+	createdAt: string;
+}
 
 /**
  * Read-only, mechanically derived status axes. They deliberately remain
@@ -179,6 +224,7 @@ export interface AnsteelTeamRoleState {
 	model: string;
 	sessionFile: string;
 	status: "idle" | "working" | "failed";
+	transitionLogId: string;
 }
 
 export interface AnsteelTeamChallenge {
@@ -186,6 +232,7 @@ export interface AnsteelTeamChallenge {
 	raisedBy: AnsteelRole;
 	targetRole: AnsteelRole;
 	status: "open" | "resolved";
+	transitionLogId: string;
 }
 
 export type AnsteelActionRisk = "green" | "yellow" | "red";
@@ -193,7 +240,16 @@ export type AnsteelCheckpointRisk = AnsteelActionRisk;
 export type AnsteelCheckpointConfidence = "L1" | "L2" | "L3" | "L4";
 export type AnsteelProcessIssueSeverity = "advisory" | "blocking" | "critical";
 export type AnsteelProcessResolutionOutcome = "ACCEPTED" | "REFUTED" | "EXPERIMENT_REQUIRED" | "SCOPE_ESCALATION";
-export type AnsteelActionKind = "read" | "experiment" | "edit" | "write" | "test" | "commit" | "publish" | "decision";
+export type AnsteelActionKind =
+	| "read"
+	| "report"
+	| "experiment"
+	| "edit"
+	| "write"
+	| "test"
+	| "commit"
+	| "publish"
+	| "decision";
 
 export interface AnsteelGovernedAction {
 	kind: AnsteelActionKind;
@@ -222,6 +278,7 @@ export interface AnsteelWorkCheckpoint {
 	governedAction: AnsteelGovernedAction | null;
 	confidence: AnsteelCheckpointConfidence;
 	status: "active" | "superseded";
+	transitionLogId: string;
 	supersedesCheckpointId?: string;
 	createdAt: string;
 }
@@ -254,6 +311,7 @@ export interface AnsteelProcessIssue {
 	evidenceRefs: string[];
 	suggestedCorrection: string;
 	status: "open" | "resolution-proposed" | "closed" | "escalated";
+	transitionLogId: string;
 	resolutions: AnsteelProcessResolution[];
 	createdAt: string;
 }
@@ -288,11 +346,11 @@ export interface AnsteelActionFileIdentity {
 
 export type AnsteelWorkCheckpointInput = Omit<
 	AnsteelWorkCheckpoint,
-	"actor" | "governedAction" | "status" | "createdAt" | "risk"
+	"actor" | "governedAction" | "status" | "transitionLogId" | "createdAt" | "risk"
 > & { risk?: AnsteelActionRisk };
 export type AnsteelProcessIssueInput = Omit<
 	AnsteelProcessIssue,
-	"author" | "targetRole" | "status" | "resolutions" | "createdAt"
+	"author" | "targetRole" | "status" | "transitionLogId" | "resolutions" | "createdAt"
 >;
 export type AnsteelProcessResolutionInput = Omit<
 	AnsteelProcessResolution,
@@ -346,6 +404,7 @@ export interface AnsteelTeamTask {
 	dependsOn: string[];
 	/** `blocked` is coordinator-derived from `dependsOn`; roles cannot choose it. */
 	status: "blocked" | "claimed" | "submitted" | "final-verification" | "revision-required" | "approved";
+	transitionLogId: string;
 	revision: number;
 	testEvidence: AnsteelTeamTaskTestEvidence[];
 	submissions: AnsteelTeamTaskSubmission[];
@@ -404,6 +463,7 @@ export interface AnsteelTeamDeliveryVerification {
 	sourceCommit: string;
 	manifestHash: string;
 	status: "verifying" | "passed" | "failed";
+	transitionLogId: string;
 	checks: AnsteelTeamDeliveryCheckEvidence[];
 	startedAt: string;
 	completedAt?: string;
@@ -449,6 +509,7 @@ export interface AnsteelTeamMilestone {
 	description: string;
 	acceptanceCriteria: string;
 	status: "blocked" | "ready" | "submitted" | "final-verification" | "revision-required" | "approved";
+	transitionLogId: string;
 	revision: number;
 	testEvidence: AnsteelTeamTaskTestEvidence[];
 	submissions: AnsteelTeamMilestoneSubmission[];
@@ -577,6 +638,7 @@ export interface AnsteelTeamState {
 	id: string;
 	topic: string;
 	status: AnsteelTeamStatus;
+	transitionLogId: string;
 	createdAt: string;
 	updatedAt: string;
 	nextEventSequence: number;
@@ -590,6 +652,7 @@ export interface AnsteelTeamState {
 	processIssues: AnsteelProcessIssue[];
 	actionReviews: AnsteelActionReview[];
 	deliveryVerifications: AnsteelTeamDeliveryVerification[];
+	transitionLogs: AnsteelStateTransitionLog[];
 	ledgerHeadHash: string | null;
 }
 
@@ -663,6 +726,8 @@ export interface AnsteelTeamEvent extends AnsteelTeamEventInput {
 
 export interface AnsteelTeamPersistenceContext {
 	logger: AnsteelRuntimeLogger;
+	parentSpan?: AnsteelRuntimeSpan;
+	toolCallId?: string;
 	causeEventId?: string;
 }
 
@@ -787,6 +852,276 @@ function assertStateStringArray(value: unknown, field: string): asserts value is
 function assertStateTimestamp(value: unknown, field: string): asserts value is string {
 	if (typeof value !== "string" || value.trim().length === 0 || Number.isNaN(Date.parse(value))) {
 		throw new AnsteelTeamStateError(`Ansteel team ${field} must be a valid timestamp`);
+	}
+}
+
+interface AnsteelMutableStateTarget {
+	status: string;
+	transitionLogId: string;
+}
+
+interface AnsteelStateTransitionOptions {
+	guard: string;
+	triggerEventId?: string;
+	causeEventId?: string;
+	reasonCode?: AnsteelRuntimeReasonCode;
+	createdAt?: string;
+	deterministicSeed?: string;
+	from?: string | null;
+	record?: boolean;
+}
+
+function getAnsteelStateObjectKey(kind: AnsteelStateObjectKind, objectId: string): string {
+	return `${kind}\0${objectId}`;
+}
+
+function createAnsteelTransitionIdentity(seed?: string): string {
+	return seed === undefined ? `ST-${randomUUID()}` : `ST-${createHash("sha256").update(seed, "utf8").digest("hex")}`;
+}
+
+function createAnsteelStateTransitionPair(
+	kind: AnsteelStateObjectKind,
+	objectId: string,
+	from: string | null,
+	to: string,
+	guardResult: boolean,
+	options: AnsteelStateTransitionOptions,
+): [AnsteelStateTransitionLog, AnsteelStateTransitionLog] {
+	const transitionId = createAnsteelTransitionIdentity(options.deterministicSeed);
+	const triggerEventId = options.triggerEventId ?? `EV-${transitionId}`;
+	const createdAt = options.createdAt ?? new Date().toISOString();
+	const common = {
+		transitionId,
+		objectKind: kind,
+		objectId,
+		from,
+		to,
+		guard: options.guard,
+		guardResult,
+		triggerEventId,
+		createdAt,
+	};
+	const attempted: AnsteelStateTransitionLog = {
+		...common,
+		logId: `${transitionId}-ATTEMPTED`,
+		eventName: "state.transition.attempted",
+		...(options.causeEventId === undefined ? {} : { causeEventId: options.causeEventId }),
+	};
+	const result: AnsteelStateTransitionLog = guardResult
+		? {
+				...common,
+				logId: `${transitionId}-APPLIED`,
+				eventName: "state.transition.applied",
+				...(options.causeEventId === undefined ? {} : { causeEventId: options.causeEventId }),
+			}
+		: {
+				...common,
+				logId: `${transitionId}-REJECTED`,
+				eventName: "state.transition.rejected",
+				reasonCode: options.reasonCode ?? "unclassified-runtime-error",
+				causeEventId: options.causeEventId ?? triggerEventId,
+			};
+	return [attempted, result];
+}
+
+/**
+ * 应用一次状态机转换，并把目标对象绑定到对应的持久 applied 记录。事件重放时可以禁止
+ * 再次插入记录，但重建对象必须保留同一个确定性 transitionLogId，确保实时写入与重放投影一致。
+ */
+function applyAnsteelStateTransition(
+	state: AnsteelTeamState,
+	target: AnsteelMutableStateTarget,
+	kind: AnsteelStateObjectKind,
+	objectId: string,
+	to: string,
+	options: AnsteelStateTransitionOptions,
+): AnsteelStateTransitionLog {
+	const from = options.from === undefined ? target.status : options.from;
+	const [attempted, applied] = createAnsteelStateTransitionPair(kind, objectId, from, to, true, options);
+	if (options.record !== false) state.transitionLogs.push(attempted, applied);
+	target.status = to;
+	target.transitionLogId = applied.logId;
+	return applied;
+}
+
+/** 记录被拒绝的状态转换，但绝不推进目标对象投影。 */
+function rejectAnsteelStateTransition(
+	state: AnsteelTeamState,
+	target: AnsteelMutableStateTarget,
+	kind: AnsteelStateObjectKind,
+	objectId: string,
+	to: string,
+	options: AnsteelStateTransitionOptions & { reasonCode: AnsteelRuntimeReasonCode },
+): AnsteelStateTransitionLog {
+	const from = options.from === undefined ? target.status : options.from;
+	const [attempted, rejected] = createAnsteelStateTransitionPair(kind, objectId, from, to, false, options);
+	state.transitionLogs.push(attempted, rejected);
+	return rejected;
+}
+
+function rejectPersistedAnsteelStateTransition(
+	projectDirectory: string,
+	state: AnsteelTeamState,
+	target: AnsteelMutableStateTarget,
+	kind: AnsteelStateObjectKind,
+	objectId: string,
+	to: string,
+	guard: string,
+	reasonCode: AnsteelRuntimeReasonCode,
+	message: string,
+): never {
+	rejectAnsteelStateTransition(state, target, kind, objectId, to, {
+		guard,
+		reasonCode,
+		causeEventId: message,
+	});
+	saveAnsteelTeamState(projectDirectory, state);
+	throw new AnsteelTeamStateError(message);
+}
+
+function assertAnsteelStateTransitionLogs(state: AnsteelTeamState): void {
+	if (!Array.isArray(state.transitionLogs)) {
+		throw new AnsteelTeamStateError("state-projection-mismatch: transition log is missing");
+	}
+	const targets = new Map<string, { status: string; transitionLogId: string }>();
+	const addTarget = (kind: AnsteelStateObjectKind, objectId: string, target: AnsteelMutableStateTarget): void => {
+		const key = getAnsteelStateObjectKey(kind, objectId);
+		if (targets.has(key)) {
+			throw new AnsteelTeamStateError(`state-projection-mismatch: duplicate state object ${kind} ${objectId}`);
+		}
+		targets.set(key, { status: target.status, transitionLogId: target.transitionLogId });
+	};
+	addTarget("team", state.id, state);
+	for (const role of ANSTEEL_ROLES) addTarget("role", role, state.roles[role]);
+	for (const challenge of state.openChallenges) addTarget("challenge", challenge.id, challenge);
+	for (const task of state.tasks) addTarget("task", task.id, task);
+	for (const milestone of state.milestones) addTarget("milestone", milestone.id, milestone);
+	for (const checkpoint of state.workCheckpoints) addTarget("checkpoint", checkpoint.id, checkpoint);
+	for (const issue of state.processIssues) addTarget("process-issue", issue.id, issue);
+	for (const verification of state.deliveryVerifications) {
+		addTarget("delivery-verification", verification.id, verification);
+	}
+
+	const projected = new Map<string, string | null>();
+	const lastApplied = new Map<string, string>();
+	const logIds = new Set<string>();
+	for (let index = 0; index < state.transitionLogs.length; index += 2) {
+		const attempted = state.transitionLogs[index];
+		const result = state.transitionLogs[index + 1];
+		if (!isRecord(attempted) || !isRecord(result)) {
+			throw new AnsteelTeamStateError("state-projection-mismatch: transition log contains an incomplete pair");
+		}
+		for (const entry of [attempted, result]) {
+			if (
+				typeof entry.logId !== "string" ||
+				!/^ST-[0-9a-f-]+-(?:ATTEMPTED|APPLIED|REJECTED)$/.test(entry.logId) ||
+				typeof entry.transitionId !== "string" ||
+				!/^ST-[0-9a-f-]+$/.test(entry.transitionId) ||
+				!ANSTEEL_STATE_TRANSITION_EVENT_NAMES.includes(entry.eventName as AnsteelStateTransitionEventName) ||
+				typeof entry.objectId !== "string" ||
+				entry.objectId.length === 0 ||
+				typeof entry.to !== "string" ||
+				entry.to.length === 0 ||
+				typeof entry.guard !== "string" ||
+				entry.guard.length === 0 ||
+				typeof entry.guardResult !== "boolean" ||
+				typeof entry.triggerEventId !== "string" ||
+				entry.triggerEventId.length === 0
+			) {
+				throw new AnsteelTeamStateError("state-projection-mismatch: transition log entry is invalid");
+			}
+			assertStateTimestamp(entry.createdAt, "transition time");
+			if (entry.from !== null && typeof entry.from !== "string") {
+				throw new AnsteelTeamStateError("state-projection-mismatch: transition source is invalid");
+			}
+			if (logIds.has(entry.logId)) {
+				throw new AnsteelTeamStateError(`state-projection-mismatch: duplicate transition log ${entry.logId}`);
+			}
+			logIds.add(entry.logId);
+		}
+		if (
+			attempted.eventName !== "state.transition.attempted" ||
+			(result.eventName !== "state.transition.applied" && result.eventName !== "state.transition.rejected") ||
+			attempted.transitionId !== result.transitionId ||
+			attempted.objectKind !== result.objectKind ||
+			attempted.objectId !== result.objectId ||
+			attempted.from !== result.from ||
+			attempted.to !== result.to ||
+			attempted.guard !== result.guard ||
+			attempted.guardResult !== result.guardResult ||
+			attempted.triggerEventId !== result.triggerEventId
+		) {
+			throw new AnsteelTeamStateError("state-projection-mismatch: transition attempt and result do not match");
+		}
+		const key = getAnsteelStateObjectKey(result.objectKind, result.objectId);
+		if (!targets.has(key)) {
+			throw new AnsteelTeamStateError(
+				`state-projection-mismatch: transition references missing ${result.objectKind} ${result.objectId}`,
+			);
+		}
+		const current = projected.get(key) ?? null;
+		if (result.from !== current) {
+			throw new AnsteelTeamStateError(
+				`state-projection-mismatch: transition ${result.transitionId} starts at ${String(result.from)} instead of ${String(current)}`,
+			);
+		}
+		if (result.eventName === "state.transition.applied") {
+			if (!result.guardResult || result.reasonCode !== undefined) {
+				throw new AnsteelTeamStateError(
+					"state-projection-mismatch: applied transition has an invalid guard result",
+				);
+			}
+			projected.set(key, result.to);
+			lastApplied.set(key, result.logId);
+		} else {
+			if (
+				result.guardResult ||
+				result.reasonCode === undefined ||
+				!ANSTEEL_RUNTIME_REASON_CODES.includes(result.reasonCode as AnsteelRuntimeReasonCode) ||
+				typeof result.causeEventId !== "string" ||
+				result.causeEventId.length === 0
+			) {
+				throw new AnsteelTeamStateError("state-projection-mismatch: rejected transition lacks a stable cause");
+			}
+		}
+	}
+
+	for (const [key, target] of targets) {
+		if (projected.get(key) !== target.status || lastApplied.get(key) !== target.transitionLogId) {
+			throw new AnsteelTeamStateError(
+				`state-projection-mismatch: ${key.replace("\0", " ")} disagrees with transition replay`,
+			);
+		}
+	}
+}
+
+function initializeAnsteelStateTransitionBaseline(
+	state: AnsteelTeamState,
+	guard: "team-created" | "legacy-v11-migration-baseline",
+	triggerEventId: string,
+): void {
+	state.transitionLogs = [];
+	const createdAt = state.updatedAt;
+	const initialize = (kind: AnsteelStateObjectKind, objectId: string, target: AnsteelMutableStateTarget): void => {
+		const status = target.status;
+		target.transitionLogId = "";
+		applyAnsteelStateTransition(state, target, kind, objectId, status, {
+			guard,
+			triggerEventId,
+			createdAt,
+			from: null,
+			deterministicSeed: `${state.id}\0${guard}\0${kind}\0${objectId}\0${status}`,
+		});
+	};
+	initialize("team", state.id, state);
+	for (const role of ANSTEEL_ROLES) initialize("role", role, state.roles[role]);
+	for (const challenge of state.openChallenges) initialize("challenge", challenge.id, challenge);
+	for (const task of state.tasks) initialize("task", task.id, task);
+	for (const milestone of state.milestones) initialize("milestone", milestone.id, milestone);
+	for (const checkpoint of state.workCheckpoints) initialize("checkpoint", checkpoint.id, checkpoint);
+	for (const issue of state.processIssues) initialize("process-issue", issue.id, issue);
+	for (const verification of state.deliveryVerifications) {
+		initialize("delivery-verification", verification.id, verification);
 	}
 }
 
@@ -1029,7 +1364,7 @@ function assertAnsteelTeamDeliveryVerifications(state: AnsteelTeamState): void {
 	if (!Array.isArray(state.deliveryVerifications)) {
 		throw new AnsteelTeamStateError("Ansteel team state has invalid delivery verifications");
 	}
-	const taskIds = new Set(state.tasks.map((task) => task.id));
+	const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
 	const verificationIds = new Set<string>();
 	const activeScopes = new Set<string>();
 	for (const verification of state.deliveryVerifications) {
@@ -1040,7 +1375,8 @@ function assertAnsteelTeamDeliveryVerifications(state: AnsteelTeamState): void {
 		}
 		verificationIds.add(verification.id);
 		assertTaskId(verification.taskId);
-		if (!taskIds.has(verification.taskId)) {
+		const task = tasksById.get(verification.taskId);
+		if (!task) {
 			throw new AnsteelTeamStateError(
 				`Ansteel team delivery verification ${verification.id} targets an unknown task`,
 			);
@@ -1048,6 +1384,16 @@ function assertAnsteelTeamDeliveryVerifications(state: AnsteelTeamState): void {
 		if (!Number.isSafeInteger(verification.revision) || verification.revision < 1) {
 			throw new AnsteelTeamStateError(
 				`Ansteel team delivery verification ${verification.id} has an invalid revision`,
+			);
+		}
+		if (verification.revision > task.revision) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} targets a future task revision`,
+			);
+		}
+		if (!task.submissions.some((submission) => submission.revision === verification.revision)) {
+			throw new AnsteelTeamStateError(
+				`Ansteel team delivery verification ${verification.id} has no matching task submission`,
 			);
 		}
 		assertLedgerHash(verification.diffHash, "delivery diff hash", false);
@@ -1210,17 +1556,36 @@ function assertAnsteelTeamTaskDependencyGraph(state: AnsteelTeamState): void {
 	}
 }
 
-function reconcileAnsteelTeamTaskDependencies(state: AnsteelTeamState): void {
+function reconcileAnsteelTeamTaskDependencies(
+	state: AnsteelTeamState,
+	eventContext?: { event: AnsteelTeamEvent; recordTransitions: boolean },
+): void {
+	const transitionOptions = (guard: string, suffix: string): AnsteelStateTransitionOptions => ({
+		guard,
+		...(eventContext === undefined
+			? { causeEventId: state.ledgerHeadHash ?? undefined }
+			: {
+					triggerEventId: eventContext.event.hash,
+					causeEventId: eventContext.event.hash,
+					createdAt: eventContext.event.createdAt,
+					deterministicSeed: `${eventContext.event.hash}\0${suffix}`,
+					record: eventContext.recordTransitions,
+				}),
+	});
 	const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
 	for (const task of state.tasks) {
 		const dependenciesApproved = task.dependsOn.every((dependency) =>
 			isAnsteelTeamTaskDelivered(state, tasksById.get(dependency)!),
 		);
 		if (!dependenciesApproved && task.status !== "blocked") {
-			task.status = "blocked";
+			applyAnsteelStateTransition(state, task, "task", task.id, "blocked", {
+				...transitionOptions("dependencies-delivered", `task\0${task.id}\0blocked`),
+			});
 			task.testEvidence = [];
 		} else if (dependenciesApproved && task.status === "blocked") {
-			task.status = "claimed";
+			applyAnsteelStateTransition(state, task, "task", task.id, "claimed", {
+				...transitionOptions("dependencies-delivered", `task\0${task.id}\0claimed`),
+			});
 		}
 	}
 	for (const milestone of state.milestones) {
@@ -1228,10 +1593,14 @@ function reconcileAnsteelTeamTaskDependencies(state: AnsteelTeamState): void {
 			isAnsteelTeamTaskDelivered(state, tasksById.get(taskId)!),
 		);
 		if (!tasksApproved && milestone.status !== "blocked") {
-			milestone.status = "blocked";
+			applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, "blocked", {
+				...transitionOptions("milestone-tasks-delivered", `milestone\0${milestone.id}\0blocked`),
+			});
 			milestone.testEvidence = [];
 		} else if (tasksApproved && milestone.status === "blocked") {
-			milestone.status = "ready";
+			applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, "ready", {
+				...transitionOptions("milestone-tasks-delivered", `milestone\0${milestone.id}\0ready`),
+			});
 		}
 	}
 }
@@ -1314,7 +1683,10 @@ function assertAnsteelTeamMilestones(state: AnsteelTeamState): void {
 	}
 }
 
-function assertAnsteelPublicCollaborationState(state: AnsteelTeamState): void {
+function assertAnsteelPublicCollaborationState(
+	state: AnsteelTeamState,
+	options: { validateTransitionProjection?: boolean } = {},
+): void {
 	if (!Array.isArray(state.workCheckpoints)) {
 		throw new AnsteelTeamStateError("Ansteel team state has invalid work checkpoints");
 	}
@@ -1361,6 +1733,7 @@ function assertAnsteelPublicCollaborationState(state: AnsteelTeamState): void {
 		}
 		if (
 			checkpoint.nextAction.kind !== "read" &&
+			checkpoint.nextAction.kind !== "report" &&
 			checkpoint.nextAction.kind !== "experiment" &&
 			checkpoint.nextAction.kind !== "edit" &&
 			checkpoint.nextAction.kind !== "write" &&
@@ -1629,6 +2002,7 @@ function assertAnsteelPublicCollaborationState(state: AnsteelTeamState): void {
 		assertNonEmptyStateString(review.reason, `action review ${review.checkpointId} reason`);
 		assertStateTimestamp(review.reviewedAt, `action review ${review.checkpointId} time`);
 	}
+	if (options.validateTransitionProjection !== false) assertAnsteelStateTransitionLogs(state);
 }
 
 export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): AnsteelTeamState {
@@ -1645,13 +2019,19 @@ export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): 
 		id: createAnsteelTeamId(now),
 		topic: options.topic.trim(),
 		status: "active",
+		transitionLogId: "",
 		createdAt: timestamp,
 		updatedAt: timestamp,
 		nextEventSequence: 1,
 		roles: Object.fromEntries(
 			ANSTEEL_ROLES.map((role) => [
 				role,
-				{ model: options.roleModels[role], sessionFile: getAnsteelTeamRoleSessionPath(cwd, role), status: "idle" },
+				{
+					model: options.roleModels[role],
+					sessionFile: getAnsteelTeamRoleSessionPath(cwd, role),
+					status: "idle",
+					transitionLogId: "",
+				},
 			]),
 		) as Record<AnsteelRole, AnsteelTeamRoleState>,
 		taskOwners,
@@ -1662,10 +2042,40 @@ export function createAnsteelTeamState(options: CreateAnsteelTeamStateOptions): 
 		processIssues: [],
 		actionReviews: [],
 		deliveryVerifications: [],
+		transitionLogs: [],
 		ledgerHeadHash: null,
 	};
+	initializeAnsteelStateTransitionBaseline(state, "team-created", `EV-TEAM-CREATED-${state.id}`);
 	assertState(state);
 	return state;
+}
+
+/** 由协调器独占写入的团队生命周期转换，供扩展运行时调用。 */
+export function transitionAnsteelTeamStatus(
+	state: AnsteelTeamState,
+	to: AnsteelTeamStatus,
+	guard: string,
+	causeEventId?: string,
+): void {
+	applyAnsteelStateTransition(state, state, "team", state.id, to, {
+		guard,
+		...(causeEventId === undefined ? {} : { causeEventId }),
+	});
+}
+
+/** 由协调器独占写入的角色会话转换，包围每一次 provider 阶段。 */
+export function transitionAnsteelTeamRoleStatus(
+	state: AnsteelTeamState,
+	role: AnsteelRole,
+	to: AnsteelTeamRoleState["status"],
+	guard: string,
+	causeEventId?: string,
+): void {
+	assertRole(role, "role transition target");
+	applyAnsteelStateTransition(state, state.roles[role], "role", role, to, {
+		guard,
+		...(causeEventId === undefined ? {} : { causeEventId }),
+	});
 }
 
 interface CanonicalProjectTarget {
@@ -1844,7 +2254,7 @@ function classifyCheckpointActionRisk(
 	cwd: string,
 	action: AnsteelWorkCheckpointInput["nextAction"],
 ): AnsteelActionRisk {
-	if (action.kind === "read") return "green";
+	if (action.kind === "read" || action.kind === "report") return "green";
 	if (action.kind === "commit" || action.kind === "publish") return "red";
 	if (action.kind === "edit" || action.kind === "write") {
 		return classifyAnsteelTeamActionRisk(cwd, {
@@ -2263,6 +2673,7 @@ function claimAnsteelTeamTaskInState(
 		})
 			? "claimed"
 			: "blocked",
+		transitionLogId: "",
 		revision: 0,
 		testEvidence: [],
 		submissions: [],
@@ -2270,6 +2681,10 @@ function claimAnsteelTeamTaskInState(
 		reviews: [],
 	};
 	state.tasks.push(task);
+	applyAnsteelStateTransition(state, task, "task", task.id, task.status, {
+		guard: "task-claim-valid",
+		from: null,
+	});
 	return task;
 }
 
@@ -2411,6 +2826,7 @@ export function createAnsteelTeamMilestone(
 		description: input.description.trim(),
 		acceptanceCriteria: input.acceptanceCriteria.trim(),
 		status: tasksApproved ? "ready" : "blocked",
+		transitionLogId: "",
 		revision: 0,
 		testEvidence: [],
 		submissions: [],
@@ -2418,6 +2834,10 @@ export function createAnsteelTeamMilestone(
 		reviews: [],
 	};
 	state.milestones.push(milestone);
+	applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, milestone.status, {
+		guard: "milestone-plan-valid",
+		from: null,
+	});
 	saveAnsteelTeamState(projectDirectory, state);
 	return milestone;
 }
@@ -2442,34 +2862,50 @@ function getMilestoneForIntegration(
 	return milestone;
 }
 
-export function runAnsteelTeamMilestoneTest(
+export async function runAnsteelTeamMilestoneTest(
 	cwd: string,
 	state: AnsteelTeamState,
 	role: AnsteelRole,
 	milestoneId: string,
 	command: string,
-): AnsteelTeamTaskTestEvidence {
+	persistence?: AnsteelTeamPersistenceContext,
+): Promise<AnsteelTeamTaskTestEvidence> {
 	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
 	const milestone = getMilestoneForIntegration(state, role, milestoneId);
 	if (typeof command !== "string") throw new AnsteelTeamStateError("Ansteel team milestone tests require a command");
 	const normalizedCommand = assertAllowedTaskTestCommand(command);
-	const result = spawnSync(normalizedCommand, {
+	const result = await runAnsteelGovernedProcess({
+		command: normalizedCommand,
+		args: [],
 		cwd: projectDirectory,
-		encoding: "utf8",
+		env: getAnsteelTeamDeliveryEnvironment(),
 		shell: true,
-		timeout: ANSTEEL_TEAM_TEST_TIMEOUT_MS,
-		maxBuffer: 4 * 1024 * 1024,
-		windowsHide: true,
+		timeoutMs: ANSTEEL_TEAM_TEST_TIMEOUT_MS,
+		maximumOutputBytes: ANSTEEL_TEAM_TEST_OUTPUT_MAX_BYTES,
+		policy: "milestone-test",
+		role,
+		checkpointId: milestoneId,
+		...(persistence?.toolCallId === undefined ? {} : { toolCallId: persistence.toolCallId }),
+		...(persistence === undefined ? {} : { persistence }),
 	});
+	const diagnostic = result.launchError
+		? `\n${result.launchError.message}`
+		: result.timedOut
+			? `\nProcess timed out after ${ANSTEEL_TEAM_TEST_TIMEOUT_MS}ms`
+			: result.stdoutTruncated || result.stderrTruncated
+				? "\nProcess output exceeded the governed collection boundary"
+				: "";
 	const evidence: AnsteelTeamTaskTestEvidence = {
 		command: normalizedCommand,
-		output: `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? `\n${result.error.message}` : ""}`.slice(
-			0,
-			MAX_PUBLIC_EVENT_CONTENT_LENGTH,
-		),
-		isError: result.status !== 0 || result.error !== undefined,
-		completedAt: new Date().toISOString(),
+		output: `${diagnostic}${result.stdout}${result.stderr}`.slice(0, MAX_PUBLIC_EVENT_CONTENT_LENGTH),
+		isError:
+			result.exitCode !== 0 ||
+			result.launchError !== undefined ||
+			result.timedOut ||
+			result.stdoutTruncated ||
+			result.stderrTruncated,
+		completedAt: result.completedAt,
 	};
 	milestone.testEvidence.push(evidence);
 	saveAnsteelTeamState(projectDirectory, state);
@@ -2485,12 +2921,42 @@ export function submitAnsteelTeamMilestone(
 ): AnsteelTeamMilestoneSubmission {
 	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
-	const milestone = getMilestoneForIntegration(state, role, milestoneId);
+	assertRole(role, "milestone role");
+	if (role !== "tech-lead")
+		throw new AnsteelTeamStateError("Only Ansteel team tech-lead can submit milestone integration evidence");
+	assertMilestoneId(milestoneId);
+	const milestone = state.milestones.find((item) => item.id === milestoneId);
+	if (!milestone) throw new AnsteelTeamStateError(`Ansteel team milestone ${milestoneId} does not exist`);
+	if (milestone.status !== "ready" && milestone.status !== "revision-required") {
+		const message =
+			milestone.status === "blocked"
+				? `Ansteel team milestone ${milestoneId} is waiting for delivered tasks`
+				: `Ansteel team milestone ${milestoneId} cannot accept new integration evidence`;
+		return rejectPersistedAnsteelStateTransition(
+			projectDirectory,
+			state,
+			milestone,
+			"milestone",
+			milestone.id,
+			"submitted",
+			"milestone-submission-evidence-valid",
+			"no-governed-progress",
+			message,
+		);
+	}
 	const test = [...milestone.testEvidence]
 		.reverse()
 		.find((evidence) => evidence.command === testCommand.trim() && !evidence.isError);
 	if (!test) {
-		throw new AnsteelTeamStateError(
+		return rejectPersistedAnsteelStateTransition(
+			projectDirectory,
+			state,
+			milestone,
+			"milestone",
+			milestone.id,
+			"submitted",
+			"milestone-submission-evidence-valid",
+			"no-governed-progress",
 			`Ansteel team milestone ${milestoneId} requires a successful recorded result for ${testCommand.trim()}`,
 		);
 	}
@@ -2501,7 +2967,9 @@ export function submitAnsteelTeamMilestone(
 	};
 	milestone.revision = submission.revision;
 	milestone.submissions.push(submission);
-	milestone.status = "submitted";
+	applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, "submitted", {
+		guard: "milestone-submission-evidence-valid",
+	});
 	saveAnsteelTeamState(projectDirectory, state);
 	return submission;
 }
@@ -2639,13 +3107,23 @@ export function beginAnsteelTeamMilestoneFinalVerification(
 	const projectDirectory = assertProjectDirectory(cwd);
 	const readiness = getAnsteelTeamMilestoneFinalVerificationReadiness(projectDirectory, state, milestoneId);
 	if (!readiness.ready) {
+		const milestone = state.milestones.find((item) => item.id === milestoneId)!;
+		rejectAnsteelStateTransition(state, milestone, "milestone", milestone.id, "final-verification", {
+			guard: "milestone-final-verification-ready",
+			reasonCode: readiness.blockers.some((blocker) => blocker.startsWith("open "))
+				? "blocking-process-issue-open"
+				: "no-governed-progress",
+		});
+		saveAnsteelTeamState(projectDirectory, state);
 		throw new AnsteelTeamStateError(
 			`Ansteel team milestone ${milestoneId} cannot begin final verification: ${readiness.blockers.join("; ")}`,
 		);
 	}
 	const milestone = state.milestones.find((item) => item.id === milestoneId)!;
 	const submission = milestone.submissions.at(-1)!;
-	milestone.status = "final-verification";
+	applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, "final-verification", {
+		guard: "milestone-final-verification-ready",
+	});
 	saveAnsteelTeamState(projectDirectory, state);
 	return submission;
 }
@@ -2694,7 +3172,10 @@ export function reviewAnsteelTeamMilestone(
 	};
 	milestone.reviews.push(review);
 	if (review.verdict === "reject") {
-		milestone.status = "revision-required";
+		applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, "revision-required", {
+			guard: "milestone-final-review-approved",
+			causeEventId: `REVIEW-${review.reviewer}-${review.reviewedAt}`,
+		});
 		milestone.testEvidence = [];
 	} else if (
 		["staff-engineer", "qa-engineer"].every((role) =>
@@ -2703,7 +3184,9 @@ export function reviewAnsteelTeamMilestone(
 			),
 		)
 	) {
-		milestone.status = "approved";
+		applyAnsteelStateTransition(state, milestone, "milestone", milestone.id, "approved", {
+			guard: "milestone-final-review-approved",
+		});
 	}
 	saveAnsteelTeamState(projectDirectory, state);
 	return review;
@@ -3270,13 +3753,14 @@ function assertAllowedTaskTestCommand(command: string): string {
 	return normalizedCommand;
 }
 
-export function runAnsteelTeamTaskTest(
+export async function runAnsteelTeamTaskTest(
 	cwd: string,
 	state: AnsteelTeamState,
 	role: AnsteelRole,
 	taskId: string,
 	command: string,
-): AnsteelTeamTaskTestEvidence {
+	persistence?: AnsteelTeamPersistenceContext,
+): Promise<AnsteelTeamTaskTestEvidence> {
 	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
 	const task = getTaskForOwner(state, role, taskId);
@@ -3285,19 +3769,37 @@ export function runAnsteelTeamTaskTest(
 		throw new AnsteelTeamStateError("Ansteel team task tests require a command");
 	}
 	const normalizedCommand = assertAllowedTaskTestCommand(command);
-	const result = spawnSync(normalizedCommand, {
+	const result = await runAnsteelGovernedProcess({
+		command: normalizedCommand,
+		args: [],
 		cwd: projectDirectory,
-		encoding: "utf8",
+		env: getAnsteelTeamDeliveryEnvironment(),
 		shell: true,
-		timeout: ANSTEEL_TEAM_TEST_TIMEOUT_MS,
-		maxBuffer: 4 * 1024 * 1024,
-		windowsHide: true,
+		timeoutMs: ANSTEEL_TEAM_TEST_TIMEOUT_MS,
+		maximumOutputBytes: ANSTEEL_TEAM_TEST_OUTPUT_MAX_BYTES,
+		policy: "task-test",
+		role,
+		taskId,
+		...(persistence?.toolCallId === undefined ? {} : { toolCallId: persistence.toolCallId }),
+		...(persistence === undefined ? {} : { persistence }),
 	});
-	const output = `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? `\n${result.error.message}` : ""}`;
+	const diagnostic = result.launchError
+		? `\n${result.launchError.message}`
+		: result.timedOut
+			? `\nProcess timed out after ${ANSTEEL_TEAM_TEST_TIMEOUT_MS}ms`
+			: result.stdoutTruncated || result.stderrTruncated
+				? "\nProcess output exceeded the governed collection boundary"
+				: "";
+	const output = `${diagnostic}${result.stdout}${result.stderr}`;
 	return recordAnsteelTeamTaskTestResult(projectDirectory, state, role, taskId, {
 		command: normalizedCommand,
 		output,
-		isError: result.status !== 0 || result.error !== undefined,
+		isError:
+			result.exitCode !== 0 ||
+			result.launchError !== undefined ||
+			result.timedOut ||
+			result.stdoutTruncated ||
+			result.stderrTruncated,
 	});
 }
 
@@ -3460,11 +3962,22 @@ export function returnAnsteelTeamTaskForCollaboration(
 	const task = state.tasks.find((item) => item.id === taskId);
 	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
 	if (task.status !== "submitted") {
-		throw new AnsteelTeamStateError(
+		return rejectPersistedAnsteelStateTransition(
+			projectDirectory,
+			state,
+			task,
+			"task",
+			task.id,
+			"revision-required",
+			"task-collaboration-return-recorded",
+			"no-governed-progress",
 			`Ansteel team task ${taskId} is ${task.status}; it cannot be returned for collaboration`,
 		);
 	}
-	task.status = "revision-required";
+	applyAnsteelStateTransition(state, task, "task", task.id, "revision-required", {
+		guard: "task-collaboration-return-recorded",
+		causeEventId: reason.trim(),
+	});
 	task.testEvidence = [];
 	reconcileAnsteelTeamTaskDependencies(state);
 	saveAnsteelTeamState(projectDirectory, state);
@@ -3479,13 +3992,25 @@ export function beginAnsteelTeamTaskFinalVerification(
 	const projectDirectory = assertProjectDirectory(cwd);
 	const readiness = getAnsteelTeamTaskFinalVerificationReadiness(projectDirectory, state, taskId);
 	if (!readiness.ready) {
+		const task = state.tasks.find((item) => item.id === taskId)!;
+		rejectAnsteelStateTransition(state, task, "task", task.id, "final-verification", {
+			guard: "task-final-verification-ready",
+			reasonCode: readiness.blockers.some((blocker) => blocker.startsWith("open "))
+				? "blocking-process-issue-open"
+				: readiness.blockers.some((blocker) => blocker.includes("diff differs"))
+					? "diff-hash-mismatch"
+					: "no-governed-progress",
+		});
+		saveAnsteelTeamState(projectDirectory, state);
 		throw new AnsteelTeamStateError(
 			`Ansteel team task ${taskId} cannot begin final verification: ${readiness.blockers.join("; ")}`,
 		);
 	}
 	const task = state.tasks.find((item) => item.id === taskId)!;
 	const submission = task.submissions.at(-1)!;
-	task.status = "final-verification";
+	applyAnsteelStateTransition(state, task, "task", task.id, "final-verification", {
+		guard: "task-final-verification-ready",
+	});
 	saveAnsteelTeamState(projectDirectory, state);
 	return submission;
 }
@@ -3559,6 +4084,59 @@ export function getAnsteelTeamTaskCollaborationFingerprint(
 		.digest("hex");
 }
 
+/**
+ * 对当前 revision 中曾获得全部必要同伴批准的唯一任务动作绑定做指纹。指纹故意不包含
+ * checkpoint ID 和 checkpoint 当前状态：替换或重命名同一个已批准动作不能伪造“新进展”，
+ * 后续治理变化导致批准消失也不能被反向计算为前进。
+ */
+export function getAnsteelTeamTaskActionApprovalFingerprint(
+	cwd: string,
+	state: AnsteelTeamState,
+	taskId: string,
+): string {
+	assertProjectDirectory(cwd);
+	assertState(state);
+	assertTaskId(taskId);
+	const task = state.tasks.find((item) => item.id === taskId);
+	if (!task) throw new AnsteelTeamStateError(`Ansteel team task ${taskId} does not exist`);
+
+	const revisionPrefix = `${task.id}@${task.revision};`;
+	const approvedBindings = new Set<string>();
+	for (const checkpoint of state.workCheckpoints) {
+		const action = checkpoint.governedAction;
+		if (
+			checkpoint.taskId !== task.id ||
+			action === null ||
+			!action.version.startsWith(revisionPrefix) ||
+			action.effectiveRisk === "green"
+		) {
+			continue;
+		}
+
+		const reviews = state.actionReviews.filter(
+			(review) =>
+				review.checkpointId === checkpoint.id &&
+				review.action.kind === action.kind &&
+				review.action.target === action.target &&
+				review.action.version === action.version,
+		);
+		if (reviews.some((review) => review.verdict === "reject")) continue;
+		const requiredReviewers = getRequiredAnsteelActionReviewers(checkpoint.actor);
+		if (
+			!requiredReviewers.every((reviewer) =>
+				reviews.some((review) => review.reviewer === reviewer && review.verdict === "approve"),
+			)
+		) {
+			continue;
+		}
+		approvedBindings.add(JSON.stringify([checkpoint.actor, action.kind, action.target, action.version]));
+	}
+
+	return createHash("sha256")
+		.update(JSON.stringify([...approvedBindings].sort()), "utf8")
+		.digest("hex");
+}
+
 export function submitAnsteelTeamTask(
 	cwd: string,
 	state: AnsteelTeamState,
@@ -3569,7 +4147,19 @@ export function submitAnsteelTeamTask(
 	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
 	const task = getTaskForOwner(state, role, taskId);
-	assertTaskCanBeChanged(task);
+	if (task.status !== "claimed" && task.status !== "revision-required") {
+		return rejectPersistedAnsteelStateTransition(
+			projectDirectory,
+			state,
+			task,
+			"task",
+			task.id,
+			"submitted",
+			"task-submission-evidence-valid",
+			"no-governed-progress",
+			`Ansteel team task ${task.id} is ${task.status}; it cannot be changed`,
+		);
+	}
 	if (typeof testCommand !== "string" || testCommand.trim().length === 0) {
 		throw new AnsteelTeamStateError("Ansteel team task submission requires the exact test command");
 	}
@@ -3577,19 +4167,46 @@ export function submitAnsteelTeamTask(
 		.reverse()
 		.find((evidence) => evidence.command === testCommand.trim() && !evidence.isError);
 	if (!test) {
-		throw new AnsteelTeamStateError(
+		return rejectPersistedAnsteelStateTransition(
+			projectDirectory,
+			state,
+			task,
+			"task",
+			task.id,
+			"submitted",
+			"task-submission-evidence-valid",
+			"no-governed-progress",
 			`Ansteel team task ${task.id} requires a successful recorded result for ${testCommand.trim()}`,
+		);
+	}
+	let diff: string;
+	try {
+		diff = captureTaskDiff(projectDirectory, task);
+	} catch (error) {
+		if (!(error instanceof AnsteelTeamStateError)) throw error;
+		return rejectPersistedAnsteelStateTransition(
+			projectDirectory,
+			state,
+			task,
+			"task",
+			task.id,
+			"submitted",
+			"task-submission-evidence-valid",
+			error.message.includes("has no Git diff") ? "no-governed-progress" : "tool-exit-nonzero",
+			error.message,
 		);
 	}
 	const submission: AnsteelTeamTaskSubmission = {
 		revision: task.revision + 1,
 		submittedAt: new Date().toISOString(),
-		diff: captureTaskDiff(projectDirectory, task),
+		diff,
 		test: { ...test },
 	};
 	task.revision = submission.revision;
 	task.submissions.push(submission);
-	task.status = "submitted";
+	applyAnsteelStateTransition(state, task, "task", task.id, "submitted", {
+		guard: "task-submission-evidence-valid",
+	});
 	saveAnsteelTeamState(projectDirectory, state);
 	return submission;
 }
@@ -3636,13 +4253,18 @@ export function reviewAnsteelTeamTask(
 	};
 	task.reviews.push(review);
 	if (review.verdict === "reject") {
-		task.status = "revision-required";
+		applyAnsteelStateTransition(state, task, "task", task.id, "revision-required", {
+			guard: "task-final-review-recorded",
+			causeEventId: `REVIEW-${review.reviewer}-${review.reviewedAt}`,
+		});
 		task.testEvidence = [];
 	} else {
 		const peerReviews = task.reviews.filter((item) => item.revision === submission.revision);
 		const peerRoles = ANSTEEL_ROLES.filter((role) => role !== task.owner);
 		if (peerRoles.every((role) => peerReviews.some((item) => item.reviewer === role && item.verdict === "approve"))) {
-			task.status = "approved";
+			applyAnsteelStateTransition(state, task, "task", task.id, "approved", {
+				guard: "all-independent-task-reviews-approved",
+			});
 		}
 	}
 	reconcileAnsteelTeamTaskDependencies(state);
@@ -3660,6 +4282,135 @@ interface AnsteelTeamDeliveryWorkspaceSnapshot {
 	hash: string;
 	trackedDiffHash: string;
 	untracked: Array<{ file: string; sha256: string }>;
+}
+
+/**
+ * 只有将已签名公共账本重放并与持久状态核对成功后，才构造事故包中由项目层负责的上下文。
+ * 运行记录只用于选择相关 task 身份；记录里缺失的 revision 必须保持缺失，不能用当前 revision
+ * 冒充事故发生时的历史 revision。
+ */
+export function createAnsteelTeamIncidentProjectContext(
+	cwd: string,
+	state: AnsteelTeamState,
+	runtimeEntries: readonly AnsteelRuntimeLogEntry[],
+): AnsteelIncidentProjectContextVerified {
+	assertState(state);
+	const events = listAnsteelTeamEvents(cwd);
+	const board = getAnsteelTeamSharedBoard(state, events, runtimeEntries);
+	const taskRevisions = new Map<string, Set<number>>();
+	for (const entry of runtimeEntries) {
+		if (entry.taskId === undefined) continue;
+		let revisions = taskRevisions.get(entry.taskId);
+		if (revisions === undefined) {
+			revisions = new Set<number>();
+			taskRevisions.set(entry.taskId, revisions);
+		}
+		if (entry.revision !== undefined) revisions.add(entry.revision);
+	}
+	const taskIdentities = [...taskRevisions.entries()]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([taskId, revisions]) => {
+			const task = state.tasks.find((candidate) => candidate.id === taskId);
+			return {
+				taskId,
+				runtimeRevisions: [...revisions].sort((left, right) => left - right),
+				...(task === undefined ? {} : { currentRevision: task.revision, currentStatus: task.status }),
+			};
+		});
+	const relatedTaskIds = new Set(taskIdentities.map((task) => task.taskId));
+	const checkpointCandidates =
+		relatedTaskIds.size === 0
+			? state.workCheckpoints
+			: state.workCheckpoints.filter(
+					(checkpoint) => checkpoint.taskId !== undefined && relatedTaskIds.has(checkpoint.taskId),
+				);
+	const checkpoint = [...checkpointCandidates]
+		.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+		.at(-1);
+	const checkpointEvent =
+		checkpoint === undefined
+			? undefined
+			: [...events]
+					.reverse()
+					.find((event) => event.checkpointId === checkpoint.id && event.type === "work-checkpoint");
+	const lastValidCheckpoint =
+		checkpoint === undefined
+			? null
+			: {
+					checkpointId: checkpoint.id,
+					...(checkpoint.taskId === undefined ? {} : { taskId: checkpoint.taskId }),
+					actor: checkpoint.actor,
+					status: checkpoint.status,
+					createdAt: checkpoint.createdAt,
+					risk: checkpoint.risk,
+					confidence: checkpoint.confidence,
+					nextAction: redactAnsteelSensitiveValue(checkpoint.nextAction) as {
+						kind: string;
+						target: string;
+						expectedResult: string;
+					},
+					checkpointHash: hashAnsteelAuditValue(checkpoint),
+					...(checkpointEvent === undefined ? {} : { eventSequence: checkpointEvent.sequence }),
+				};
+	let workspace: AnsteelIncidentProjectContextVerified["workspace"];
+	try {
+		workspace = { status: "captured", ...captureAnsteelTeamDeliveryWorkspaceSnapshot(cwd) };
+	} catch {
+		// 非 Git 项目或暂时不可访问的 worktree 仍需要生成运行事故包。这里只记录稳定的
+		// “workspace-snapshot-unavailable”机械事实，不嵌入平台相关命令输出，也不伪造工作区哈希。
+		workspace = { status: "unavailable", reasonCode: "workspace-snapshot-unavailable" };
+	}
+	const relatedTask = taskIdentities
+		.map((identity) => state.tasks.find((task) => task.id === identity.taskId))
+		.find((task): task is AnsteelTeamTask => task !== undefined);
+	const checkpointTask =
+		checkpoint?.taskId === undefined ? undefined : state.tasks.find((task) => task.id === checkpoint.taskId);
+	let recoveryEntry: AnsteelIncidentProjectContextVerified["recoveryEntry"];
+	if (checkpoint !== undefined) {
+		recoveryEntry = {
+			kind: "checkpoint",
+			command:
+				checkpoint.taskId === undefined
+					? "/ansteel-team start <existing-topic>"
+					: `/ansteel-team task ${checkpoint.taskId}`,
+			checkpointId: checkpoint.id,
+			...(checkpoint.taskId === undefined ? {} : { taskId: checkpoint.taskId }),
+			...(checkpointTask === undefined ? {} : { revision: checkpointTask.revision }),
+		};
+	} else if (relatedTask !== undefined) {
+		recoveryEntry = {
+			kind: "task-revision",
+			command: `/ansteel-team task ${relatedTask.id}`,
+			taskId: relatedTask.id,
+			revision: relatedTask.revision,
+		};
+	} else if (state.status === "active") {
+		recoveryEntry = { kind: "team-resume", command: "/ansteel-team start <existing-topic>" };
+	} else {
+		recoveryEntry = { kind: "manual", command: "/ansteel-team status --explain" };
+	}
+	return {
+		availability: "verified",
+		teamId: state.id,
+		taskIdentities,
+		publicAuditEventRange: {
+			firstSequence: events[0]?.sequence ?? null,
+			lastSequence: events.at(-1)?.sequence ?? null,
+			eventCount: events.length,
+			headHash: events.at(-1)?.hash ?? null,
+			integrity: "verified",
+		},
+		teamState: {
+			status: state.status,
+			collaborationStatus: board.axes.collaborationStatus,
+			governanceStatus: board.axes.governanceStatus,
+			deliveryStatus: board.axes.deliveryStatus,
+			workflowStatus: board.axes.workflowStatus,
+		},
+		lastValidCheckpoint,
+		workspace,
+		recoveryEntry,
+	};
 }
 
 function captureAnsteelTeamDeliveryWorkspaceSnapshot(cwd: string): AnsteelTeamDeliveryWorkspaceSnapshot {
@@ -3872,13 +4623,13 @@ function appendAnsteelTeamDeliveryTerminalEvent(
  * commands or output to role sessions. Every durable success is bound to the
  * current task revision, frozen task diff, whole workspace and Git commit.
  */
-export function verifyAnsteelTeamTaskDelivery(
+export async function verifyAnsteelTeamTaskDelivery(
 	cwd: string,
 	state: AnsteelTeamState,
 	taskId: string,
 	manifestPath: string,
 	persistence?: AnsteelTeamPersistenceContext,
-): AnsteelTeamDeliveryVerification {
+): Promise<AnsteelTeamDeliveryVerification> {
 	const projectDirectory = assertProjectDirectory(cwd);
 	assertState(state);
 	assertTaskId(taskId);
@@ -3928,6 +4679,7 @@ export function verifyAnsteelTeamTaskDelivery(
 		sourceCommit,
 		manifestHash,
 		status: "verifying",
+		transitionLogId: "",
 		checks: [],
 		startedAt: new Date().toISOString(),
 	};
@@ -3945,32 +4697,47 @@ export function verifyAnsteelTeamTaskDelivery(
 	);
 
 	for (const check of manifest.checks) {
-		const startedAt = new Date().toISOString();
 		const commandHash = hashAnsteelAuditValue({ executable: check.executable, args: check.args });
-		const result = spawnSync(check.executable, check.args, {
+		const result = await runAnsteelGovernedProcess({
+			command: check.executable,
+			args: check.args,
 			cwd: projectDirectory,
-			encoding: "utf8",
 			env: getAnsteelTeamDeliveryEnvironment(),
-			maxBuffer: ANSTEEL_TEAM_DELIVERY_OUTPUT_MAX_BYTES,
-			timeout: check.timeoutMs,
-			windowsHide: true,
 			shell: false,
+			timeoutMs: check.timeoutMs,
+			maximumOutputBytes: ANSTEEL_TEAM_DELIVERY_OUTPUT_MAX_BYTES,
+			policy: "delivery-check",
+			role: "coordinator",
+			taskId,
+			...(persistence === undefined ? {} : { persistence }),
 		});
-		const completedAt = new Date().toISOString();
-		const timedOut = result.error !== undefined && "code" in result.error && result.error.code === "ETIMEDOUT";
-		const isError = result.error !== undefined || result.status !== 0;
+		const startedAt = result.startedAt;
+		const completedAt = result.completedAt;
+		const timedOut = result.timedOut;
+		const isError =
+			result.launchError !== undefined ||
+			timedOut ||
+			result.exitCode !== 0 ||
+			result.stdoutTruncated ||
+			result.stderrTruncated;
 		const output = {
 			verificationId: verification.id,
 			checkId: check.id,
-			stdout: result.stdout ?? "",
-			stderr: result.stderr ?? "",
-			exitCode: result.status,
+			stdout: result.stdout,
+			stderr: `${result.stderr}${result.launchError === undefined ? "" : `\n${result.launchError.message}`}`,
+			stdoutBytes: result.stdoutBytes,
+			stderrBytes: result.stderrBytes,
+			stdoutTruncated: result.stdoutTruncated,
+			stderrTruncated: result.stderrTruncated,
+			stdoutHash: result.stdoutHash,
+			stderrHash: result.stderrHash,
+			exitCode: result.exitCode,
 			timedOut,
 			isError,
 			startedAt,
 			completedAt,
 		};
-		const outputHash = hashAnsteelAuditValue({ stdout: output.stdout, stderr: output.stderr });
+		const outputHash = hashAnsteelAuditValue({ stdoutHash: output.stdoutHash, stderrHash: output.stderrHash });
 		const artifactHash = hashAnsteelAuditValue(output);
 		writeDurableTemporaryFile(
 			join(evidenceDirectory, `${artifactHash}.json`),
@@ -3981,7 +4748,7 @@ export function verifyAnsteelTeamTaskDelivery(
 			commandHash,
 			outputHash,
 			artifactHash,
-			exitCode: result.status,
+			exitCode: result.exitCode,
 			timedOut,
 			isError,
 			startedAt,
@@ -4002,7 +4769,7 @@ export function verifyAnsteelTeamTaskDelivery(
 		if (isError) {
 			const reason: AnsteelTeamDeliveryFailureReason = timedOut
 				? "check-timeout"
-				: result.error === undefined
+				: result.launchError === undefined
 					? "check-failed"
 					: "check-launch-failed";
 			const failed = appendAnsteelTeamDeliveryTerminalEvent(
@@ -4180,12 +4947,71 @@ function recoverAnsteelTeamPendingTransaction(cwd: string, persistence?: Ansteel
 			data: { eventSequence: event.sequence, recovered: true },
 		});
 	}
-	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state, persistence);
+	saveAnsteelTeamState(cwd, state, persistence);
 	unlinkSync(path);
 }
 
 function getAnsteelTeamDirectoryFromStatePath(path: string): string {
 	return resolvePath(join(path, ".."));
+}
+
+function readPersistedAnsteelTransitionLogIds(path: string): Set<string> {
+	if (!existsSync(path)) return new Set();
+	try {
+		const value = JSON.parse(readFileSync(path, "utf8"));
+		if (!isRecord(value) || !Array.isArray(value.transitionLogs)) return new Set();
+		return new Set(
+			value.transitionLogs.flatMap((entry) =>
+				isRecord(entry) && typeof entry.logId === "string" ? [entry.logId] : [],
+			),
+		);
+	} catch {
+		// 正常状态写入路径会在加载时报告损坏的持久状态；这里把它视为“没有已镜像 ID”，
+		// 不会隐藏新的 transition，最多导致后续严格校验再次发现同一损坏。
+		return new Set();
+	}
+}
+
+function createAnsteelStateTransitionRuntimeInput(
+	state: AnsteelTeamState,
+	entry: AnsteelStateTransitionLog,
+): AnsteelRuntimeLogInput {
+	const verification =
+		entry.objectKind === "delivery-verification"
+			? state.deliveryVerifications.find((item) => item.id === entry.objectId)
+			: undefined;
+	return {
+		level: entry.eventName === "state.transition.rejected" ? "warn" : "audit",
+		eventName: entry.eventName,
+		outcome:
+			entry.eventName === "state.transition.attempted"
+				? "progress"
+				: entry.eventName === "state.transition.applied"
+					? "succeeded"
+					: "failed",
+		role:
+			entry.objectKind === "role" && ANSTEEL_ROLES.includes(entry.objectId as AnsteelRole)
+				? (entry.objectId as AnsteelRole)
+				: "coordinator",
+		...(entry.objectKind === "task" ? { taskId: entry.objectId } : {}),
+		...(entry.objectKind === "checkpoint" ? { checkpointId: entry.objectId } : {}),
+		...(entry.objectKind === "process-issue" ? { issueId: entry.objectId } : {}),
+		...(verification === undefined ? {} : { taskId: verification.taskId, revision: verification.revision }),
+		...(entry.reasonCode === undefined ? {} : { reasonCode: entry.reasonCode }),
+		...(entry.causeEventId === undefined ? {} : { causeEventId: entry.causeEventId }),
+		message: `${entry.objectKind} ${entry.objectId} transition ${entry.eventName.split(".").at(-1)}`,
+		data: {
+			transitionLogId: entry.logId,
+			transitionId: entry.transitionId,
+			objectKind: entry.objectKind,
+			objectId: entry.objectId,
+			from: entry.from,
+			to: entry.to,
+			guard: entry.guard,
+			guardResult: entry.guardResult,
+			triggerEventId: entry.triggerEventId,
+		},
+	};
 }
 
 export function saveAnsteelTeamState(
@@ -4196,7 +5022,22 @@ export function saveAnsteelTeamState(
 	assertProjectDirectory(cwd);
 	assertState(state);
 	assertAnsteelTeamEventLedger(cwd, state);
-	writeAnsteelTeamState(getAnsteelTeamStatePath(cwd), state, persistence);
+	const statePath = getAnsteelTeamStatePath(cwd);
+	if (persistence !== undefined) {
+		let persistedLogIds = mirroredTransitionLogIdsByLogger.get(persistence.logger);
+		if (persistedLogIds === undefined) {
+			persistedLogIds = readPersistedAnsteelTransitionLogIds(statePath);
+			mirroredTransitionLogIdsByLogger.set(persistence.logger, persistedLogIds);
+		}
+		const pendingTransitions = state.transitionLogs.filter((entry) => !persistedLogIds.has(entry.logId));
+		if (pendingTransitions.length > 0) {
+			persistence.logger.writeBatch(
+				pendingTransitions.map((entry) => createAnsteelStateTransitionRuntimeInput(state, entry)),
+			);
+			for (const entry of pendingTransitions) persistedLogIds.add(entry.logId);
+		}
+	}
+	writeAnsteelTeamState(statePath, state, persistence);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -4284,7 +5125,7 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 	if (state.version === 10) {
 		state = {
 			...state,
-			version: ANSTEEL_TEAM_STATE_VERSION,
+			version: 11,
 			deliveryVerifications: [],
 			// A v10 approval proves governance only. Without a current revision's
 			// delivery receipt it cannot keep dependent work or milestones unlocked.
@@ -4301,6 +5142,50 @@ function migrateAnsteelTeamState(value: unknown): unknown {
 					)
 				: state.milestones,
 		};
+	}
+	if (state.version === 11) {
+		const migrated = {
+			...state,
+			version: ANSTEEL_TEAM_STATE_VERSION,
+			transitionLogId: "",
+			transitionLogs: [],
+			roles: isRecord(state.roles)
+				? Object.fromEntries(
+						Object.entries(state.roles).map(([role, roleState]) => [
+							role,
+							isRecord(roleState) ? { ...roleState, transitionLogId: "" } : roleState,
+						]),
+					)
+				: state.roles,
+			openChallenges: Array.isArray(state.openChallenges)
+				? state.openChallenges.map((challenge) =>
+						isRecord(challenge) ? { ...challenge, transitionLogId: "" } : challenge,
+					)
+				: state.openChallenges,
+			tasks: Array.isArray(state.tasks)
+				? state.tasks.map((task) => (isRecord(task) ? { ...task, transitionLogId: "" } : task))
+				: state.tasks,
+			milestones: Array.isArray(state.milestones)
+				? state.milestones.map((milestone) =>
+						isRecord(milestone) ? { ...milestone, transitionLogId: "" } : milestone,
+					)
+				: state.milestones,
+			workCheckpoints: Array.isArray(state.workCheckpoints)
+				? state.workCheckpoints.map((checkpoint) =>
+						isRecord(checkpoint) ? { ...checkpoint, transitionLogId: "" } : checkpoint,
+					)
+				: state.workCheckpoints,
+			processIssues: Array.isArray(state.processIssues)
+				? state.processIssues.map((issue) => (isRecord(issue) ? { ...issue, transitionLogId: "" } : issue))
+				: state.processIssues,
+			deliveryVerifications: Array.isArray(state.deliveryVerifications)
+				? state.deliveryVerifications.map((verification) =>
+						isRecord(verification) ? { ...verification, transitionLogId: "" } : verification,
+					)
+				: state.deliveryVerifications,
+		} as unknown as AnsteelTeamState;
+		initializeAnsteelStateTransitionBaseline(migrated, "legacy-v11-migration-baseline", "MIGRATION-V12");
+		state = migrated as unknown as Record<string, unknown>;
 	}
 	return state;
 }
@@ -5003,17 +5888,43 @@ function assertAnsteelTeamEventLedger(cwd: string, state: AnsteelTeamState): voi
 	}
 }
 
-function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent): void {
+function applyAnsteelTeamEvent(
+	state: AnsteelTeamState,
+	event: AnsteelTeamEvent,
+	options: { recordTransitions?: boolean } = {},
+): void {
+	const recordTransitions = options.recordTransitions !== false;
+	const transition = (
+		target: AnsteelMutableStateTarget,
+		kind: AnsteelStateObjectKind,
+		objectId: string,
+		to: string,
+		guard: string,
+		suffix: string,
+		from?: string | null,
+	): void => {
+		applyAnsteelStateTransition(state, target, kind, objectId, to, {
+			guard,
+			triggerEventId: event.hash,
+			createdAt: event.createdAt,
+			deterministicSeed: `${event.hash}\0${suffix}`,
+			record: recordTransitions,
+			...(from === undefined ? {} : { from }),
+		});
+	};
 	if (event.type === "challenge") {
 		if (state.openChallenges.some((challenge) => challenge.id === event.challengeId)) {
 			throw new AnsteelTeamStateError(`Ansteel team challenge ${event.challengeId} already exists`);
 		}
-		state.openChallenges.push({
+		const challenge: AnsteelTeamChallenge = {
 			id: event.challengeId!,
 			raisedBy: event.role as AnsteelRole,
 			targetRole: event.targetRole!,
 			status: "open",
-		});
+			transitionLogId: "",
+		};
+		state.openChallenges.push(challenge);
+		transition(challenge, "challenge", challenge.id, "open", "challenge-valid", `challenge\0${challenge.id}`, null);
 	}
 	if (event.type === "resolution") {
 		const challenge = state.openChallenges.find((item) => item.id === event.challengeId && item.status === "open");
@@ -5023,12 +5934,20 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 				`Ansteel team challenge ${event.challengeId} must be resolved by ${challenge.targetRole}`,
 			);
 		}
-		challenge.status = "resolved";
+		transition(
+			challenge,
+			"challenge",
+			challenge.id,
+			"resolved",
+			"challenge-resolution-authorized",
+			`challenge\0${challenge.id}\0resolved`,
+		);
 	}
 	if (event.schemaVersion !== 2 || event.payload === undefined) return;
 	const payload = event.payload;
 	if (payload.kind === "work-checkpoint") {
 		const checkpoint = structuredClone(payload.checkpoint);
+		checkpoint.transitionLogId = "";
 		if (checkpoint.governedAction === undefined) {
 			checkpoint.governedAction = null;
 			checkpoint.status = "superseded";
@@ -5040,13 +5959,32 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 					`Ansteel team checkpoint ${checkpoint.id} supersedes unknown checkpoint ${checkpoint.supersedesCheckpointId}`,
 				);
 			}
-			superseded.status = "superseded";
+			transition(
+				superseded,
+				"checkpoint",
+				superseded.id,
+				"superseded",
+				"checkpoint-supersession-valid",
+				`checkpoint\0${superseded.id}\0superseded`,
+			);
 		}
 		state.workCheckpoints.push(checkpoint);
+		transition(
+			checkpoint,
+			"checkpoint",
+			checkpoint.id,
+			checkpoint.status,
+			"checkpoint-publication-valid",
+			`checkpoint\0${checkpoint.id}\0created`,
+			null,
+		);
 		return;
 	}
 	if (payload.kind === "process-issue") {
-		state.processIssues.push(structuredClone(payload.issue));
+		const issue = structuredClone(payload.issue);
+		issue.transitionLogId = "";
+		state.processIssues.push(issue);
+		transition(issue, "process-issue", issue.id, issue.status, "process-issue-valid", `issue\0${issue.id}`, null);
 		return;
 	}
 	if (payload.kind === "action-review") {
@@ -5056,7 +5994,18 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 	if (payload.kind === "action-assessed") return;
 	if (payload.kind === "runtime-recovery") return;
 	if (payload.kind === "task-delivery-started") {
-		state.deliveryVerifications.push(structuredClone(payload.verification));
+		const verification = structuredClone(payload.verification);
+		verification.transitionLogId = "";
+		state.deliveryVerifications.push(verification);
+		transition(
+			verification,
+			"delivery-verification",
+			verification.id,
+			"verifying",
+			"delivery-preflight-valid",
+			`delivery\0${verification.id}\0verifying`,
+			null,
+		);
 		return;
 	}
 	if (payload.kind === "task-delivery-check") {
@@ -5077,20 +6026,37 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 		if (!verification || verification.status !== "verifying") {
 			throw new AnsteelTeamStateError(`Ansteel team has no active delivery verification ${payload.verificationId}`);
 		}
-		verification.status = payload.status;
+		transition(
+			verification,
+			"delivery-verification",
+			verification.id,
+			payload.status,
+			"delivery-checks-complete",
+			`delivery\0${verification.id}\0${payload.status}`,
+		);
 		verification.completedAt = payload.completedAt;
 		if (payload.failureReason !== undefined) verification.failureReason = payload.failureReason;
 		const task = state.tasks.find((item) => item.id === verification.taskId);
-		if (!task || task.revision !== verification.revision) {
+		if (!task || verification.revision > task.revision) {
 			throw new AnsteelTeamStateError(
 				`Ansteel team delivery verification ${verification.id} no longer matches its task revision`,
 			);
 		}
+		// 共享工作板重放从最新任务快照开始，而 delivery 事件会保留更早的所有 revision。
+		// 历史终态回执继续可审计，但不能把当前任务或依赖关系回滚到已经过时的生命周期状态。
+		if (verification.revision < task.revision) return;
 		if (payload.status === "failed" && payload.failureReason !== "interrupted") {
-			task.status = "revision-required";
+			transition(
+				task,
+				"task",
+				task.id,
+				"revision-required",
+				"delivery-verification-passed",
+				`task\0${task.id}\0delivery-failed`,
+			);
 			task.testEvidence = [];
 		}
-		reconcileAnsteelTeamTaskDependencies(state);
+		reconcileAnsteelTeamTaskDependencies(state, { event, recordTransitions });
 		return;
 	}
 	const issue = state.processIssues.find((item) => item.id === payload.issueId);
@@ -5099,7 +6065,8 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 	}
 	if (payload.kind === "process-resolution") {
 		issue.resolutions.push(structuredClone(payload.resolution));
-		issue.status = payload.resolution.outcome === "SCOPE_ESCALATION" ? "escalated" : "resolution-proposed";
+		const to = payload.resolution.outcome === "SCOPE_ESCALATION" ? "escalated" : "resolution-proposed";
+		transition(issue, "process-issue", issue.id, to, "process-resolution-valid", `issue\0${issue.id}\0${to}`);
 		return;
 	}
 	const resolution = issue.resolutions.find((item) => item.id === payload.resolutionId);
@@ -5110,11 +6077,32 @@ function applyAnsteelTeamEvent(state: AnsteelTeamState, event: AnsteelTeamEvent)
 	}
 	resolution.review = structuredClone(payload.review);
 	if (resolution.review.verdict === "reject") {
-		issue.status = "open";
+		transition(
+			issue,
+			"process-issue",
+			issue.id,
+			"open",
+			"process-resolution-review-valid",
+			`issue\0${issue.id}\0open`,
+		);
 	} else if (resolution.outcome === "SCOPE_ESCALATION") {
-		issue.status = "escalated";
+		transition(
+			issue,
+			"process-issue",
+			issue.id,
+			"escalated",
+			"process-resolution-review-valid",
+			`issue\0${issue.id}\0escalated`,
+		);
 	} else {
-		issue.status = "closed";
+		transition(
+			issue,
+			"process-issue",
+			issue.id,
+			"closed",
+			"process-resolution-review-valid",
+			`issue\0${issue.id}\0closed`,
+		);
 	}
 }
 
@@ -5233,6 +6221,7 @@ export function publishAnsteelWorkCheckpoint(
 		},
 		actor,
 		status: "active",
+		transitionLogId: "",
 		createdAt: new Date().toISOString(),
 	};
 	appendAnsteelTeamEvent(
@@ -5333,6 +6322,7 @@ export function raiseAnsteelProcessIssue(
 		author,
 		targetRole: checkpoint.actor,
 		status: "open",
+		transitionLogId: "",
 		resolutions: [],
 		createdAt: new Date().toISOString(),
 	};
@@ -5349,7 +6339,10 @@ export function raiseAnsteelProcessIssue(
 	if (targetTask?.status === "submitted" && (issue.severity === "blocking" || issue.severity === "critical")) {
 		// A structured blocking challenge is continuous collaboration, not a final
 		// review. It revokes the frozen work package before final verification.
-		targetTask.status = "revision-required";
+		applyAnsteelStateTransition(state, targetTask, "task", targetTask.id, "revision-required", {
+			guard: "no-open-blocking-process-issue",
+			causeEventId: issue.id,
+		});
 		targetTask.testEvidence = [];
 		reconcileAnsteelTeamTaskDependencies(state);
 	}
@@ -5546,12 +6539,21 @@ function hasRejectedMilestoneFinalVerification(milestone: AnsteelTeamMilestone):
 }
 
 function getActiveNonGreenGovernedCheckpoints(state: AnsteelTeamState): AnsteelWorkCheckpoint[] {
-	return state.workCheckpoints.filter(
-		(checkpoint) =>
-			checkpoint.status === "active" &&
-			checkpoint.governedAction !== null &&
-			checkpoint.governedAction.effectiveRisk !== "green",
-	);
+	return state.workCheckpoints.filter((checkpoint) => {
+		if (
+			checkpoint.status !== "active" ||
+			checkpoint.governedAction === null ||
+			checkpoint.governedAction.effectiveRisk === "green"
+		) {
+			return false;
+		}
+		// 协调器创建带 revision 的工作前，真实的无作用域决策仍应显示为待治理。任务一旦存在，
+		// 不绑定 task 的 checkpoint 只能作为公共上下文：既不能授权任务动作，也不能让已交付
+		// revision 永久停留在 pending。
+		if (checkpoint.taskId === undefined) return state.tasks.length === 0 && state.milestones.length === 0;
+		const task = state.tasks.find((item) => item.id === checkpoint.taskId);
+		return task !== undefined && checkpoint.governedAction.version.startsWith(`${task.id}@${task.revision};`);
+	});
 }
 
 function getCheckpointActionReviews(state: AnsteelTeamState, checkpoint: AnsteelWorkCheckpoint): AnsteelActionReview[] {
@@ -5837,10 +6839,10 @@ export function getAnsteelTeamSharedBoard(
 	try {
 		for (const event of parsedEvents) {
 			if (event.schemaVersion === 2 && isAnsteelPublicCollaborationEventType(event.type)) {
-				applyAnsteelTeamEvent(replayedState, event);
+				applyAnsteelTeamEvent(replayedState, event, { recordTransitions: false });
 			}
 		}
-		assertAnsteelPublicCollaborationState(replayedState);
+		assertAnsteelPublicCollaborationState(replayedState, { validateTransitionProjection: false });
 	} catch (error) {
 		throwAnsteelStateProjectionMismatch(error instanceof Error ? error.message : String(error));
 	}
