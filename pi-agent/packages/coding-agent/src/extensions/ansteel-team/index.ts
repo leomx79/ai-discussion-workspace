@@ -1229,7 +1229,8 @@ function buildTaskCollaborationPrompt(
 	return [
 		`You are the ${role} continuous collaborator for ${task.id} revision ${submission.revision}.`,
 		"This is the public collaboration stage, not final approval. Inspect the frozen package and current project with read-only tools; do not edit this task and do not call ansteel_review_task.",
-		"If a blocking or critical concern requires owner rework, first raise a structured process issue against the relevant owner checkpoint. Then call ansteel_publish_task_collaboration exactly once with your evidence and remaining uncertainty.",
+		"If a blocking or critical concern requires owner rework, first raise a structured process issue against the relevant owner checkpoint, then stop this stage. Do not publish task collaboration or final review after raising that issue: it changes this task to revision-required and the coordinator will route its resolution separately.",
+		"If you do not raise a blocking or critical process issue, call ansteel_publish_task_collaboration exactly once with your evidence and remaining uncertainty.",
 		`Task owner: ${task.owner}`,
 		`Task type: ${task.type}`,
 		task.assignmentReason === undefined ? undefined : `Cross-role assignment reason: ${task.assignmentReason}`,
@@ -1325,7 +1326,7 @@ function buildActionReviewPrompt(checkpoint: AnsteelWorkCheckpoint): string {
 		"Call ansteel_review_action exactly once with this exact binding. Treat action.version as an opaque coordinator value: copy every field from the JSON byte-for-byte, especially the version; never retype, shorten, recompute, or guess an alternative version. If you identify a blocking or critical concern, first call ansteel_raise_process_issue against this checkpoint, then reject the action.",
 		checkpoint.taskId === undefined
 			? "Do not publish a checkpoint merely to narrate an ordinary action review; the structured action review is the governed result."
-			: `This binding belongs to ${checkpoint.taskId}. Do not publish a checkpoint merely to narrate an ordinary action review. If a genuine new checkpoint is required, include taskId exactly ${checkpoint.taskId}.`,
+			: `This binding belongs to ${checkpoint.taskId}. During this peer action review, never publish a checkpoint: only the task owner may create task-bound checkpoints. Your sole governed action in this stage is ansteel_review_action.`,
 		"Immutable binding:",
 		"```json",
 		JSON.stringify(binding),

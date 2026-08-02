@@ -2559,13 +2559,22 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 		expect(
 			harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-RESOLUTION-ROUTE")),
 		).toContain("must include taskId exactly TASK-RESOLUTION-ROUTE");
+		const taskCollaborationPrompt = harness.prompts.find((prompt) =>
+			prompt.includes("continuous collaborator for TASK-RESOLUTION-ROUTE revision 1"),
+		);
+		expect(taskCollaborationPrompt).toContain("then stop this stage");
+		expect(taskCollaborationPrompt).toContain(
+			"Do not publish task collaboration or final review after raising that issue",
+		);
+		expect(taskCollaborationPrompt).toContain("If you do not raise a blocking or critical process issue");
 		const actionReviewPrompt = harness.prompts.find((prompt) =>
 			prompt.includes("independent peer reviewer for one immutable governed action binding"),
 		);
 		expect(actionReviewPrompt).toContain("Treat action.version as an opaque coordinator value");
 		expect(actionReviewPrompt).toContain("copy every field from the JSON byte-for-byte");
 		expect(actionReviewPrompt).toContain("This binding belongs to TASK-RESOLUTION-ROUTE");
-		expect(actionReviewPrompt).toContain("include taskId exactly TASK-RESOLUTION-ROUTE");
+		expect(actionReviewPrompt).toContain("During this peer action review, never publish a checkpoint");
+		expect(actionReviewPrompt).toContain("only the task owner may create task-bound checkpoints");
 	});
 
 	it("rejects task assignment when an advisory cross-examination issue lacks a structured resolution", async () => {
