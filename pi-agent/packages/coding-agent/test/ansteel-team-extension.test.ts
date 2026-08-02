@@ -2626,6 +2626,72 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 		);
 	});
 
+	it("blocks later task assignment when a taskless advisory issue remains unresolved", async () => {
+		let harness: ReturnType<typeof setup>;
+		harness = setup(createConfig(), async (role, prompt) => {
+			const options = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!options) throw new Error(`Missing ${role} operations`);
+
+			if (role === "tech-lead" && prompt.includes("Surface a late taskless issue.")) {
+				await options.taskOperations.publishCheckpoint({
+					id: "CP-LATE-TASKLESS-ISSUE-0001",
+					goal: "State the parser acceptance command before assigning new work",
+					currentUnderstanding: "A later collaboration round discovered an unreviewed acceptance gap.",
+					assumptions: [],
+					evidenceRefs: ["file:src/parser.ts"],
+					uncertainties: ["Whether the proposed task can be accepted without a named command"],
+					nextAction: {
+						kind: "report",
+						target: "protocol:task-assignment",
+						expectedResult: "Peers can challenge the late taskless checkpoint",
+					},
+					confidence: "L2",
+				});
+			}
+
+			if (role === "staff-engineer" && prompt.includes("Surface a late taskless issue.")) {
+				await options.taskOperations.raiseProcessIssue({
+					id: "PI-LATE-TASKLESS-ISSUE-0001",
+					targetCheckpointId: "CP-LATE-TASKLESS-ISSUE-0001",
+					severity: "advisory",
+					claim: "New work must name the acceptance command before the coordinator assigns it.",
+					evidenceRefs: ["file:test/parser.test.mjs"],
+					suggestedCorrection: "Publish and review a direct replacement checkpoint with the command.",
+				});
+			}
+
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+
+		await command("start Review the parser", harness.ctx);
+		await command("ask Surface a late taskless issue.", harness.ctx);
+		await expect(
+			command(
+				'task {"id":"TASK-LATE-TASKLESS-ISSUE","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+				harness.ctx,
+			),
+		).rejects.toThrow("cannot continue while taskless process issues remain unresolved");
+
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		expect(state?.tasks).toHaveLength(0);
+		expect(state?.processIssues).toMatchObject([
+			{
+				id: "PI-LATE-TASKLESS-ISSUE-0001",
+				status: "open",
+				targetRole: "tech-lead",
+				resolutions: [],
+			},
+		]);
+		expect(harness.prompts).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("target role for open process issue PI-LATE-TASKLESS-ISSUE-0001"),
+			]),
+		);
+	});
+
 	it("settles an advisory cross-examination issue before accepting task assignments", async () => {
 		let harness: ReturnType<typeof setup>;
 		harness = setup(createConfig(), async (role, prompt) => {

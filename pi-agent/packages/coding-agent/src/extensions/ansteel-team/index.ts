@@ -2431,18 +2431,14 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		const settlePendingProcessIssues = async (
 			activeTeam: ActiveAnsteelTeam,
 			ctx: ExtensionCommandContext,
-			task?: AnsteelTeamTask,
+			scope: AnsteelTeamTask | "all" | "taskless" = "all",
 		): Promise<boolean> => {
-			const taskCheckpointIds =
-				task === undefined
-					? undefined
-					: new Set(
-							activeTeam.state.workCheckpoints
-								.filter((checkpoint) => checkpoint.taskId === task.id)
-								.map((checkpoint) => checkpoint.id),
-						);
-			const isInScope = (issue: AnsteelProcessIssue): boolean =>
-				taskCheckpointIds === undefined || taskCheckpointIds.has(issue.targetCheckpointId);
+			const isInScope = (issue: AnsteelProcessIssue): boolean => {
+				if (scope === "all") return true;
+				const checkpoint = activeTeam.state.workCheckpoints.find((item) => item.id === issue.targetCheckpointId);
+				if (scope === "taskless") return checkpoint?.taskId === undefined;
+				return checkpoint?.taskId === scope.id;
+			};
 			const openIssues = activeTeam.state.processIssues.filter(
 				(issue) => issue.status === "open" && isInScope(issue),
 			);
@@ -4128,6 +4124,11 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							activeTeam.state.id,
 							`task ${argument}`,
 							async () => {
+								if (!(await settlePendingProcessIssues(activeTeam, ctx, "taskless"))) {
+									throw new Error(
+										"Ansteel team cannot continue while taskless process issues remain unresolved",
+									);
+								}
 								if (parsed.kind === "parallel") {
 									const assignment = await runObservedOperation(
 										ctx.cwd,
