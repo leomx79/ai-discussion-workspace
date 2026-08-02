@@ -2561,6 +2561,71 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 		).toContain("must include taskId exactly TASK-RESOLUTION-ROUTE");
 	});
 
+	it("rejects task assignment when an advisory cross-examination issue lacks a structured resolution", async () => {
+		let harness: ReturnType<typeof setup>;
+		harness = setup(createConfig(), async (role, prompt) => {
+			const options = harness.roleSessionOptions.find((entry) => entry.role === role);
+			if (!options) throw new Error(`Missing ${role} operations`);
+
+			if (role === "tech-lead" && prompt.includes("Investigate this independently.")) {
+				await options.taskOperations.publishCheckpoint({
+					id: "CP-CROSS-EXAMINATION-UNRESOLVED-0001",
+					goal: "Propose a bounded parser review approach",
+					currentUnderstanding: "The initial approach needs independent review before task assignment.",
+					assumptions: [],
+					evidenceRefs: ["file:src/parser.ts"],
+					uncertainties: ["Whether the stated verification command is sufficient"],
+					nextAction: {
+						kind: "report",
+						target: "protocol:task-assignment",
+						expectedResult: "Peers can challenge the initial approach",
+					},
+					confidence: "L2",
+				});
+			}
+
+			if (role === "staff-engineer" && prompt.includes("Cross-examine each peer's public claims.")) {
+				await options.taskOperations.raiseProcessIssue({
+					id: "PI-CROSS-EXAMINATION-UNRESOLVED-0001",
+					targetCheckpointId: "CP-CROSS-EXAMINATION-UNRESOLVED-0001",
+					severity: "advisory",
+					claim: "The initial approach must identify the acceptance command before assigning implementation work.",
+					evidenceRefs: ["file:test/parser.test.mjs"],
+					suggestedCorrection: "Publish a replacement checkpoint with the acceptance command.",
+				});
+			}
+
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+
+		await expect(command("start Review the parser", harness.ctx)).rejects.toThrow(
+			"cannot continue while cross-examination process issues remain unresolved",
+		);
+
+		const state = loadAnsteelTeamState(harness.ctx.cwd);
+		expect(state?.tasks).toHaveLength(0);
+		expect(state?.processIssues).toMatchObject([
+			{
+				id: "PI-CROSS-EXAMINATION-UNRESOLVED-0001",
+				status: "open",
+				targetRole: "tech-lead",
+				resolutions: [],
+			},
+		]);
+		expect(listAnsteelTeamEvents(harness.ctx.cwd)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "role-failure",
+					role: "tech-lead",
+					content: expect.stringContaining("did not receive a structured resolution proposal"),
+				}),
+			]),
+		);
+	});
+
 	it("settles an advisory cross-examination issue before accepting task assignments", async () => {
 		let harness: ReturnType<typeof setup>;
 		harness = setup(createConfig(), async (role, prompt) => {
