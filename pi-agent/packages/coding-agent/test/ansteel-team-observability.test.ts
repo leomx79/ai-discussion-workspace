@@ -35,6 +35,9 @@ import {
 const temporaryProjects: string[] = [];
 const RUNTIME_TEST_HASH = "a".repeat(64);
 const RUNTIME_TEST_UTC = "2026-07-29T00:00:00.000Z";
+// 这些测试会执行多次真实 fsync，或故意等待完整的 5 秒锁竞争窗口；局部监督上限只覆盖测试调度抖动，
+// 不改变产品锁超时、治理阶段超时或 GitHub job 的 10 分钟失败关闭边界。
+const ANSTEEL_OBSERVABILITY_IO_TEST_TIMEOUT_MS = 30_000;
 const RUNTIME_TEST_RECOVERY_DATA = {
 	recoveredFromSequence: 1,
 	recoveredFromEventHash: RUNTIME_TEST_HASH,
@@ -761,58 +764,62 @@ describe("Ansteel team observability", () => {
 		expect(() => readAnsteelRuntimeLogs(cwd, context.runId)).toThrow("exceeds the byte limit");
 	});
 
-	it("accepts exact v1 message, data, array, and artifact-count boundaries", () => {
-		const cwd = createTemporaryProject();
-		const context = createAnsteelRunContext({ teamId: "team-envelope-boundary", command: "envelope boundary" });
-		const logger = createAnsteelRuntimeLogger(cwd, context);
-		const taskIds = Array.from(
-			{ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems },
-			(_, index) => `TASK-BOUNDARY-${index + 1}`,
-		);
-		const arrayBoundary = logger.write({
-			level: "audit",
-			eventName: "task.claim.parallel",
-			outcome: "succeeded",
-			message: "m".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes),
-			data: { taskIds },
-		});
-		const dataOverhead = Buffer.byteLength(
-			JSON.stringify({ configurationIdentity: "", provider: "", model: "", timeoutMs: 0 }),
-			"utf8",
-		);
-		const secondDataStringLength =
-			ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes - ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes - dataOverhead - 1;
-		const dataBoundary = logger.write({
-			level: "audit",
-			eventName: "provider.request.started",
-			outcome: "started",
-			message: "data boundary",
-			data: {
-				configurationIdentity: "x".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes),
-				provider: "y".repeat(secondDataStringLength),
-				model: "m",
-				timeoutMs: 0,
-			},
-		});
-		const artifactBoundary = logger.write({
-			level: "audit",
-			eventName: "tool.call.completed",
-			outcome: "succeeded",
-			message: "artifact boundary",
-			data: { exitCode: 0 },
-			artifacts: Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs }, (_, index) => ({
-				kind: `output-${index + 1}`,
-				content: `artifact-${index + 1}`,
-			})),
-		});
-		logger.close();
-		expect(Buffer.byteLength(JSON.stringify(dataBoundary.data), "utf8")).toBe(
-			ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes,
-		);
-		expect(arrayBoundary.data.taskIds).toHaveLength(ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems);
-		expect(artifactBoundary.artifactRefs).toHaveLength(ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs);
-		expect(readAnsteelRuntimeLogs(cwd, context.runId).length).toBeGreaterThan(3);
-	});
+	it(
+		"accepts exact v1 message, data, array, and artifact-count boundaries",
+		() => {
+			const cwd = createTemporaryProject();
+			const context = createAnsteelRunContext({ teamId: "team-envelope-boundary", command: "envelope boundary" });
+			const logger = createAnsteelRuntimeLogger(cwd, context);
+			const taskIds = Array.from(
+				{ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems },
+				(_, index) => `TASK-BOUNDARY-${index + 1}`,
+			);
+			const arrayBoundary = logger.write({
+				level: "audit",
+				eventName: "task.claim.parallel",
+				outcome: "succeeded",
+				message: "m".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes),
+				data: { taskIds },
+			});
+			const dataOverhead = Buffer.byteLength(
+				JSON.stringify({ configurationIdentity: "", provider: "", model: "", timeoutMs: 0 }),
+				"utf8",
+			);
+			const secondDataStringLength =
+				ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes - ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes - dataOverhead - 1;
+			const dataBoundary = logger.write({
+				level: "audit",
+				eventName: "provider.request.started",
+				outcome: "started",
+				message: "data boundary",
+				data: {
+					configurationIdentity: "x".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes),
+					provider: "y".repeat(secondDataStringLength),
+					model: "m",
+					timeoutMs: 0,
+				},
+			});
+			const artifactBoundary = logger.write({
+				level: "audit",
+				eventName: "tool.call.completed",
+				outcome: "succeeded",
+				message: "artifact boundary",
+				data: { exitCode: 0 },
+				artifacts: Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs }, (_, index) => ({
+					kind: `output-${index + 1}`,
+					content: `artifact-${index + 1}`,
+				})),
+			});
+			logger.close();
+			expect(Buffer.byteLength(JSON.stringify(dataBoundary.data), "utf8")).toBe(
+				ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes,
+			);
+			expect(arrayBoundary.data.taskIds).toHaveLength(ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems);
+			expect(artifactBoundary.artifactRefs).toHaveLength(ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs);
+			expect(readAnsteelRuntimeLogs(cwd, context.runId).length).toBeGreaterThan(3);
+		},
+		ANSTEEL_OBSERVABILITY_IO_TEST_TIMEOUT_MS,
+	);
 
 	it("rejects unknown versioned events and invalid event-outcome combinations before writing", () => {
 		const cwd = createTemporaryProject();
@@ -1711,35 +1718,43 @@ describe("Ansteel team observability", () => {
 		);
 	});
 
-	it("does not abandon an orphaned span while its original logger still owns the run", async () => {
-		const cwd = createTemporaryProject();
-		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
-		const logger = createAnsteelRuntimeLogger(cwd, context);
-		logger.startSpan("run.started", { role: "coordinator" });
-		await logger.forceFlush();
+	it(
+		"does not abandon an orphaned span while its original logger still owns the run",
+		async () => {
+			const cwd = createTemporaryProject();
+			const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+			const logger = createAnsteelRuntimeLogger(cwd, context);
+			logger.startSpan("run.started", { role: "coordinator" });
+			await logger.forceFlush();
 
-		await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).rejects.toMatchObject({
-			reasonCode: "lease-owner-mismatch",
-		});
-		expect(readAnsteelRuntimeLogs(cwd, context.runId).map((entry) => entry.outcome)).toEqual(["started"]);
+			await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).rejects.toMatchObject({
+				reasonCode: "lease-owner-mismatch",
+			});
+			expect(readAnsteelRuntimeLogs(cwd, context.runId).map((entry) => entry.outcome)).toEqual(["started"]);
 
-		logger.close();
-	});
+			logger.close();
+		},
+		ANSTEEL_OBSERVABILITY_IO_TEST_TIMEOUT_MS,
+	);
 
-	it("rejects a second concurrent writer for the same runtime run", () => {
-		const cwd = createTemporaryProject();
-		const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
-		const first = createAnsteelRuntimeLogger(cwd, context);
-		const { ownerPath } = getRuntimeRunLockPaths(cwd, context.runId);
-		const originalOwner = readFileSync(ownerPath, "utf8");
+	it(
+		"rejects a second concurrent writer for the same runtime run",
+		() => {
+			const cwd = createTemporaryProject();
+			const context = createAnsteelRunContext({ teamId: "team-1", command: "start" });
+			const first = createAnsteelRuntimeLogger(cwd, context);
+			const { ownerPath } = getRuntimeRunLockPaths(cwd, context.runId);
+			const originalOwner = readFileSync(ownerPath, "utf8");
 
-		expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
-			expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
-		);
-		expect(readFileSync(ownerPath, "utf8")).toBe(originalOwner);
+			expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
+				expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
+			);
+			expect(readFileSync(ownerPath, "utf8")).toBe(originalOwner);
 
-		first.close();
-	});
+			first.close();
+		},
+		ANSTEEL_OBSERVABILITY_IO_TEST_TIMEOUT_MS,
+	);
 
 	it("records one truthful acquired and released receipt for an audited runtime writer lease", () => {
 		const cwd = createTemporaryProject();
@@ -1911,23 +1926,27 @@ describe("Ansteel team observability", () => {
 		}
 	});
 
-	it("refuses early takeover when a runtime lock owner is missing or malformed", () => {
-		const cwd = createTemporaryProject();
-		const context = createAnsteelRunContext({ teamId: "team-lock-owner-invalid", command: "start" });
-		const first = createAnsteelRuntimeLogger(cwd, context);
-		const { lockDirectoryPath, ownerPath } = getRuntimeRunLockPaths(cwd, context.runId);
-		first.close();
+	it(
+		"refuses early takeover when a runtime lock owner is missing or malformed",
+		() => {
+			const cwd = createTemporaryProject();
+			const context = createAnsteelRunContext({ teamId: "team-lock-owner-invalid", command: "start" });
+			const first = createAnsteelRuntimeLogger(cwd, context);
+			const { lockDirectoryPath, ownerPath } = getRuntimeRunLockPaths(cwd, context.runId);
+			first.close();
 
-		mkdirSync(lockDirectoryPath);
-		expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
-			expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
-		);
+			mkdirSync(lockDirectoryPath);
+			expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
+				expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
+			);
 
-		writeFileSync(ownerPath, '{"schemaVersion":1,"pid":"invalid"}\n', "utf8");
-		expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
-			expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
-		);
-	});
+			writeFileSync(ownerPath, '{"schemaVersion":1,"pid":"invalid"}\n', "utf8");
+			expect(() => createAnsteelRuntimeLogger(cwd, context)).toThrow(
+				expect.objectContaining({ reasonCode: "lease-owner-mismatch" }),
+			);
+		},
+		ANSTEEL_OBSERVABILITY_IO_TEST_TIMEOUT_MS,
+	);
 
 	it("recovers a runtime lock immediately when its valid owner PID has exited", async () => {
 		const cwd = createTemporaryProject();
