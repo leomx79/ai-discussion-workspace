@@ -1052,7 +1052,7 @@ async function prepareAnchorRpcFixture(projectDir: string): Promise<{
 	return { taskId: task.id, milestoneId: milestone.id, remote };
 }
 
-function startRpcCli(projectDir: string, agentDir: string): RpcCliProcess {
+function startRpcCli(projectDir: string, agentDir: string, environment: NodeJS.ProcessEnv = {}): RpcCliProcess {
 	const child = spawn(
 		process.execPath,
 		[
@@ -1068,6 +1068,7 @@ function startRpcCli(projectDir: string, agentDir: string): RpcCliProcess {
 			cwd: projectDir,
 			env: {
 				...process.env,
+				...environment,
 				[ENV_AGENT_DIR]: agentDir,
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 			},
@@ -2097,12 +2098,15 @@ describe("Ansteel team CLI", () => {
 	it("recovers the same trace after the real RPC host is killed during a provider request", async () => {
 		const topic = "Exercise real host interruption recovery";
 		const { agentDir, projectDir } = createTemporaryProject(INTERRUPTED_HOST_PROVIDER_EXTENSION);
+		// The trace assertion must not depend on the developer or CI host environment. The child receives a
+		// deterministic sentinel so the test can prove that only the variable name, never its value, is persisted.
+		const hostEnvironment = { ANSTEEL_TL_DEEPSEEK_API_KEY: "deterministic-test-key" };
 		const configPath = join(projectDir, ".pi", "ansteel.json");
 		const config = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
 		config.stageTimeoutMs = 20_000;
 		writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 
-		const firstHost = startRpcCli(projectDir, agentDir);
+		const firstHost = startRpcCli(projectDir, agentDir, hostEnvironment);
 		try {
 			const commands = await firstHost.send({ id: "host-commands", type: "get_commands" }, 30_000);
 			const teamCommand = (commands.data as { commands: Array<{ name: string }> }).commands.find((command) =>
@@ -2193,7 +2197,7 @@ describe("Ansteel team CLI", () => {
 				DETERMINISTIC_TEAM_PROVIDER_EXTENSION,
 				"utf8",
 			);
-			const restartedHost = startRpcCli(projectDir, agentDir);
+			const restartedHost = startRpcCli(projectDir, agentDir, hostEnvironment);
 			try {
 				await restartedHost.send({ id: "restart-commands", type: "get_commands" }, 30_000);
 				const recoveryAttempt = await restartedHost.send({

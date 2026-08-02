@@ -117,10 +117,15 @@ function acquireAnsteelRuntimeAuditGate(gatePath: string, deadline: number): () 
 		let released = false;
 		return () => {
 			if (released) return;
-			release!();
-			released = true;
-			const currentOwner = readAnsteelRuntimeLockOwner(gatePath);
-			if (currentOwner?.ownerId === owner.ownerId) unlinkSync(ownerPath);
+			try {
+				// Remove this identity while the OS lock is still held. Releasing first lets the next gate owner
+				// replace the sidecar between our read and unlink, which can either raise ENOENT or delete its identity.
+				const currentOwner = readAnsteelRuntimeLockOwner(gatePath);
+				if (currentOwner?.ownerId === owner.ownerId) unlinkSync(ownerPath);
+			} finally {
+				release!();
+				released = true;
+			}
 		};
 	}
 }

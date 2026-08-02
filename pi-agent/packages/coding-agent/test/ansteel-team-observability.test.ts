@@ -107,6 +107,7 @@ describe("Ansteel team observability", () => {
 		expect(listAnsteelRuntimeRuns(cwd)).toEqual([]);
 		await holderExit;
 		expect(existsSync(`${gatePath}.lock`)).toBe(false);
+		expect(existsSync(`${gatePath}.lock-owner.json`)).toBe(false);
 		expect(listAnsteelRuntimeRuns(cwd)).toEqual([]);
 	});
 
