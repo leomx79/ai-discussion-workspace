@@ -1079,7 +1079,7 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 			role: "coordinator",
 			taskId: "TASK-BOARD-FORGED-ROOT-1",
 			message: "forged non-root terminal",
-			data: {},
+			data: { command: forgedContext.command },
 		});
 		forgedLogger.close();
 

@@ -27,6 +27,8 @@ import {
 	type SpanExporter,
 } from "@opentelemetry/sdk-trace-base";
 import lockfile from "proper-lockfile";
+import { type TSchema, Type } from "typebox";
+import { Compile } from "typebox/compile";
 import { VERSION } from "../config.ts";
 import { canonicalizeAnsteelAuditValue, hashAnsteelAuditValue } from "./ansteel-team-integrity.ts";
 
@@ -531,6 +533,673 @@ export const ANSTEEL_RUNTIME_EVENT_CATALOG = {
 } as const satisfies Record<string, readonly AnsteelRuntimeOutcome[]>;
 
 export type AnsteelRuntimeEventName = keyof typeof ANSTEEL_RUNTIME_EVENT_CATALOG;
+
+const strictRuntimeDataObject = (properties: Record<string, TSchema>): TSchema =>
+	Type.Object(properties, { additionalProperties: false });
+const runtimeDataUnion = (...schemas: TSchema[]): TSchema => Type.Union(schemas);
+const runtimeNonEmptyString = Type.String({ minLength: 1 });
+const runtimeSha256 = Type.String({ pattern: "^[0-9a-f]{64}$" });
+const runtimeUtcTimestamp = Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" });
+const runtimeInteger = Type.Integer({ minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER });
+const runtimeNonNegativeInteger = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
+const runtimePositiveInteger = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
+const runtimeNonNegativeNumber = Type.Number({ minimum: 0 });
+const runtimeNullableInteger = Type.Union([runtimeInteger, Type.Null()]);
+const runtimeNullableNonNegativeInteger = Type.Union([runtimeNonNegativeInteger, Type.Null()]);
+const runtimeNullableNonNegativeNumber = Type.Union([runtimeNonNegativeNumber, Type.Null()]);
+const runtimeNullableString = Type.Union([runtimeNonEmptyString, Type.Null()]);
+const runtimeEmptyData = strictRuntimeDataObject({});
+const runtimeRecoveryData = strictRuntimeDataObject({
+	recoveredFromSequence: runtimePositiveInteger,
+	recoveredFromEventHash: runtimeSha256,
+});
+const runtimeCommandData = strictRuntimeDataObject({ command: runtimeNonEmptyString });
+const runtimeExitCodeData = strictRuntimeDataObject({ exitCode: runtimeInteger });
+const runtimeVerdictData = strictRuntimeDataObject({ verdict: runtimeNonEmptyString });
+const runtimeRevisionData = strictRuntimeDataObject({ revision: runtimePositiveInteger });
+const runtimeEnvironmentSchema = strictRuntimeDataObject({
+	productVersion: runtimeNonEmptyString,
+	extensionVersion: runtimeNonEmptyString,
+	gitCommit: runtimeNullableString,
+	configStatus: Type.Union([Type.Literal("missing"), Type.Literal("parsed"), Type.Literal("invalid")]),
+	configFingerprint: runtimeSha256,
+	featureFlags: Type.Record(
+		Type.String(),
+		Type.Union([
+			Type.Boolean(),
+			Type.Number(),
+			runtimeNonEmptyString,
+			Type.Array(runtimeNonEmptyString, { uniqueItems: true }),
+		]),
+	),
+	nodeVersion: runtimeNonEmptyString,
+	osPlatform: runtimeNonEmptyString,
+	osRelease: runtimeNonEmptyString,
+	architecture: runtimeNonEmptyString,
+	projectRootId: runtimeSha256,
+	enabledEnvironmentVariables: Type.Array(runtimeNonEmptyString, { uniqueItems: true }),
+	environmentFingerprint: runtimeSha256,
+});
+
+const runtimeRunStartedData = strictRuntimeDataObject({
+	command: runtimeNonEmptyString,
+	runtimeEnvironment: runtimeEnvironmentSchema,
+	resumedFromRunId: Type.Optional(runtimeNonEmptyString),
+	resumedFromSequence: Type.Optional(runtimePositiveInteger),
+});
+const runtimeProviderRequestBaseFields = {
+	requestRound: Type.Optional(runtimePositiveInteger),
+	retryCount: Type.Optional(runtimeNonNegativeInteger),
+	timeoutStage: Type.Optional(runtimeNonEmptyString),
+	timeoutMs: Type.Optional(runtimeNonNegativeInteger),
+	configurationIdentity: Type.Optional(runtimeNonEmptyString),
+	provider: Type.Optional(runtimeNonEmptyString),
+	model: Type.Optional(runtimeNonEmptyString),
+};
+const runtimeProviderRequestStartedData = strictRuntimeDataObject(runtimeProviderRequestBaseFields);
+const runtimeProviderRequestCompletedData = strictRuntimeDataObject({
+	...runtimeProviderRequestBaseFields,
+	durationMs: Type.Optional(runtimeNonNegativeInteger),
+	firstTokenLatencyMs: Type.Optional(runtimeNullableNonNegativeNumber),
+	inputTokens: Type.Optional(runtimeNullableNonNegativeInteger),
+	outputTokens: Type.Optional(runtimeNullableNonNegativeInteger),
+	maxTokens: Type.Optional(runtimeNonNegativeInteger),
+	tokenCountsAvailable: Type.Optional(Type.Boolean()),
+	outputLength: Type.Optional(runtimeNonNegativeInteger),
+	publicOutputEmpty: Type.Optional(Type.Boolean()),
+	httpStatus: Type.Optional(Type.Union([Type.Integer({ minimum: 100, maximum: 599 }), Type.Null()])),
+	sdkErrorCategory: Type.Optional(runtimeNullableString),
+});
+const runtimeToolCallBaseFields = {
+	command: Type.Optional(runtimeNonEmptyString),
+	toolName: Type.Optional(runtimeNonEmptyString),
+	denialBoundary: Type.Optional(runtimeNonEmptyString),
+};
+const runtimeToolCallStartedData = strictRuntimeDataObject(runtimeToolCallBaseFields);
+const runtimeToolCallCompletedData = strictRuntimeDataObject({
+	...runtimeToolCallBaseFields,
+	exitCode: Type.Optional(runtimeInteger),
+	stdout: Type.Optional(Type.String()),
+});
+const runtimeProcessSpawnedData = strictRuntimeDataObject({
+	pid: runtimePositiveInteger,
+	policy: runtimeNonEmptyString,
+	commandHash: runtimeSha256,
+	cwdHash: runtimeSha256,
+	shell: Type.Boolean(),
+	argumentCount: runtimeNonNegativeInteger,
+	timeoutMs: runtimePositiveInteger,
+	maximumOutputBytes: runtimePositiveInteger,
+	startedAt: runtimeUtcTimestamp,
+});
+const runtimeProcessProgressData = strictRuntimeDataObject({
+	pid: runtimePositiveInteger,
+	policy: runtimeNonEmptyString,
+	elapsedMs: runtimeNonNegativeNumber,
+	stdoutBytes: runtimeNonNegativeInteger,
+	stderrBytes: runtimeNonNegativeInteger,
+	lastProgressAt: runtimeUtcTimestamp,
+});
+const runtimeProcessExitedData = strictRuntimeDataObject({
+	pid: runtimePositiveInteger,
+	policy: runtimeNonEmptyString,
+	commandHash: runtimeSha256,
+	cwdHash: runtimeSha256,
+	exitCode: runtimeNullableInteger,
+	signal: runtimeNullableString,
+	timedOut: Type.Boolean(),
+	durationMs: runtimeNonNegativeNumber,
+	lastProgressAt: runtimeUtcTimestamp,
+	stdoutBytes: runtimeNonNegativeInteger,
+	stderrBytes: runtimeNonNegativeInteger,
+	stdoutTruncated: Type.Boolean(),
+	stderrTruncated: Type.Boolean(),
+	stdoutHash: runtimeSha256,
+	stderrHash: runtimeSha256,
+});
+const runtimeTransitionData = strictRuntimeDataObject({
+	transitionLogId: runtimeNonEmptyString,
+	transitionId: runtimeNonEmptyString,
+	objectKind: Type.Union([
+		Type.Literal("team"),
+		Type.Literal("role"),
+		Type.Literal("challenge"),
+		Type.Literal("task"),
+		Type.Literal("milestone"),
+		Type.Literal("checkpoint"),
+		Type.Literal("process-issue"),
+		Type.Literal("delivery-verification"),
+	]),
+	objectId: runtimeNonEmptyString,
+	from: runtimeNullableString,
+	to: runtimeNonEmptyString,
+	guard: runtimeNonEmptyString,
+	guardResult: Type.Boolean(),
+	triggerEventId: runtimeNonEmptyString,
+});
+const runtimeArtifactStorageData = strictRuntimeDataObject({
+	resourceKind: Type.Literal("content-addressed-artifact"),
+	sourceSequence: runtimePositiveInteger,
+	artifactKind: runtimeNonEmptyString,
+	sha256: runtimeSha256,
+	contentByteLength: runtimeNonNegativeInteger,
+	storageResult: Type.Union([Type.Literal("created"), Type.Literal("deduplicated-and-verified")]),
+});
+const runtimeArtifactAuditData = strictRuntimeDataObject({
+	resourceKind: Type.Literal("content-addressed-artifact"),
+	sourceRunId: runtimeNonEmptyString,
+	sourceSequence: runtimePositiveInteger,
+	artifactKind: runtimeNonEmptyString,
+	sha256: runtimeSha256,
+	verificationResult: Type.Union([
+		Type.Literal("verified"),
+		Type.Literal("missing"),
+		Type.Literal("hash-mismatch"),
+		Type.Literal("unreadable"),
+	]),
+	actualHash: Type.Optional(runtimeSha256),
+});
+const runtimeSecurityRedactionData = strictRuntimeDataObject({
+	sourceEventName: runtimeNonEmptyString,
+	sourceSequence: runtimePositiveInteger,
+	redactionBoundary: Type.Literal("runtime-persistence"),
+	findingCount: runtimePositiveInteger,
+	sensitiveFieldCount: runtimeNonNegativeInteger,
+	sensitiveTextMatchCount: runtimeNonNegativeInteger,
+	surfaces: Type.Array(Type.Union([Type.Literal("message"), Type.Literal("data"), Type.Literal("artifact")]), {
+		minItems: 1,
+		uniqueItems: true,
+	}),
+});
+const runtimeBudgetBase = {
+	resourceKind: Type.Literal("read-only-tool-calls"),
+	used: runtimeNonNegativeInteger,
+	limit: runtimeNonNegativeInteger,
+	remaining: runtimeNonNegativeInteger,
+};
+
+/**
+ * v1 data schema 目录与事件名称/结果目录共同构成持久化协议。每个对象默认拒绝未知字段；
+ * 需要兼容多种真实生命周期形态时使用显式 union，不能用任意 Record 绕过版本治理。
+ */
+export const ANSTEEL_RUNTIME_EVENT_DATA_SCHEMAS = {
+	"run.started": runtimeRunStartedData,
+	"run.resumed": strictRuntimeDataObject({
+		resumedFromRunId: runtimeNonEmptyString,
+		resumedFromSequence: runtimePositiveInteger,
+	}),
+	"run.completed": runtimeCommandData,
+	"run.failed": runtimeDataUnion(runtimeCommandData, runtimeRecoveryData),
+	"role.session.started": runtimeEmptyData,
+	"role.session.output": strictRuntimeDataObject({
+		outputLength: runtimePositiveInteger,
+		publicOutputEmpty: Type.Literal(false),
+	}),
+	"role.session.truncated": strictRuntimeDataObject({
+		truncationBoundary: Type.Literal("provider-output"),
+		stopReason: Type.Literal("length"),
+		elapsedMs: Type.Optional(runtimeNonNegativeNumber),
+	}),
+	"role.session.ended": runtimeDataUnion(
+		runtimeEmptyData,
+		strictRuntimeDataObject({ outputLength: runtimePositiveInteger }),
+		runtimeRecoveryData,
+	),
+	"provider.request.started": runtimeProviderRequestStartedData,
+	"provider.request.retry": strictRuntimeDataObject({
+		retryBoundary: Type.Literal("agent-session"),
+		attempt: runtimePositiveInteger,
+		maxAttempts: runtimePositiveInteger,
+		delayMs: runtimeNonNegativeInteger,
+	}),
+	"provider.request.completed": runtimeDataUnion(runtimeProviderRequestCompletedData, runtimeRecoveryData),
+	"tool.call.started": runtimeToolCallStartedData,
+	"tool.call.progress": strictRuntimeDataObject({
+		pid: runtimePositiveInteger,
+		policy: runtimeNonEmptyString,
+		elapsedMs: runtimeNonNegativeNumber,
+		stdoutBytes: runtimeNonNegativeInteger,
+		stderrBytes: runtimeNonNegativeInteger,
+		lastProgressAt: runtimeUtcTimestamp,
+		sourceEventName: Type.Literal("process.heartbeat"),
+	}),
+	"tool.call.completed": runtimeDataUnion(runtimeToolCallCompletedData, runtimeRecoveryData),
+	"process.spawned": runtimeProcessSpawnedData,
+	"process.heartbeat": runtimeProcessProgressData,
+	"process.exited": runtimeDataUnion(runtimeProcessExitedData, runtimeRecoveryData),
+	"process.orphan-detected": strictRuntimeDataObject({
+		recoveredFromSequence: runtimePositiveInteger,
+		recoveredFromEventHash: runtimeSha256,
+		pid: Type.Union([runtimePositiveInteger, Type.Null()]),
+	}),
+	"state.transition.attempted": runtimeTransitionData,
+	"state.transition.applied": runtimeTransitionData,
+	"state.transition.rejected": runtimeTransitionData,
+	"lease.acquired": strictRuntimeDataObject({
+		resourceKind: Type.Literal("runtime-run"),
+		resourceHash: runtimeSha256,
+		lockKind: Type.Literal("run"),
+		ownerPid: runtimePositiveInteger,
+		ownerProcessStartedAtUtc: runtimeUtcTimestamp,
+		ownerExecutableHash: runtimeSha256,
+		ownerCommandHash: runtimeSha256,
+		ownerWorkingDirectoryHash: runtimeSha256,
+		acquiredAtUtc: runtimeUtcTimestamp,
+		staleAfterMs: runtimePositiveInteger,
+		renewEveryMs: runtimePositiveInteger,
+		expiresAtUtc: runtimeUtcTimestamp,
+	}),
+	"lease.renewed": strictRuntimeDataObject({
+		resourceKind: Type.Literal("runtime-run"),
+		resourceHash: runtimeSha256,
+		ownerPid: runtimePositiveInteger,
+		renewedAtUtc: runtimeUtcTimestamp,
+		renewalCount: runtimePositiveInteger,
+		expiresAtUtc: runtimeUtcTimestamp,
+	}),
+	"lease.expired": strictRuntimeDataObject({
+		resourceKind: Type.Literal("runtime-run"),
+		resourceHash: runtimeSha256,
+		lockKind: Type.Literal("run"),
+		ownerPid: runtimePositiveInteger,
+		ownerProcessStartedAtUtc: runtimeUtcTimestamp,
+		ownerExecutableHash: runtimeSha256,
+		ownerCommandHash: runtimeSha256,
+		ownerWorkingDirectoryHash: runtimeSha256,
+		acquiredAtUtc: runtimeUtcTimestamp,
+		detectedAtUtc: runtimeUtcTimestamp,
+		replacementLeaseId: runtimeNonEmptyString,
+	}),
+	"lease.released": strictRuntimeDataObject({
+		resourceKind: Type.Literal("runtime-run"),
+		resourceHash: runtimeSha256,
+		ownerPid: runtimePositiveInteger,
+		releasedAtUtc: runtimeUtcTimestamp,
+		renewalCount: runtimeNonNegativeInteger,
+		heldDurationMs: runtimeNonNegativeInteger,
+	}),
+	"event.appended": runtimeDataUnion(
+		strictRuntimeDataObject({
+			eventSequence: runtimePositiveInteger,
+			eventType: runtimeNonEmptyString,
+			eventHash: runtimeSha256,
+		}),
+		strictRuntimeDataObject({ eventSequence: runtimePositiveInteger, recovered: Type.Literal(true) }),
+	),
+	"event.fsync.completed": strictRuntimeDataObject({
+		eventSequence: runtimePositiveInteger,
+		recovered: Type.Optional(Type.Literal(true)),
+	}),
+	"event.chain.invalid": strictRuntimeDataObject({
+		resourceKind: Type.Literal("runtime-log-chain"),
+		sourceRunId: runtimeNonEmptyString,
+		verificationBoundary: Type.Literal("diagnostic-target-read"),
+	}),
+	"artifact.stored": runtimeArtifactStorageData,
+	"artifact.verified": runtimeDataUnion(runtimeArtifactStorageData, runtimeArtifactAuditData),
+	"artifact.missing": runtimeDataUnion(
+		strictRuntimeDataObject({
+			resourceKind: Type.Literal("runtime-log"),
+			sourceRunId: runtimeNonEmptyString,
+			verificationResult: Type.Literal("missing"),
+		}),
+		runtimeArtifactAuditData,
+	),
+	"budget.reserved": strictRuntimeDataObject(runtimeBudgetBase),
+	"budget.consumed": strictRuntimeDataObject({ ...runtimeBudgetBase, toolName: runtimeNonEmptyString }),
+	"budget.exhausted": strictRuntimeDataObject({ ...runtimeBudgetBase, toolName: runtimeNonEmptyString }),
+	"security.access-denied": strictRuntimeDataObject({
+		sourceEventName: Type.Literal("tool.call.completed"),
+		sourceSequence: runtimePositiveInteger,
+		denialBoundary: runtimeNonEmptyString,
+	}),
+	"security.redaction-applied": runtimeSecurityRedactionData,
+	"security.secret-detected": runtimeSecurityRedactionData,
+	"runtime-index-rebuilt": runtimeDataUnion(
+		strictRuntimeDataObject({
+			rebuildReason: Type.Union([
+				Type.Literal("missing"),
+				Type.Literal("json-invalid"),
+				Type.Literal("schema-invalid"),
+				Type.Literal("hash-invalid"),
+				Type.Literal("log-state-mismatch"),
+			]),
+			rebuiltAt: runtimeUtcTimestamp,
+			sourceRunCount: runtimeNonNegativeInteger,
+			rebuiltIndexHash: Type.Optional(runtimeSha256),
+		}),
+		runtimeRecoveryData,
+	),
+	"state.persisted": strictRuntimeDataObject({
+		status: runtimeNonEmptyString,
+		version: runtimePositiveInteger,
+		nextEventSequence: runtimePositiveInteger,
+	}),
+	"transaction.persisted": strictRuntimeDataObject({ eventSequence: runtimePositiveInteger }),
+	"event.ledger.rewritten": strictRuntimeDataObject({ eventCount: runtimeNonNegativeInteger }),
+	"action.assess": runtimeDataUnion(strictRuntimeDataObject({ toolName: runtimeNonEmptyString }), runtimeRecoveryData),
+	"action.review": runtimeDataUnion(
+		strictRuntimeDataObject({
+			verdict: runtimeNonEmptyString,
+			actionKind: runtimeNonEmptyString,
+			target: runtimeNonEmptyString,
+		}),
+		runtimeRecoveryData,
+	),
+	"checkpoint.publish": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"milestone.collaboration.publish": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"milestone.create": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"milestone.final-verification.begin": runtimeDataUnion(runtimeRevisionData, runtimeRecoveryData),
+	"milestone.review": runtimeDataUnion(runtimeVerdictData, runtimeRecoveryData),
+	"milestone.submit": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"process.issue": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"process.resolve": runtimeDataUnion(
+		strictRuntimeDataObject({ outcome: runtimeNonEmptyString }),
+		runtimeRecoveryData,
+	),
+	"process.review": runtimeDataUnion(runtimeVerdictData, runtimeRecoveryData),
+	"task.claim": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"task.claim.parallel": runtimeDataUnion(
+		strictRuntimeDataObject({
+			taskIds: Type.Array(runtimeNonEmptyString, { minItems: 1, uniqueItems: true }),
+		}),
+		runtimeRecoveryData,
+	),
+	"task.collaboration.publish": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"task.collaboration.return": runtimeDataUnion(
+		strictRuntimeDataObject({ reason: runtimeNonEmptyString }),
+		runtimeRecoveryData,
+	),
+	"task.final-verification.begin": runtimeDataUnion(runtimeRevisionData, runtimeRecoveryData),
+	"task.review": runtimeDataUnion(runtimeVerdictData, runtimeRecoveryData),
+	"task.submit": runtimeDataUnion(runtimeEmptyData, runtimeRecoveryData),
+	"task.started": runtimeDataUnion(runtimeEmptyData, runtimeCommandData),
+	"task.progress": runtimeDataUnion(runtimeEmptyData, runtimeCommandData),
+	"task.completed": runtimeDataUnion(runtimeEmptyData, runtimeExitCodeData, runtimeRecoveryData),
+} as const satisfies Record<AnsteelRuntimeEventName, TSchema>;
+
+const ANSTEEL_RUNTIME_EVENT_DATA_VALIDATORS = Object.fromEntries(
+	Object.entries(ANSTEEL_RUNTIME_EVENT_DATA_SCHEMAS).map(([eventName, schema]) => [eventName, Compile(schema)]),
+) as Record<AnsteelRuntimeEventName, ReturnType<typeof Compile>>;
+
+const ANSTEEL_RUNTIME_RECOVERY_EVENT_NAMES = new Set<AnsteelRuntimeEventName>([
+	"run.failed",
+	"role.session.ended",
+	"provider.request.completed",
+	"tool.call.completed",
+	"process.exited",
+	"runtime-index-rebuilt",
+	"action.assess",
+	"action.review",
+	"checkpoint.publish",
+	"milestone.collaboration.publish",
+	"milestone.create",
+	"milestone.final-verification.begin",
+	"milestone.review",
+	"milestone.submit",
+	"process.issue",
+	"process.resolve",
+	"process.review",
+	"task.claim",
+	"task.claim.parallel",
+	"task.collaboration.publish",
+	"task.collaboration.return",
+	"task.final-verification.begin",
+	"task.review",
+	"task.submit",
+	"task.completed",
+]);
+
+function assertRuntimeUtcTimestamp(value: unknown, field: string, eventName: string): void {
+	if (typeof value !== "string" || Number.isNaN(Date.parse(value)) || new Date(value).toISOString() !== value) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime event ${eventName} data field ${field} must be a canonical UTC timestamp`,
+		);
+	}
+}
+
+function assertAnsteelRuntimeEventData(eventName: string, outcome: string, data: unknown): void {
+	const validator = ANSTEEL_RUNTIME_EVENT_DATA_VALIDATORS[eventName as AnsteelRuntimeEventName];
+	if (validator === undefined || !validator.Check(data)) {
+		const error = validator?.Errors(data)[0];
+		const path = error?.instancePath ? error.instancePath.replace(/^\//, "data.").replace(/\//g, ".") : "data";
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime event ${eventName} data schema rejects ${path}${error === undefined ? "" : `: ${error.message}`}`,
+		);
+	}
+	const record = data as Record<string, unknown>;
+	const hasRecoveryReceipt = Object.hasOwn(record, "recoveredFromSequence");
+	if (ANSTEEL_RUNTIME_RECOVERY_EVENT_NAMES.has(eventName as AnsteelRuntimeEventName)) {
+		if ((outcome === "abandoned") !== hasRecoveryReceipt) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data recovery receipt does not match outcome ${outcome}`,
+			);
+		}
+	}
+	if (eventName === "run.started") {
+		const hasResumedRun = Object.hasOwn(record, "resumedFromRunId");
+		const hasResumedSequence = Object.hasOwn(record, "resumedFromSequence");
+		if (hasResumedRun !== hasResumedSequence) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime run.started data must include both resume coordinates or neither",
+			);
+		}
+	}
+	if (eventName.startsWith("state.transition.")) {
+		if (eventName === "state.transition.applied" && record.guardResult !== true) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime applied transition data must have guardResult true",
+			);
+		}
+		if (eventName === "state.transition.rejected" && record.guardResult !== false) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime rejected transition data must have guardResult false",
+			);
+		}
+	}
+	if (eventName.startsWith("budget.")) {
+		const used = record.used as number;
+		const limit = record.limit as number;
+		const remaining = record.remaining as number;
+		if (used + remaining !== limit || (eventName === "budget.exhausted" && remaining !== 0)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data has inconsistent budget counters`,
+			);
+		}
+	}
+	if (eventName === "provider.request.retry" && (record.attempt as number) > (record.maxAttempts as number)) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime provider retry attempt exceeds maxAttempts",
+		);
+	}
+	if (eventName === "provider.request.started" || eventName === "provider.request.completed") {
+		const configurationFields = ["configurationIdentity", "provider", "model", "timeoutMs"];
+		const configuredCount = configurationFields.filter((field) => Object.hasOwn(record, field)).length;
+		if (configuredCount !== 0 && configuredCount !== configurationFields.length) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data must include the complete provider configuration identity`,
+			);
+		}
+		if (
+			record.tokenCountsAvailable === true &&
+			(typeof record.inputTokens !== "number" || typeof record.outputTokens !== "number")
+		) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data cannot claim available null token counts`,
+			);
+		}
+		if (record.tokenCountsAvailable === false && (record.inputTokens !== null || record.outputTokens !== null)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data must use null token counts when unavailable`,
+			);
+		}
+		if (
+			typeof record.firstTokenLatencyMs === "number" &&
+			typeof record.durationMs === "number" &&
+			record.firstTokenLatencyMs > record.durationMs
+		) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data first-token latency exceeds total duration`,
+			);
+		}
+	}
+	if (eventName === "security.secret-detected" || eventName === "security.redaction-applied") {
+		if (record.findingCount !== (record.sensitiveFieldCount as number) + (record.sensitiveTextMatchCount as number)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} data has inconsistent redaction counters`,
+			);
+		}
+	}
+	if (eventName === "artifact.stored" && record.storageResult !== "created") {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact.stored data must describe newly created storage",
+		);
+	}
+	if (
+		eventName === "artifact.verified" &&
+		Object.hasOwn(record, "storageResult") &&
+		record.storageResult !== "deduplicated-and-verified"
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact.verified storage data must describe verified deduplication",
+		);
+	}
+	if (
+		eventName === "artifact.verified" &&
+		Object.hasOwn(record, "verificationResult") &&
+		record.verificationResult !== "verified"
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact.verified audit data must report verificationResult verified",
+		);
+	}
+	if (
+		eventName === "artifact.missing" &&
+		Object.hasOwn(record, "artifactKind") &&
+		record.verificationResult === "verified"
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact.missing audit data cannot report verificationResult verified",
+		);
+	}
+	if (Object.hasOwn(record, "verificationResult") && Object.hasOwn(record, "artifactKind")) {
+		const expectsActualHash =
+			record.verificationResult === "verified" || record.verificationResult === "hash-mismatch";
+		if (expectsActualHash !== Object.hasOwn(record, "actualHash")) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime event ${eventName} artifact audit data has an inconsistent actualHash`,
+			);
+		}
+	}
+	if (eventName === "process.exited" && outcome !== "abandoned") {
+		if (
+			outcome === "succeeded" &&
+			(record.exitCode !== 0 ||
+				record.timedOut !== false ||
+				record.stdoutTruncated !== false ||
+				record.stderrTruncated !== false)
+		) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime successful process exit data contradicts its exit or output facts",
+			);
+		}
+		if (outcome === "cancelled" && record.timedOut !== true) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime cancelled process exit data must describe a timed-out process",
+			);
+		}
+	}
+	if (eventName === "runtime-index-rebuilt") {
+		if (outcome === "succeeded" && !Object.hasOwn(record, "rebuiltIndexHash")) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime successful index rebuild data requires rebuiltIndexHash",
+			);
+		}
+		if (outcome !== "succeeded" && Object.hasOwn(record, "rebuiltIndexHash")) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime ${outcome} index rebuild data cannot claim a rebuiltIndexHash`,
+			);
+		}
+	}
+	for (const field of [
+		"startedAt",
+		"lastProgressAt",
+		"ownerProcessStartedAtUtc",
+		"acquiredAtUtc",
+		"expiresAtUtc",
+		"renewedAtUtc",
+		"detectedAtUtc",
+		"releasedAtUtc",
+		"rebuiltAt",
+	]) {
+		if (Object.hasOwn(record, field)) assertRuntimeUtcTimestamp(record[field], field, eventName);
+	}
+	if (eventName === "lease.acquired") {
+		if ((record.renewEveryMs as number) >= (record.staleAfterMs as number)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime lease renewal interval must be shorter than its stale boundary",
+			);
+		}
+		if (
+			Date.parse(record.expiresAtUtc as string) - Date.parse(record.acquiredAtUtc as string) !==
+			record.staleAfterMs
+		) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime lease expiry does not match its acquired time and stale boundary",
+			);
+		}
+		if (Date.parse(record.ownerProcessStartedAtUtc as string) > Date.parse(record.acquiredAtUtc as string)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime lease owner process cannot start after lease acquisition",
+			);
+		}
+	}
+	if (
+		eventName === "lease.renewed" &&
+		Date.parse(record.expiresAtUtc as string) - Date.parse(record.renewedAtUtc as string) !==
+			ANSTEEL_RUNTIME_LOG_LOCK_STALE_MS
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime renewed lease expiry does not match the governed stale boundary",
+		);
+	}
+	if (
+		eventName === "lease.expired" &&
+		(Date.parse(record.ownerProcessStartedAtUtc as string) > Date.parse(record.acquiredAtUtc as string) ||
+			Date.parse(record.acquiredAtUtc as string) > Date.parse(record.detectedAtUtc as string))
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime expired lease data has non-monotonic lifecycle timestamps",
+		);
+	}
+}
 
 export function isAnsteelRuntimeEventCombination(eventName: string, outcome: string): boolean {
 	const allowed = (ANSTEEL_RUNTIME_EVENT_CATALOG as Record<string, readonly string[]>)[eventName];
@@ -1165,6 +1834,7 @@ function parseRuntimeLogEntry(value: unknown): AnsteelRuntimeLogEntry {
 	}
 	if (catalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION) {
 		assertAnsteelRuntimeEventCombination(entry.eventName, entry.outcome);
+		assertAnsteelRuntimeEventData(entry.eventName, entry.outcome, entry.data);
 	}
 	if (
 		typeof entry.runId !== "string" ||
@@ -1524,6 +2194,7 @@ function startRuntimeIndexRebuildAudit(
 		artifactRefs: [],
 		previousHash: null,
 	};
+	assertAnsteelRuntimeEventData(unsigned.eventName, unsigned.outcome, unsigned.data);
 	const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
 	mkdirSync(getAnsteelRuntimeLogDirectory(cwd), { recursive: true });
 	try {
@@ -1567,6 +2238,7 @@ function completeRuntimeIndexRebuildAudit(
 		artifactRefs: [],
 		previousHash: audit.startHash,
 	};
+	assertAnsteelRuntimeEventData(unsigned.eventName, unsigned.outcome, unsigned.data);
 	const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
 	const path = getAnsteelRuntimeLogPath(cwd, audit.runId);
 	let fd: number | undefined;
@@ -2246,6 +2918,9 @@ function getAnsteelRuntimeSpanStartEventName(spanName: string): string {
 		case "process":
 		case "process.spawned":
 			return "process.spawned";
+		case "task":
+		case "task.started":
+			return "task.started";
 		default:
 			return spanName;
 	}
@@ -2266,6 +2941,8 @@ function getAnsteelRuntimeSpanTerminalEventName(
 			return "tool.call.completed";
 		case "process.spawned":
 			return "process.exited";
+		case "task.started":
+			return "task.completed";
 		default:
 			return startEventName;
 	}
@@ -3212,7 +3889,7 @@ export function createAnsteelRuntimeLogger(
 				surfaces: Array<"message" | "data" | "artifact">;
 			};
 		}
-		const validateInput = (input: AnsteelRuntimeLogInput): void => {
+		const validateInputMetadata = (input: AnsteelRuntimeLogInput): void => {
 			assertAnsteelRuntimeEventCombination(input.eventName, input.outcome);
 			if (input.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(input.reasonCode)) {
 				throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime reason code is invalid");
@@ -3226,6 +3903,10 @@ export function createAnsteelRuntimeLogger(
 					"Ansteel artifact and security lifecycle events cannot recursively attach artifacts",
 				);
 			}
+		};
+		const validateInput = (input: AnsteelRuntimeLogInput): void => {
+			validateInputMetadata(input);
+			assertAnsteelRuntimeEventData(input.eventName, input.outcome, input.data);
 		};
 		const prepareInput = (input: AnsteelRuntimeLogInput): PreparedRuntimeLogInput => {
 			const message = inspectAndRedactAnsteelSensitiveText(input.message);
@@ -3262,7 +3943,7 @@ export function createAnsteelRuntimeLogger(
 		// 在创建第一个内容寻址文件前先校验整批输入。security 事件自身若仍含秘密必须直接拒绝；
 		// 若对 security 事件再次静默脱敏，会递归产生新的 security 事件并破坏明确因果链。
 		const preparedInputs = inputs.map((input) => {
-			validateInput(input);
+			validateInputMetadata(input);
 			const prepared = prepareInput(input);
 			if (input.eventName.startsWith("security.") && prepared.security.findingCount > 0) {
 				throw new AnsteelObservabilityError(
@@ -3270,6 +3951,7 @@ export function createAnsteelRuntimeLogger(
 					"Ansteel security lifecycle events must already contain only non-sensitive metadata",
 				);
 			}
+			assertAnsteelRuntimeEventData(prepared.input.eventName, prepared.input.outcome, prepared.input.data);
 			return prepared;
 		});
 		const appendEntry = (
@@ -3576,6 +4258,7 @@ export function createAnsteelRuntimeLogger(
 			startEventName === "run.started" && options.parent === undefined
 				? {
 						...(data ?? {}),
+						command: context.command,
 						runtimeEnvironment,
 						...(context.resumedFromRunId === undefined
 							? {}
@@ -3626,11 +4309,15 @@ export function createAnsteelRuntimeLogger(
 					);
 				}
 				ended = true;
+				const normalizedInput =
+					startEventName === "run.started" && options.parent === undefined
+						? { ...input, data: { ...(input.data ?? {}), command: context.command } }
+						: input;
 				pendingEnds.set(spanContext.spanId, {
 					eventName: getAnsteelRuntimeSpanTerminalEventName(startEventName, input.outcome),
 					fields,
 					parentSpanId,
-					input,
+					input: normalizedInput,
 				});
 				openTelemetrySpan.setStatus({
 					code: input.outcome === "failed" ? SpanStatusCode.ERROR : SpanStatusCode.OK,

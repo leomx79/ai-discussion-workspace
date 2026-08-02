@@ -3816,7 +3816,7 @@ describe("Ansteel team state", () => {
 			eventName: "state.persisted",
 			outcome: "succeeded",
 			message: "A durable runtime segment exists before anchoring.",
-			data: {},
+			data: { status: team.status, version: team.version, nextEventSequence: team.nextEventSequence },
 		});
 		logger.close();
 		const remoteDirectory = mkdtempSync(join(tmpdir(), "pi-ansteel-anchor-remote-"));

@@ -8,6 +8,7 @@ import {
 	ANSTEEL_PROTOCOL_RUNTIME_EVENT_NAMES,
 	ANSTEEL_RUNTIME_EVENT_CATALOG,
 	ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION,
+	ANSTEEL_RUNTIME_EVENT_DATA_SCHEMAS,
 	ANSTEEL_RUNTIME_REASON_CODES,
 	abandonOrphanedAnsteelTeamRun,
 	auditAnsteelRuntimeArtifacts,
@@ -30,6 +31,267 @@ import {
 } from "../src/core/ansteel-team-observability.ts";
 
 const temporaryProjects: string[] = [];
+const RUNTIME_TEST_HASH = "a".repeat(64);
+const RUNTIME_TEST_UTC = "2026-07-29T00:00:00.000Z";
+const RUNTIME_TEST_RECOVERY_DATA = {
+	recoveredFromSequence: 1,
+	recoveredFromEventHash: RUNTIME_TEST_HASH,
+};
+
+const runtimeTestEnvironment = {
+	productVersion: "0.81.1",
+	extensionVersion: "3.3",
+	gitCommit: null,
+	configStatus: "missing" as const,
+	configFingerprint: RUNTIME_TEST_HASH,
+	featureFlags: {},
+	nodeVersion: process.version,
+	osPlatform: process.platform,
+	osRelease: "test-release",
+	architecture: process.arch,
+	projectRootId: RUNTIME_TEST_HASH,
+	enabledEnvironmentVariables: [],
+	environmentFingerprint: RUNTIME_TEST_HASH,
+};
+
+const runtimeTransitionData = (guardResult: boolean) => ({
+	transitionLogId: "TRANSITION-LOG-1",
+	transitionId: "TRANSITION-1",
+	objectKind: "task",
+	objectId: "TASK-1",
+	from: "claimed",
+	to: guardResult ? "submitted" : "claimed",
+	guard: "test-guard",
+	guardResult,
+	triggerEventId: "EVENT-1",
+});
+
+const runtimeProcessExitedData = {
+	pid: 42,
+	policy: "task-test",
+	commandHash: RUNTIME_TEST_HASH,
+	cwdHash: RUNTIME_TEST_HASH,
+	exitCode: 0,
+	signal: null,
+	timedOut: false,
+	durationMs: 1,
+	lastProgressAt: RUNTIME_TEST_UTC,
+	stdoutBytes: 0,
+	stderrBytes: 0,
+	stdoutTruncated: false,
+	stderrTruncated: false,
+	stdoutHash: RUNTIME_TEST_HASH,
+	stderrHash: RUNTIME_TEST_HASH,
+};
+
+const runtimeEventDataExamples = {
+	"run.started": () => ({ command: "status", runtimeEnvironment: runtimeTestEnvironment }),
+	"run.resumed": () => ({ resumedFromRunId: "RUN-SOURCE", resumedFromSequence: 1 }),
+	"run.completed": () => ({ command: "status" }),
+	"run.failed": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { command: "status" }),
+	"role.session.started": () => ({}),
+	"role.session.output": () => ({ outputLength: 1, publicOutputEmpty: false }),
+	"role.session.truncated": () => ({ truncationBoundary: "provider-output", stopReason: "length" }),
+	"role.session.ended": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : outcome === "succeeded" ? { outputLength: 1 } : {},
+	"provider.request.started": () => ({}),
+	"provider.request.retry": () => ({ retryBoundary: "agent-session", attempt: 1, maxAttempts: 2, delayMs: 0 }),
+	"provider.request.completed": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"tool.call.started": () => ({}),
+	"tool.call.progress": () => ({
+		pid: 42,
+		policy: "task-test",
+		elapsedMs: 1,
+		stdoutBytes: 0,
+		stderrBytes: 0,
+		lastProgressAt: RUNTIME_TEST_UTC,
+		sourceEventName: "process.heartbeat",
+	}),
+	"tool.call.completed": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"process.spawned": () => ({
+		pid: 42,
+		policy: "task-test",
+		commandHash: RUNTIME_TEST_HASH,
+		cwdHash: RUNTIME_TEST_HASH,
+		shell: false,
+		argumentCount: 0,
+		timeoutMs: 1,
+		maximumOutputBytes: 1,
+		startedAt: RUNTIME_TEST_UTC,
+	}),
+	"process.heartbeat": () => ({
+		pid: 42,
+		policy: "task-test",
+		elapsedMs: 1,
+		stdoutBytes: 0,
+		stderrBytes: 0,
+		lastProgressAt: RUNTIME_TEST_UTC,
+	}),
+	"process.exited": (outcome: string) =>
+		outcome === "abandoned"
+			? RUNTIME_TEST_RECOVERY_DATA
+			: outcome === "cancelled"
+				? { ...runtimeProcessExitedData, exitCode: null, timedOut: true }
+				: outcome === "failed"
+					? { ...runtimeProcessExitedData, exitCode: 1 }
+					: runtimeProcessExitedData,
+	"process.orphan-detected": () => ({ ...RUNTIME_TEST_RECOVERY_DATA, pid: 42 }),
+	"state.transition.attempted": () => runtimeTransitionData(true),
+	"state.transition.applied": () => runtimeTransitionData(true),
+	"state.transition.rejected": () => runtimeTransitionData(false),
+	"lease.acquired": () => ({
+		resourceKind: "runtime-run",
+		resourceHash: RUNTIME_TEST_HASH,
+		lockKind: "run",
+		ownerPid: 42,
+		ownerProcessStartedAtUtc: RUNTIME_TEST_UTC,
+		ownerExecutableHash: RUNTIME_TEST_HASH,
+		ownerCommandHash: RUNTIME_TEST_HASH,
+		ownerWorkingDirectoryHash: RUNTIME_TEST_HASH,
+		acquiredAtUtc: RUNTIME_TEST_UTC,
+		staleAfterMs: 2,
+		renewEveryMs: 1,
+		expiresAtUtc: "2026-07-29T00:00:00.002Z",
+	}),
+	"lease.renewed": () => ({
+		resourceKind: "runtime-run",
+		resourceHash: RUNTIME_TEST_HASH,
+		ownerPid: 42,
+		renewedAtUtc: RUNTIME_TEST_UTC,
+		renewalCount: 1,
+		expiresAtUtc: "2026-07-29T00:05:00.000Z",
+	}),
+	"lease.expired": () => ({
+		resourceKind: "runtime-run",
+		resourceHash: RUNTIME_TEST_HASH,
+		lockKind: "run",
+		ownerPid: 42,
+		ownerProcessStartedAtUtc: RUNTIME_TEST_UTC,
+		ownerExecutableHash: RUNTIME_TEST_HASH,
+		ownerCommandHash: RUNTIME_TEST_HASH,
+		ownerWorkingDirectoryHash: RUNTIME_TEST_HASH,
+		acquiredAtUtc: RUNTIME_TEST_UTC,
+		detectedAtUtc: RUNTIME_TEST_UTC,
+		replacementLeaseId: "LEASE-2",
+	}),
+	"lease.released": () => ({
+		resourceKind: "runtime-run",
+		resourceHash: RUNTIME_TEST_HASH,
+		ownerPid: 42,
+		releasedAtUtc: RUNTIME_TEST_UTC,
+		renewalCount: 0,
+		heldDurationMs: 0,
+	}),
+	"event.appended": () => ({ eventSequence: 1, eventType: "task-claimed", eventHash: RUNTIME_TEST_HASH }),
+	"event.fsync.completed": () => ({ eventSequence: 1 }),
+	"event.chain.invalid": () => ({
+		resourceKind: "runtime-log-chain",
+		sourceRunId: "RUN-SOURCE",
+		verificationBoundary: "diagnostic-target-read",
+	}),
+	"artifact.stored": () => ({
+		resourceKind: "content-addressed-artifact",
+		sourceSequence: 1,
+		artifactKind: "stderr",
+		sha256: RUNTIME_TEST_HASH,
+		contentByteLength: 0,
+		storageResult: "created",
+	}),
+	"artifact.verified": () => ({
+		resourceKind: "content-addressed-artifact",
+		sourceSequence: 1,
+		artifactKind: "stderr",
+		sha256: RUNTIME_TEST_HASH,
+		contentByteLength: 0,
+		storageResult: "deduplicated-and-verified",
+	}),
+	"artifact.missing": () => ({
+		resourceKind: "runtime-log",
+		sourceRunId: "RUN-SOURCE",
+		verificationResult: "missing",
+	}),
+	"budget.reserved": () => ({ resourceKind: "read-only-tool-calls", used: 0, limit: 2, remaining: 2 }),
+	"budget.consumed": () => ({
+		resourceKind: "read-only-tool-calls",
+		toolName: "read",
+		used: 1,
+		limit: 2,
+		remaining: 1,
+	}),
+	"budget.exhausted": () => ({
+		resourceKind: "read-only-tool-calls",
+		toolName: "read",
+		used: 2,
+		limit: 2,
+		remaining: 0,
+	}),
+	"security.access-denied": () => ({
+		sourceEventName: "tool.call.completed",
+		sourceSequence: 1,
+		denialBoundary: "tool-policy",
+	}),
+	"security.redaction-applied": () => ({
+		sourceEventName: "tool.call.completed",
+		sourceSequence: 1,
+		redactionBoundary: "runtime-persistence",
+		findingCount: 1,
+		sensitiveFieldCount: 0,
+		sensitiveTextMatchCount: 1,
+		surfaces: ["message"],
+	}),
+	"security.secret-detected": () => ({
+		sourceEventName: "tool.call.completed",
+		sourceSequence: 1,
+		redactionBoundary: "runtime-persistence",
+		findingCount: 1,
+		sensitiveFieldCount: 0,
+		sensitiveTextMatchCount: 1,
+		surfaces: ["message"],
+	}),
+	"runtime-index-rebuilt": (outcome: string) =>
+		outcome === "abandoned"
+			? RUNTIME_TEST_RECOVERY_DATA
+			: {
+					rebuildReason: "missing",
+					rebuiltAt: RUNTIME_TEST_UTC,
+					sourceRunCount: 0,
+					...(outcome === "succeeded" ? { rebuiltIndexHash: RUNTIME_TEST_HASH } : {}),
+				},
+	"state.persisted": () => ({ status: "active", version: 12, nextEventSequence: 1 }),
+	"transaction.persisted": () => ({ eventSequence: 1 }),
+	"event.ledger.rewritten": () => ({ eventCount: 0 }),
+	"action.assess": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { toolName: "read" }),
+	"action.review": (outcome: string) =>
+		outcome === "abandoned"
+			? RUNTIME_TEST_RECOVERY_DATA
+			: { verdict: "approve", actionKind: "read", target: "README.md" },
+	"checkpoint.publish": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"milestone.collaboration.publish": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"milestone.create": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"milestone.final-verification.begin": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { revision: 1 },
+	"milestone.review": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { verdict: "approve" },
+	"milestone.submit": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"process.issue": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"process.resolve": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { outcome: "fixed" },
+	"process.review": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { verdict: "approve" },
+	"task.claim": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"task.claim.parallel": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { taskIds: ["TASK-1"] },
+	"task.collaboration.publish": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"task.collaboration.return": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { reason: "diff drift" },
+	"task.final-verification.begin": (outcome: string) =>
+		outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { revision: 1 },
+	"task.review": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : { verdict: "approve" }),
+	"task.submit": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+	"task.started": () => ({}),
+	"task.progress": () => ({}),
+	"task.completed": (outcome: string) => (outcome === "abandoned" ? RUNTIME_TEST_RECOVERY_DATA : {}),
+} satisfies Record<keyof typeof ANSTEEL_RUNTIME_EVENT_CATALOG, (outcome: string) => Record<string, unknown>>;
 
 function createTemporaryProject(): string {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-observability-"));
@@ -158,6 +420,144 @@ describe("Ansteel team observability", () => {
 		expect(isAnsteelRuntimeEventCombination("runtime-index-rebuilt", "abandoned")).toBe(true);
 	});
 
+	it("defines and round-trips strict v1 data schemas for every catalog event and outcome", () => {
+		expect(Object.keys(ANSTEEL_RUNTIME_EVENT_DATA_SCHEMAS).sort()).toEqual(
+			Object.keys(ANSTEEL_RUNTIME_EVENT_CATALOG).sort(),
+		);
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-data-schema-catalog", command: "schema catalog" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		let expectedEntryCount = 0;
+		for (const [eventName, outcomes] of Object.entries(ANSTEEL_RUNTIME_EVENT_CATALOG) as Array<
+			[
+				keyof typeof ANSTEEL_RUNTIME_EVENT_CATALOG,
+				readonly (typeof ANSTEEL_RUNTIME_EVENT_CATALOG)[keyof typeof ANSTEEL_RUNTIME_EVENT_CATALOG][number][],
+			]
+		>) {
+			for (const outcome of outcomes) {
+				logger.write({
+					level: outcome === "failed" || outcome === "abandoned" ? "error" : "audit",
+					eventName,
+					outcome,
+					message: `${eventName} ${outcome} schema fixture`,
+					data: runtimeEventDataExamples[eventName](outcome),
+				});
+				expectedEntryCount++;
+			}
+		}
+		logger.close();
+		const entries = readAnsteelRuntimeLogs(cwd, context.runId);
+		expect(entries).toHaveLength(expectedEntryCount);
+		expect(entries.every((entry) => entry.eventCatalogVersion === 1)).toBe(true);
+	}, 30_000);
+
+	it("rejects required-field, type, boundary, unknown-field, and cross-field data mutations before artifact I/O", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-data-schema-writer", command: "schema mutations" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const invalidInputs = [
+			{ eventName: "state.persisted", outcome: "succeeded", data: { status: "active", version: 12 } },
+			{
+				eventName: "state.persisted",
+				outcome: "succeeded",
+				data: { status: "active", version: "12", nextEventSequence: 1 },
+			},
+			{
+				eventName: "state.persisted",
+				outcome: "succeeded",
+				data: { status: "active", version: 12, nextEventSequence: Number.MAX_SAFE_INTEGER + 1 },
+			},
+			{
+				eventName: "provider.request.retry",
+				outcome: "progress",
+				data: { retryBoundary: "agent-session", attempt: 0, maxAttempts: 2, delayMs: 0 },
+			},
+			{
+				eventName: "state.persisted",
+				outcome: "succeeded",
+				data: { status: "active", version: 12, nextEventSequence: 1, invented: true },
+			},
+			{
+				eventName: "budget.consumed",
+				outcome: "progress",
+				data: { resourceKind: "read-only-tool-calls", toolName: "read", used: 1, limit: 3, remaining: 1 },
+			},
+			{
+				eventName: "run.started",
+				outcome: "started",
+				data: {
+					command: "status",
+					runtimeEnvironment: runtimeTestEnvironment,
+					resumedFromRunId: "RUN-SOURCE",
+				},
+			},
+			{
+				eventName: "provider.request.completed",
+				outcome: "succeeded",
+				data: { tokenCountsAvailable: true, inputTokens: null, outputTokens: null },
+			},
+			{
+				eventName: "process.exited",
+				outcome: "succeeded",
+				data: { ...runtimeProcessExitedData, exitCode: 1 },
+			},
+			{
+				eventName: "artifact.verified",
+				outcome: "succeeded",
+				data: {
+					resourceKind: "content-addressed-artifact",
+					sourceRunId: "RUN-SOURCE",
+					sourceSequence: 1,
+					artifactKind: "stderr",
+					sha256: RUNTIME_TEST_HASH,
+					verificationResult: "missing",
+				},
+			},
+		] as const;
+		for (const input of invalidInputs) {
+			expect(() =>
+				logger.write({
+					level: "error",
+					eventName: input.eventName,
+					outcome: input.outcome,
+					message: "invalid schema mutation",
+					data: input.data,
+					...(input.eventName.startsWith("artifact.")
+						? {}
+						: {
+								artifacts: [
+									{ kind: "must-not-exist", content: "schema failure must precede artifact storage" },
+								],
+							}),
+				}),
+			).toThrow();
+		}
+		expect(readAnsteelRuntimeLogs(cwd, context.runId)).toEqual([]);
+		expect(existsSync(join(cwd, ".pi", "ansteel-team", "artifacts"))).toBe(false);
+		logger.close();
+	});
+
+	it("rejects a rehashed persisted v1 data mutation before hash-chain acceptance", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-data-schema-reader", command: "schema reader" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "audit",
+			eventName: "state.persisted",
+			outcome: "succeeded",
+			message: "valid state receipt",
+			data: { status: "active", version: 12, nextEventSequence: 1 },
+		});
+		logger.close();
+		const path = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const entry = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		entry.data = { status: "active", version: 12, nextEventSequence: 1, invented: true };
+		const { hash: _hash, ...unsigned } = entry;
+		entry.hash = createHash("sha256").update(JSON.stringify(unsigned), "utf8").digest("hex");
+		writeFileSync(path, `${JSON.stringify(entry)}\n`, "utf8");
+		expect(() => readAnsteelRuntimeLogs(cwd, context.runId)).toThrow("data schema rejects");
+	});
+
 	it("rejects unknown versioned events and invalid event-outcome combinations before writing", () => {
 		const cwd = createTemporaryProject();
 		const context = createAnsteelRunContext({ teamId: "team-catalog-writer", command: "status" });
@@ -196,7 +596,7 @@ describe("Ansteel team observability", () => {
 			eventName: "state.persisted",
 			outcome: "succeeded",
 			message: "valid versioned entry",
-			data: {},
+			data: { status: "active", version: 12, nextEventSequence: 1 },
 		});
 		versionedLogger.close();
 		const versionedPath = join(
@@ -292,7 +692,7 @@ describe("Ansteel team observability", () => {
 			eventName: "state.persisted",
 			outcome: "succeeded",
 			message: "status inspected",
-			data: { command: diagnostic.command },
+			data: { status: "active", version: 12, nextEventSequence: 1 },
 		});
 		diagnosticLogger.close();
 
@@ -436,8 +836,8 @@ describe("Ansteel team observability", () => {
 			reasonCode: "tool-exit-nonzero",
 			message: `command failed OPENAI_API_KEY="message secret"; provider_access_token='second secret'; API_KEY=bare-api-secret`,
 			data: {
-				authorization: "Bearer top-secret",
-				environment: `PASSWORD='bare password'; TOKEN="bare token"`,
+				command: "authorization: Bearer top-secret",
+				toolName: `PASSWORD='bare password'; TOKEN="bare token"`,
 				exitCode: 1,
 			},
 			artifacts: [
@@ -450,14 +850,14 @@ describe("Ansteel team observability", () => {
 		});
 		logger.close();
 
-		expect(entry.data.authorization).toBe("[REDACTED]");
+		expect(entry.data.command).toBe("authorization: [REDACTED]");
 		expect(entry.message).toContain("OPENAI_API_KEY=[REDACTED]");
 		expect(entry.message).toContain("provider_access_token=[REDACTED]");
 		expect(entry.message).toContain("API_KEY=[REDACTED]");
 		expect(entry.message).not.toContain("message secret");
 		expect(entry.message).not.toContain("second secret");
 		expect(entry.message).not.toContain("bare-api-secret");
-		expect(entry.data.environment).toBe("PASSWORD=[REDACTED]; TOKEN=[REDACTED]");
+		expect(entry.data.toolName).toBe("PASSWORD=[REDACTED]; TOKEN=[REDACTED]");
 		expect(entry.artifactRefs[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
 		const artifact = readFileSync(entry.artifactRefs[0]!.storageId, "utf8");
 		expect(artifact).toContain("ANSTEEL_TL_API_KEY=[REDACTED]");
@@ -555,7 +955,6 @@ describe("Ansteel team observability", () => {
 				outputTokens: 4,
 				maxTokens: 32,
 				tokenCountsAvailable: true,
-				apiKey: "[REDACTED]",
 			},
 		});
 		logger.close();
@@ -841,7 +1240,7 @@ describe("Ansteel team observability", () => {
 			eventName: "state.persisted",
 			outcome: "succeeded",
 			message: "valid source before corruption",
-			data: {},
+			data: { status: "active", version: 12, nextEventSequence: 1 },
 		});
 		sourceLogger.close();
 
@@ -857,7 +1256,7 @@ describe("Ansteel team observability", () => {
 				eventName: "state.persisted",
 				outcome: "succeeded",
 				message: "This normal write must remain fail-closed.",
-				data: {},
+				data: { status: "active", version: 12, nextEventSequence: 1 },
 			}),
 		).toThrow("hash does not match");
 		ordinaryLogger.close();
@@ -990,7 +1389,7 @@ describe("Ansteel team observability", () => {
 			spanId,
 			role: "coordinator",
 			message: "forged early terminal",
-			data: {},
+			data: { command: context.command },
 		});
 		logger.write({
 			level: "info",
@@ -999,7 +1398,7 @@ describe("Ansteel team observability", () => {
 			spanId,
 			role: "coordinator",
 			message: "late start",
-			data: {},
+			data: { command: context.command, runtimeEnvironment: runtimeTestEnvironment },
 		});
 		logger.close();
 
@@ -1021,7 +1420,7 @@ describe("Ansteel team observability", () => {
 			parentSpanId: "forged-child-parent",
 			role: "coordinator",
 			message: "forged non-root terminal",
-			data: {},
+			data: { command: context.command },
 		});
 		logger.close();
 
@@ -1340,7 +1739,17 @@ describe("Ansteel team observability", () => {
 			role: "staff-engineer",
 			taskId: "TASK-ORPHAN",
 			processId: "PROC-ORPHAN",
-			data: { pid: 424242, policy: "task-test" },
+			data: {
+				pid: 424242,
+				policy: "task-test",
+				commandHash: RUNTIME_TEST_HASH,
+				cwdHash: RUNTIME_TEST_HASH,
+				shell: false,
+				argumentCount: 0,
+				timeoutMs: 1,
+				maximumOutputBytes: 1,
+				startedAt: RUNTIME_TEST_UTC,
+			},
 		});
 		logger.close();
 
@@ -1365,6 +1774,33 @@ describe("Ansteel team observability", () => {
 			outcome: "abandoned",
 			reasonCode: "process-orphaned",
 			processId: "PROC-ORPHAN",
+		});
+	});
+
+	it("maps an orphaned generic task span to the catalog task terminal event", async () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-task-orphan", command: "task TASK-ORPHAN-MAP" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.startSpan("task", {
+			role: "staff-engineer",
+			taskId: "TASK-ORPHAN-MAP",
+			data: {},
+		});
+		logger.close();
+
+		await expect(abandonOrphanedAnsteelTeamRun(cwd, context.runId)).resolves.toMatchObject({
+			abandonedSpanCount: 1,
+		});
+		const entries = readAnsteelRuntimeLogs(cwd, context.runId);
+		expect(entries.map((entry) => [entry.eventName, entry.outcome])).toEqual([
+			["task.started", "started"],
+			["lease.acquired", "succeeded"],
+			["task.completed", "abandoned"],
+			["lease.released", "succeeded"],
+		]);
+		expect(entries[2]?.data).toEqual({
+			recoveredFromSequence: 1,
+			recoveredFromEventHash: entries[0]?.hash,
 		});
 	});
 

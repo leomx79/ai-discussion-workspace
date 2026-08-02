@@ -1038,7 +1038,7 @@ async function prepareAnchorRpcFixture(projectDir: string): Promise<{
 		eventName: "state.persisted",
 		outcome: "succeeded",
 		message: "A strict runtime segment exists before the RPC anchor command.",
-		data: {},
+		data: { status: state.status, version: state.version, nextEventSequence: state.nextEventSequence },
 	});
 	logger.close();
 
@@ -2394,7 +2394,7 @@ describe("Ansteel team CLI", () => {
 			eventName: "state.persisted",
 			outcome: "succeeded",
 			message: "A strict runtime segment exists before the delivery RPC command.",
-			data: {},
+			data: { status: state.status, version: state.version, nextEventSequence: state.nextEventSequence },
 		});
 		logger.close();
 
@@ -2566,7 +2566,7 @@ describe("Ansteel team CLI", () => {
 			eventName: "state.persisted",
 			outcome: "succeeded",
 			message: "A valid source entry exists before deliberate test corruption.",
-			data: {},
+			data: { status: "active", version: 12, nextEventSequence: 1 },
 		});
 		sourceLogger.close();
 		const indexPath = getAnsteelRuntimeIndexPath(projectDir);
