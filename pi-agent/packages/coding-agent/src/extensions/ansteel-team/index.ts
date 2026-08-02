@@ -1366,6 +1366,29 @@ function buildProcessResolutionReviewPrompt(issue: AnsteelProcessIssue, resoluti
 	].join("\n\n");
 }
 
+function buildProcessResolutionPrompt(issue: AnsteelProcessIssue): string {
+	const immutableIssue = {
+		id: issue.id,
+		targetCheckpointId: issue.targetCheckpointId,
+		author: issue.author,
+		targetRole: issue.targetRole,
+		severity: issue.severity,
+		claim: issue.claim,
+		evidenceRefs: issue.evidenceRefs,
+		suggestedCorrection: issue.suggestedCorrection,
+	};
+	return [
+		`You are the target role for open process issue ${issue.id}.`,
+		"This structured resolution has priority over task execution, action review, and final verification. Inspect project evidence with read-only tools when needed; do not edit project files or review another action or task in this stage.",
+		"Publish any required replacement checkpoint first. Then call ansteel_resolve_process_issue exactly once with ACCEPTED, REFUTED, EXPERIMENT_REQUIRED, or SCOPE_ESCALATION. An ACCEPTED outcome must cite your same-role replacement checkpoint that directly supersedes the challenged checkpoint.",
+		"Public prose cannot resolve this issue. The original issue author will independently review the immutable resolution after you submit it.",
+		"Immutable issue:",
+		"```json",
+		JSON.stringify(immutableIssue),
+		"```",
+	].join("\n\n");
+}
+
 function buildMilestoneReviewPrompt(
 	role: AnsteelRole,
 	milestone: AnsteelTeamMilestone,
@@ -2401,21 +2424,76 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		};
 
 		/**
-		 * 在审查更新动作或交付阶段前，把每个任务相关 resolution proposal 发回原 issue 作者。
-		 * 评审必须串行：同一角色可能拥有多个 issue，而持久角色会话不能安全并发处理多个 prompt。
+		 * Resolve every in-scope process issue before later action or delivery stages.
+		 * Each stage is serial because persistent role sessions cannot safely handle
+		 * more than one resolution prompt for the same role at once.
 		 */
-		const requestPendingProcessResolutionReviews = async (
+		const settlePendingProcessIssues = async (
 			activeTeam: ActiveAnsteelTeam,
 			ctx: ExtensionCommandContext,
-			task: AnsteelTeamTask,
+			task?: AnsteelTeamTask,
 		): Promise<boolean> => {
-			const taskCheckpointIds = new Set(
-				activeTeam.state.workCheckpoints
-					.filter((checkpoint) => checkpoint.taskId === task.id)
-					.map((checkpoint) => checkpoint.id),
+			const taskCheckpointIds =
+				task === undefined
+					? undefined
+					: new Set(
+							activeTeam.state.workCheckpoints
+								.filter((checkpoint) => checkpoint.taskId === task.id)
+								.map((checkpoint) => checkpoint.id),
+						);
+			const isInScope = (issue: AnsteelProcessIssue): boolean =>
+				taskCheckpointIds === undefined || taskCheckpointIds.has(issue.targetCheckpointId);
+			const openIssues = activeTeam.state.processIssues.filter(
+				(issue) => issue.status === "open" && isInScope(issue),
 			);
+			for (const pendingIssue of openIssues) {
+				const issue = activeTeam.state.processIssues.find((item) => item.id === pendingIssue.id);
+				if (!issue || issue.status !== "open") continue;
+				const checkpoint = activeTeam.state.workCheckpoints.find((item) => item.id === issue.targetCheckpointId);
+				const responder = issue.targetRole;
+				const session = activeTeam.sessions.get(responder);
+				if (!session) throw new Error(`Ansteel team ${responder} session is not active`);
+				persistRoleStatus(ctx.cwd, activeTeam.state, responder, "working", "process-resolution-session-started");
+				try {
+					const response = await promptObservedRole(
+						ctx.cwd,
+						responder,
+						session,
+						buildProcessResolutionPrompt(issue),
+						activeTeam.stageTimeoutMs,
+						{
+							...(checkpoint?.taskId === undefined ? {} : { taskId: checkpoint.taskId }),
+							checkpointId: issue.targetCheckpointId,
+						},
+					);
+					const updatedIssue = activeTeam.state.processIssues.find((item) => item.id === issue.id);
+					if (updatedIssue?.status !== "resolution-proposed") {
+						throw new Error(
+							`Ansteel team process issue ${issue.id} did not receive a structured resolution proposal`,
+						);
+					}
+					persistRoleStatus(ctx.cwd, activeTeam.state, responder, "idle", "process-resolution-session-completed");
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{ type: "role-report", role: responder, content: response.trim() },
+						getPersistenceContext(ctx.cwd),
+					);
+					emitTimelineMessage(pi, `## ${responder} process resolution [${event.sequence}]\n\n${event.content}`);
+				} catch (error) {
+					persistRoleStatus(ctx.cwd, activeTeam.state, responder, "failed", "process-resolution-session-failed");
+					const content = formatAnsteelPublicError(error);
+					const event = appendAnsteelTeamEvent(
+						ctx.cwd,
+						activeTeam.state,
+						{ type: "role-failure", role: responder, content },
+						getPersistenceContext(ctx.cwd),
+					);
+					emitTimelineMessage(pi, `## ${responder} process resolution failure [${event.sequence}]\n\n${content}`);
+				}
+			}
 			const pendingIssues = activeTeam.state.processIssues.filter(
-				(issue) => issue.status === "resolution-proposed" && taskCheckpointIds.has(issue.targetCheckpointId),
+				(issue) => issue.status === "resolution-proposed" && isInScope(issue),
 			);
 			for (const pendingIssue of pendingIssues) {
 				const issue = activeTeam.state.processIssues.find((item) => item.id === pendingIssue.id);
@@ -2424,6 +2502,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				if (!resolution) {
 					throw new Error(`Ansteel team process issue ${issue.id} has no unreviewed resolution proposal`);
 				}
+				const checkpoint = activeTeam.state.workCheckpoints.find((item) => item.id === issue.targetCheckpointId);
 				const reviewer = issue.author;
 				const session = activeTeam.sessions.get(reviewer);
 				if (!session) throw new Error(`Ansteel team ${reviewer} session is not active`);
@@ -2441,7 +2520,10 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						session,
 						buildProcessResolutionReviewPrompt(issue, resolution),
 						activeTeam.stageTimeoutMs,
-						{ taskId: task.id, checkpointId: issue.targetCheckpointId },
+						{
+							...(checkpoint?.taskId === undefined ? {} : { taskId: checkpoint.taskId }),
+							checkpointId: issue.targetCheckpointId,
+						},
 					);
 					persistRoleStatus(
 						ctx.cwd,
@@ -2482,9 +2564,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 				}
 			}
 
-			return !activeTeam.state.processIssues.some(
-				(issue) => issue.status === "resolution-proposed" && taskCheckpointIds.has(issue.targetCheckpointId),
-			);
+			return !activeTeam.state.processIssues.some((issue) => issue.status !== "closed" && isInScope(issue));
 		};
 
 		const requestMilestoneCollaborations = async (
@@ -2627,7 +2707,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			ctx: ExtensionCommandContext,
 			task: AnsteelTeamTask,
 		): Promise<void> => {
-			if (!(await requestPendingProcessResolutionReviews(activeTeam, ctx, task))) return;
+			if (!(await settlePendingProcessIssues(activeTeam, ctx, task))) return;
 			if (task.status === "submitted") {
 				const submission = task.submissions.at(-1);
 				if (!submission || submission.revision !== task.revision) {
@@ -3356,7 +3436,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 
 				task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 				if (task.status === "approved") return;
-				const processResolutionsCleared = await requestPendingProcessResolutionReviews(activeTeam, ctx, task);
+				const processResolutionsCleared = await settlePendingProcessIssues(activeTeam, ctx, task);
 				if (processResolutionsCleared) await requestPendingActionReviews(activeTeam, ctx, task);
 				task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 				if (task.status === "approved") return;
@@ -3554,11 +3634,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 						for (const taskId of runnableTasks.map((task) => task.id)) {
 							let task = activeTeam.state.tasks.find((item) => item.id === taskId);
 							if (!task || task.status === "approved") continue;
-							const processResolutionsCleared = await requestPendingProcessResolutionReviews(
-								activeTeam,
-								ctx,
-								task,
-							);
+							const processResolutionsCleared = await settlePendingProcessIssues(activeTeam, ctx, task);
 							if (processResolutionsCleared) await requestPendingActionReviews(activeTeam, ctx, task);
 							task = activeTeam.state.tasks.find((item) => item.id === taskId)!;
 							if (task.status === "submitted" || task.status === "final-verification") {
@@ -4012,6 +4088,11 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							"Review every peer's public update for this work item.",
 							"cross-examination",
 						);
+						if (!(await settlePendingProcessIssues(activeTeam, ctx))) {
+							throw new Error(
+								"Ansteel team cannot continue while cross-examination process issues remain unresolved",
+							);
+						}
 					}
 				},
 				{ resume: existing !== undefined },
