@@ -35,6 +35,7 @@ import {
 } from "../src/core/ansteel-team.ts";
 import {
 	ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION,
+	ANSTEEL_RUNTIME_LOG_LIMITS,
 	createAnsteelRunContext,
 	createAnsteelRuntimeLogger,
 	diagnoseAnsteelTeamRun,
@@ -1478,6 +1479,28 @@ describe("Ansteel team CLI", () => {
 				);
 			expect(taskRun).toBeDefined();
 			const taskRuntimeEntries = readAnsteelRuntimeLogs(projectDir, taskRun!.runId);
+			expect(taskRuntimeEntries.length).toBeGreaterThan(0);
+			for (const entry of taskRuntimeEntries) {
+				expect(entry.eventCatalogVersion).toBe(ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION);
+				expect(new Date(entry.timestampUtc).toISOString()).toBe(entry.timestampUtc);
+				expect(entry.monotonicElapsedNs).toMatch(/^(?:0|[1-9][0-9]{0,19})$/);
+				expect(["debug", "info", "warn", "error", "audit"]).toContain(entry.level);
+				expect(Buffer.byteLength(entry.message, "utf8")).toBeGreaterThan(0);
+				expect(Buffer.byteLength(entry.message, "utf8")).toBeLessThanOrEqual(
+					ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes,
+				);
+				expect(entry.runId).toMatch(/^RUN-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+				expect(entry.traceId).toMatch(/^[0-9a-f]{32}$/);
+				expect(entry.spanId).toMatch(/^[0-9a-f]{16}$/);
+				expect(entry.hash).toMatch(/^[0-9a-f]{64}$/);
+				expect(Buffer.byteLength(JSON.stringify(entry), "utf8")).toBeLessThanOrEqual(
+					ANSTEEL_RUNTIME_LOG_LIMITS.maxEntryBytes,
+				);
+				for (const artifact of entry.artifactRefs) {
+					expect(artifact.sha256).toMatch(/^[0-9a-f]{64}$/);
+					expect(artifact.storageId.replaceAll("\\", "/")).toMatch(new RegExp(`/${artifact.sha256}$`));
+				}
+			}
 			const acquiredLease = taskRuntimeEntries.find((entry) => entry.eventName === "lease.acquired");
 			const releasedLease = taskRuntimeEntries.find((entry) => entry.eventName === "lease.released");
 			const toolStarted = taskRuntimeEntries.find(

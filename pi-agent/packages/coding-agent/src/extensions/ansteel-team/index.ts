@@ -1761,9 +1761,11 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 		});
 		let root: AnsteelRuntimeSpan;
 		try {
+			// message 只承担快速阅读摘要；完整命令保留在受 schema/资源上限约束的 data.command，避免长任务定义
+			// 绕过业务层的公共内容原子校验，或把同一份用户输入重复写入两种持久化字段。
 			root = logger.startSpan("run", {
 				role: "coordinator",
-				message: `Ansteel team command started: ${command}`,
+				message: "Ansteel team command started",
 				data: { command },
 			});
 		} catch (error) {
@@ -1784,7 +1786,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			}
 			root.end({
 				outcome: "succeeded",
-				message: `Ansteel team command completed: ${command}`,
+				message: "Ansteel team command completed",
 				data: { command },
 			});
 			return result;

@@ -9,7 +9,9 @@ import {
 	ANSTEEL_RUNTIME_EVENT_CATALOG,
 	ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION,
 	ANSTEEL_RUNTIME_EVENT_DATA_SCHEMAS,
+	ANSTEEL_RUNTIME_LOG_LIMITS,
 	ANSTEEL_RUNTIME_REASON_CODES,
+	type AnsteelRuntimeLogInput,
 	abandonOrphanedAnsteelTeamRun,
 	auditAnsteelRuntimeArtifacts,
 	createAnsteelResumedRunContext,
@@ -556,6 +558,260 @@ describe("Ansteel team observability", () => {
 		entry.hash = createHash("sha256").update(JSON.stringify(unsigned), "utf8").digest("hex");
 		writeFileSync(path, `${JSON.stringify(entry)}\n`, "utf8");
 		expect(() => readAnsteelRuntimeLogs(cwd, context.runId)).toThrow("data schema rejects");
+	});
+
+	it("rejects invalid v1 entry inputs and resource amplification before artifact I/O", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-envelope-writer", command: "envelope writer" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const artifact = { kind: "must-not-exist", content: "invalid envelope must not reach artifact storage" };
+		const base = {
+			level: "audit",
+			eventName: "task.completed",
+			outcome: "succeeded",
+			message: "valid envelope fixture",
+			data: {},
+			artifacts: [artifact],
+		} satisfies AnsteelRuntimeLogInput;
+		let nested: Record<string, unknown> = {};
+		for (let depth = 0; depth < ANSTEEL_RUNTIME_LOG_LIMITS.maxDataDepth; depth++) nested = { child: nested };
+		const invalidInputs: Array<Record<string, unknown>> = [
+			{ ...base, inventedEnvelopeField: true },
+			{ ...base, level: "notice" },
+			{ ...base, message: "" },
+			{ ...base, message: "m".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes + 1) },
+			{ ...base, taskId: "task-lowercase" },
+			{ ...base, providerRequestId: "REQUEST-1" },
+			{ ...base, processId: "PID-1" },
+			{ ...base, leaseId: "owner-1" },
+			{ ...base, revision: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...base, diffHash: "a".repeat(63) },
+			{ ...base, data: nested },
+			{ ...base, data: { items: Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems + 1 }, () => 1) } },
+			{ ...base, data: { command: "x".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes) } },
+			{ ...base, artifacts: [{ ...artifact, invented: true }] },
+			{ ...base, artifacts: [artifact, artifact] },
+			{ ...base, artifacts: Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs + 1 }, () => artifact) },
+		];
+		expect(() =>
+			logger.writeBatch([
+				base,
+				{ ...base, taskId: "task-invalid-in-second-batch-entry" } as unknown as AnsteelRuntimeLogInput,
+			]),
+		).toThrow();
+		expect(() => logger.writeBatch([base, { ...base, artifacts: [artifact, artifact] }])).toThrow(
+			"repeats an artifact reference",
+		);
+		for (const input of invalidInputs) {
+			expect(() => logger.write(input as unknown as AnsteelRuntimeLogInput)).toThrow();
+		}
+		expect(readAnsteelRuntimeLogs(cwd, context.runId)).toEqual([]);
+		expect(existsSync(join(cwd, ".pi", "ansteel-team", "artifacts"))).toBe(false);
+		logger.close();
+	});
+
+	it("rejects rehashed v1 envelope, correlation ID, artifact reference, and resource mutations", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-envelope-reader", command: "envelope reader" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		logger.write({
+			level: "audit",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			role: "staff-engineer",
+			sessionId: "session-1",
+			taskId: "TASK-ENVELOPE-1",
+			checkpointId: "CP-ENVELOPE-1",
+			issueId: "PI-ENVELOPE-1",
+			toolCallId: "TOOL-ENVELOPE-1",
+			providerRequestId: "PROVIDER-ENVELOPE-1",
+			processId: "PROC-ENVELOPE-1",
+			leaseId: "LEASE-ENVELOPE-1",
+			revision: 1,
+			diffHash: RUNTIME_TEST_HASH,
+			causeEventId: "EVENT-ENVELOPE-1",
+			message: "valid envelope receipt",
+			data: { exitCode: 0 },
+			artifacts: [{ kind: "stdout", content: "bounded output" }],
+		});
+		logger.close();
+		const path = join(getAnsteelRuntimeLogDirectory(cwd), `run-${context.runId}-0001.jsonl`);
+		const originalLines = readFileSync(path, "utf8").trimEnd().split("\n");
+		const original = JSON.parse(originalLines[0]!) as Record<string, unknown>;
+		const originalArtifact = (original.artifactRefs as Array<Record<string, unknown>>)[0]!;
+		let nested: Record<string, unknown> = {};
+		for (let depth = 0; depth < ANSTEEL_RUNTIME_LOG_LIMITS.maxDataDepth; depth++) nested = { child: nested };
+		const mutations: Array<(entry: Record<string, unknown>) => void> = [
+			(entry) => delete entry.timestampUtc,
+			(entry) => {
+				entry.timestampUtc = "2026-07-29T00:00:00Z";
+			},
+			(entry) => {
+				entry.monotonicElapsedNs = "01";
+			},
+			(entry) => {
+				entry.level = "notice";
+			},
+			(entry) => {
+				entry.message = "";
+			},
+			(entry) => {
+				entry.inventedEnvelopeField = true;
+			},
+			(entry) => {
+				entry.runId = "RUN-not-a-uuid";
+			},
+			(entry) => {
+				entry.traceId = "A".repeat(32);
+			},
+			(entry) => {
+				entry.spanId = "f".repeat(15);
+			},
+			(entry) => {
+				entry.parentSpanId = entry.spanId;
+			},
+			(entry) => {
+				entry.teamId = "";
+			},
+			(entry) => {
+				entry.role = "observer";
+			},
+			(entry) => {
+				entry.sessionId = "session with spaces";
+			},
+			(entry) => {
+				entry.taskId = "task-lowercase";
+			},
+			(entry) => {
+				entry.checkpointId = "CP-lowercase";
+			},
+			(entry) => {
+				entry.issueId = "PI-lowercase";
+			},
+			(entry) => {
+				entry.toolCallId = "tool with spaces";
+			},
+			(entry) => {
+				entry.providerRequestId = "REQUEST-1";
+			},
+			(entry) => {
+				entry.processId = "PID-1";
+			},
+			(entry) => {
+				entry.leaseId = "owner-1";
+			},
+			(entry) => {
+				entry.revision = Number.MAX_SAFE_INTEGER + 1;
+			},
+			(entry) => {
+				entry.diffHash = "a".repeat(63);
+			},
+			(entry) => {
+				entry.causeEventId = "c".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxIdentifierBytes + 1);
+			},
+			(entry) => {
+				entry.previousHash = "not-a-hash";
+			},
+			(entry) => {
+				entry.data = nested;
+			},
+			(entry) => {
+				entry.data = { items: Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems + 1 }, () => 1) };
+			},
+			(entry) => {
+				entry.data = { command: "x".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes) };
+			},
+			(entry) => {
+				entry.artifactRefs = [{ ...originalArtifact, kind: "" }];
+			},
+			(entry) => {
+				entry.artifactRefs = [{ ...originalArtifact, sha256: "A".repeat(64) }];
+			},
+			(entry) => {
+				entry.artifactRefs = [
+					{ ...originalArtifact, storageId: join(cwd, "outside-artifacts", String(originalArtifact.sha256)) },
+				];
+			},
+			(entry) => {
+				entry.artifactRefs = [{ ...originalArtifact, invented: true }];
+			},
+			(entry) => {
+				entry.artifactRefs = Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs + 1 }, () => ({
+					...originalArtifact,
+				}));
+			},
+		];
+		for (const mutate of mutations) {
+			const entry = structuredClone(original);
+			mutate(entry);
+			const { hash: _hash, ...unsigned } = entry;
+			entry.hash = createHash("sha256").update(JSON.stringify(unsigned), "utf8").digest("hex");
+			writeFileSync(path, `${[JSON.stringify(entry), ...originalLines.slice(1)].join("\n")}\n`, "utf8");
+			expect(() => readAnsteelRuntimeLogs(cwd, context.runId)).toThrow();
+		}
+		const invalidHash = structuredClone(original);
+		invalidHash.hash = "z".repeat(64);
+		writeFileSync(path, `${[JSON.stringify(invalidHash), ...originalLines.slice(1)].join("\n")}\n`, "utf8");
+		expect(() => readAnsteelRuntimeLogs(cwd, context.runId)).toThrow("invalid hash");
+		writeFileSync(
+			path,
+			`${[`${" ".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxEntryBytes)}${JSON.stringify(original)}`, ...originalLines.slice(1)].join("\n")}\n`,
+			"utf8",
+		);
+		expect(() => readAnsteelRuntimeLogs(cwd, context.runId)).toThrow("exceeds the byte limit");
+	});
+
+	it("accepts exact v1 message, data, array, and artifact-count boundaries", () => {
+		const cwd = createTemporaryProject();
+		const context = createAnsteelRunContext({ teamId: "team-envelope-boundary", command: "envelope boundary" });
+		const logger = createAnsteelRuntimeLogger(cwd, context);
+		const taskIds = Array.from(
+			{ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems },
+			(_, index) => `TASK-BOUNDARY-${index + 1}`,
+		);
+		const arrayBoundary = logger.write({
+			level: "audit",
+			eventName: "task.claim.parallel",
+			outcome: "succeeded",
+			message: "m".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes),
+			data: { taskIds },
+		});
+		const dataOverhead = Buffer.byteLength(
+			JSON.stringify({ configurationIdentity: "", provider: "", model: "", timeoutMs: 0 }),
+			"utf8",
+		);
+		const secondDataStringLength =
+			ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes - ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes - dataOverhead - 1;
+		const dataBoundary = logger.write({
+			level: "audit",
+			eventName: "provider.request.started",
+			outcome: "started",
+			message: "data boundary",
+			data: {
+				configurationIdentity: "x".repeat(ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes),
+				provider: "y".repeat(secondDataStringLength),
+				model: "m",
+				timeoutMs: 0,
+			},
+		});
+		const artifactBoundary = logger.write({
+			level: "audit",
+			eventName: "tool.call.completed",
+			outcome: "succeeded",
+			message: "artifact boundary",
+			data: { exitCode: 0 },
+			artifacts: Array.from({ length: ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs }, (_, index) => ({
+				kind: `output-${index + 1}`,
+				content: `artifact-${index + 1}`,
+			})),
+		});
+		logger.close();
+		expect(Buffer.byteLength(JSON.stringify(dataBoundary.data), "utf8")).toBe(
+			ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes,
+		);
+		expect(arrayBoundary.data.taskIds).toHaveLength(ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems);
+		expect(artifactBoundary.artifactRefs).toHaveLength(ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs);
+		expect(readAnsteelRuntimeLogs(cwd, context.runId).length).toBeGreaterThan(3);
 	});
 
 	it("rejects unknown versioned events and invalid event-outcome combinations before writing", () => {
@@ -1417,7 +1673,7 @@ describe("Ansteel team observability", () => {
 			eventName: "run.completed",
 			outcome: "succeeded",
 			spanId: root.spanId,
-			parentSpanId: "forged-child-parent",
+			parentSpanId: "f".repeat(16),
 			role: "coordinator",
 			message: "forged non-root terminal",
 			data: { command: context.command },

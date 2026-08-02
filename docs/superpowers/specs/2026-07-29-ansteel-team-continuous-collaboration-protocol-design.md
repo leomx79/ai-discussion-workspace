@@ -700,7 +700,7 @@ data 和 artifact；只有确实发现并替换敏感内容时，才在同一批
 span 产生 `tool-policy-denied` 和 `security.access-denied`。每个隔离角色 stage 的真实 reset 记录
 `budget.reserved`；允许的只读工具 preflight 逐次记录 `budget.consumed`；首个超限请求在执行前记录
 `budget.exhausted/budget-exhausted`。三类记录保留角色 span、工具调用身份与机械计数，但不保存原始工具参数。
-当前定向证据为可观测性 52/52、核心与进程 runner 118/118、扩展 55/55 和 CLI/RPC 18/18，共 243/243；
+当前定向证据为可观测性 59/59、核心与进程 runner 118/118、扩展 55/55 和 CLI/RPC 18/18，共 250/250；
 该证据还覆盖真实 AgentSession retry、provider 输出长度截断、受控任务进程 heartbeat 派生的工具进展，以及
 损坏目标链的独立 incident 记录。它证明真实宿主退出后的跨进程 trace、run writer lease、内容 artifact、
 Security 和隔离 stage 只读预算基础连续性，不外推为存活子进程的安全重接管或其他预算类型已实现。
@@ -794,7 +794,10 @@ provider 输出以 `stopReason: length` 结束时写 `role.session.truncated/fai
 和父子 span。incident 读取损坏目标链时，在显式隔离诊断 run 中写 `event.chain.invalid`；该 run 自身保持哈希链和
 fsync，但绝不重建或替换不可验证的受信索引，普通 writer 仍失败关闭。17.5 的 37/37 产品事件接线已完成，
 但进程事件尚未携带所有动作执行前后文件哈希，provider token/首 token/HTTP 状态仍受底层权威回调限制，
-每事件完整 data schema、轮转与保留也未完成，因此第 17 章整体仍为部分实现。
+当前工作树又完成 `eventCatalogVersion: 1` 的完整 entry envelope 与每事件 data schema：writer 在任何 artifact I/O
+前对整批输入、脱敏结果、顶层字段、关联 ID、内容寻址引用及固定资源上限失败关闭，reader 对重哈希后的 v1
+记录执行同一校验；无目录版本的旧 schema-v1 记录继续只读兼容。日志轮转、保留、磁盘预算和截断恢复仍未
+完成，因此第 17 章整体仍为部分实现。
 
 ### 17.6 状态转换日志
 
@@ -981,7 +984,7 @@ PID 明确返回 `ESRCH` 时，重启宿主才会提前移除 proper-lockfile �
 
 | 步骤 | 原迁移内容 | 实现状态 | 当前证据与边界 |
 |---|---|---|---|
-| 1 | 先定义统一关联 ID、稳定原因码、结构化日志 writer、内容寻址产物和只读 `trace/doctor` 查询。 | 已实现，17.3 跨进程与 17.5 全部 37 个事件已机械接线 | `ansteel-team-observability.ts` 已提供关联 ID、稳定原因码、结构化 JSONL、内容寻址产物及 `trace/doctor`；提交 `76c3918` 增加成功恢复审计和可校验 `run-index.json`。当前工作树进一步实现恢复运行的新 `runId`/原 `traceId`、精确恢复点和根环境指纹，密钥值不参与指纹或日志。task、milestone 和 delivery 已共享受控异步 process runner；真实 RPC 任务路径验证 `tool.call -> process.spawned -> process.heartbeat + tool.call.progress -> process.exited`。runtime run writer 精确产生四个 lease 事件，真实 RPC 宿主强杀探针证明原 lease expired、恢复方新 lease 归档开放 span 并真实释放。artifact writer 把源事件与非自引用的 `artifact.stored` 放在同一日志 fsync batch；重复内容和 doctor/incident 校验只有在磁盘 SHA-256 真实匹配后写 verified，缺失或不匹配写 missing/failed。Security writer 在持久化前返回不含值/路径/哈希的计数摘要，同批派生 secret-detected/redaction-applied；真实 RPC 角色读取协调器私有状态被 `beforeToolCall` 阻断，并产生带 tool cause hash 的 access-denied。Security 事件自身携密或附 artifact 时，整个 batch 在任何 artifact I/O 前失败关闭。隔离 stage reset 和只读工具 preflight 精确产生 reserved/consumed/exhausted，真实 RPC 的 5-read 夹具证明第 5 次请求在执行前耗尽且不派生 Security 事件。AgentSession retry、provider 长度截断和损坏链 incident 又补齐 provider retry、role truncated 与独立 chain-invalid 事实。incident schema v2 进一步机械聚合任务/revision、公共审计区间、span 树、脱敏配置摘要、完整性、工作区、最后合法检查点和恢复入口；上下文不可验证时显式标记 unavailable。当前定向回归为可观测性 52/52、核心与进程 runner 118/118、扩展 55/55、CLI/RPC 18/18，共 243/243。仍未实现内部 index 锁与任务/文件租约事件、其他预算类型、日志轮转、保留自动化和存活/PID 复用进程的安全重接管。 |
+| 1 | 先定义统一关联 ID、稳定原因码、结构化日志 writer、内容寻址产物和只读 `trace/doctor` 查询。 | 已实现，17.3 跨进程与 17.5 全部 37 个事件已机械接线 | `ansteel-team-observability.ts` 已提供关联 ID、稳定原因码、结构化 JSONL、内容寻址产物及 `trace/doctor`；提交 `76c3918` 增加成功恢复审计和可校验 `run-index.json`。当前工作树进一步实现恢复运行的新 `runId`/原 `traceId`、精确恢复点和根环境指纹，密钥值不参与指纹或日志。task、milestone 和 delivery 已共享受控异步 process runner；真实 RPC 任务路径验证 `tool.call -> process.spawned -> process.heartbeat + tool.call.progress -> process.exited`。runtime run writer 精确产生四个 lease 事件，真实 RPC 宿主强杀探针证明原 lease expired、恢复方新 lease 归档开放 span 并真实释放。artifact writer 把源事件与非自引用的 `artifact.stored` 放在同一日志 fsync batch；重复内容和 doctor/incident 校验只有在磁盘 SHA-256 真实匹配后写 verified，缺失或不匹配写 missing/failed。Security writer 在持久化前返回不含值/路径/哈希的计数摘要，同批派生 secret-detected/redaction-applied；真实 RPC 角色读取协调器私有状态被 `beforeToolCall` 阻断，并产生带 tool cause hash 的 access-denied。Security 事件自身携密或附 artifact 时，整个 batch 在任何 artifact I/O 前失败关闭。隔离 stage reset 和只读工具 preflight 精确产生 reserved/consumed/exhausted，真实 RPC 的 5-read 夹具证明第 5 次请求在执行前耗尽且不派生 Security 事件。AgentSession retry、provider 长度截断和损坏链 incident 又补齐 provider retry、role truncated 与独立 chain-invalid 事实。incident schema v2 进一步机械聚合任务/revision、公共审计区间、span 树、脱敏配置摘要、完整性、工作区、最后合法检查点和恢复入口；上下文不可验证时显式标记 unavailable。v1 entry envelope 与逐事件 data schema 现已同时限制顶层字段、关联 ID、artifact namespace、时间/哈希格式及固定大小/深度/数组上限，并在整批 artifact I/O 前和 reader 重哈希变形中失败关闭。当前定向回归为可观测性 59/59、核心与进程 runner 118/118、扩展 55/55、CLI/RPC 18/18，共 250/250。仍未实现内部 index 锁与任务/文件租约事件、其他预算类型、日志轮转、保留自动化和存活/PID 复用进程的安全重接管。 |
 | 2 | 扩展当前 `events.jsonl` 为版本化公共协作事件协议，并增加严格重放验证。 | 已实现 | `ansteel-team.ts` 的版本化公共事件、哈希链、状态投影和严格重放已有确定性测试，新增 `action-assessed`、`action-review`、`runtime-recovery` 也进入同一校验路径。证据限于当前单协调器、本地持久化边界。 |
 | 3 | 引入共享工作板投影和公开工作检查点，不改变现有最终交付门禁。 | 已实现 | `ansteel-team.ts` 与扩展已从持久事件机械投影工作板，公开检查点、问题、解决和复核均有状态重放测试；任务与里程碑的最终双同伴评审仍保留，没有被动作确认替代。 |
 | 4 | 给三个持久角色增加检查点、质疑、解决、决定和租约转交工具。 | 已实现，限当前任务所有权模型 | 三个持久角色均可使用检查点、问题、解决、复核和动作确认工具；任务 owner、精确文件 claim、依赖释放和恢复策略由协调器校验。当前“租约转交”仅指协调器分配、不可重叠文件 claim 和受配置约束的 owner 恢复；第 7 步增加了类型化批量分配，但仍不代表任意角色间动态转让。 |

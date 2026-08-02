@@ -17,7 +17,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { arch, platform, release } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { type Span as OpenTelemetrySpan, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import {
@@ -46,6 +46,25 @@ const ANSTEEL_RUNTIME_GIT_TIMEOUT_MS = 5_000;
 const ANSTEEL_RUNTIME_DIAGNOSTIC_COMMAND = /^(?:board|status|trace|doctor|incident)(?:\s|$)/;
 const ANSTEEL_RUNTIME_LOCK_OWNER_SCHEMA_VERSION = 1;
 export const ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION = 1 as const;
+
+/**
+ * v1 runtime entry 的资源边界属于持久化协议，而不是调用方提示。固定上限使 writer/reader 对同一条记录
+ * 得出一致结论，并在递归脱敏、JSON 解析后处理或 artifact I/O 前拒绝异常放大输入。
+ */
+export const ANSTEEL_RUNTIME_LOG_LIMITS = {
+	maxEntryBytes: 256 * 1024,
+	maxMessageBytes: 8 * 1024,
+	maxDataBytes: 128 * 1024,
+	maxDataDepth: 12,
+	maxArrayItems: 128,
+	maxObjectProperties: 128,
+	maxStringBytes: 64 * 1024,
+	maxObjectKeyBytes: 256,
+	maxArtifactRefs: 16,
+	maxArtifactKindBytes: 128,
+	maxStorageIdBytes: 4 * 1024,
+	maxIdentifierBytes: 512,
+} as const;
 
 interface AnsteelRuntimeLockOwner {
 	schemaVersion: typeof ANSTEEL_RUNTIME_LOCK_OWNER_SCHEMA_VERSION;
@@ -1756,23 +1775,35 @@ interface AnsteelStoredArtifact {
 	contentByteLength: number;
 }
 
+interface AnsteelPreparedArtifact {
+	ref: AnsteelRuntimeArtifactRef;
+	content: string;
+	contentByteLength: number;
+}
+
 interface AnsteelArtifactInspection {
 	verificationResult: "verified" | "missing" | "hash-mismatch" | "unreadable";
 	actualHash?: string;
 }
 
-function storeArtifact(cwd: string, artifact: { kind: string; content: string }): AnsteelStoredArtifact {
+function prepareArtifact(cwd: string, artifact: { kind: string; content: string }): AnsteelPreparedArtifact {
 	const content = redactAnsteelSensitiveText(artifact.content);
 	const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
-	const directory = getAnsteelRuntimeArtifactDirectory(cwd);
+	const storageId = expectedRuntimeArtifactStorageId(cwd, sha256);
+	const ref = { kind: artifact.kind, sha256, storageId };
+	assertRuntimeArtifactRef(ref, cwd);
+	return { ref, content, contentByteLength: Buffer.byteLength(content, "utf8") };
+}
+
+function storeArtifact(artifact: AnsteelPreparedArtifact): AnsteelStoredArtifact {
+	const directory = dirname(artifact.ref.storageId);
 	mkdirSync(directory, { recursive: true });
-	const storageId = join(directory, sha256);
 	let storageResult: AnsteelStoredArtifact["storageResult"];
-	if (!existsSync(storageId)) {
-		writeNewDurableFile(storageId, content);
+	if (!existsSync(artifact.ref.storageId)) {
+		writeNewDurableFile(artifact.ref.storageId, artifact.content);
 		storageResult = "created";
 	} else {
-		const inspection = inspectAnsteelRuntimeArtifact({ kind: artifact.kind, sha256, storageId });
+		const inspection = inspectAnsteelRuntimeArtifact(artifact.ref);
 		if (inspection.verificationResult !== "verified") {
 			throw new AnsteelObservabilityError(
 				"artifact-missing",
@@ -1782,9 +1813,9 @@ function storeArtifact(cwd: string, artifact: { kind: string; content: string })
 		storageResult = "deduplicated-and-verified";
 	}
 	return {
-		ref: { kind: artifact.kind, sha256, storageId },
+		ref: artifact.ref,
 		storageResult,
-		contentByteLength: Buffer.byteLength(content, "utf8"),
+		contentByteLength: artifact.contentByteLength,
 	};
 }
 
@@ -1804,6 +1835,448 @@ function hashRuntimeLogEntry(entry: Omit<AnsteelRuntimeLogEntry, "hash">): strin
 	return createHash("sha256").update(JSON.stringify(entry), "utf8").digest("hex");
 }
 
+const ANSTEEL_RUNTIME_ENTRY_KEYS = new Set([
+	"schemaVersion",
+	"eventCatalogVersion",
+	"timestampUtc",
+	"monotonicElapsedNs",
+	"sequence",
+	"level",
+	"eventName",
+	"outcome",
+	"reasonCode",
+	"runId",
+	"traceId",
+	"spanId",
+	"parentSpanId",
+	"teamId",
+	"role",
+	"sessionId",
+	"taskId",
+	"checkpointId",
+	"issueId",
+	"toolCallId",
+	"providerRequestId",
+	"processId",
+	"leaseId",
+	"revision",
+	"diffHash",
+	"causeEventId",
+	"message",
+	"data",
+	"artifactRefs",
+	"previousHash",
+	"hash",
+]);
+
+const ANSTEEL_RUNTIME_INPUT_KEYS = new Set([
+	"level",
+	"eventName",
+	"outcome",
+	"reasonCode",
+	"parentSpanId",
+	"role",
+	"sessionId",
+	"taskId",
+	"checkpointId",
+	"issueId",
+	"toolCallId",
+	"providerRequestId",
+	"processId",
+	"leaseId",
+	"revision",
+	"diffHash",
+	"causeEventId",
+	"spanId",
+	"message",
+	"data",
+	"artifacts",
+]);
+
+const ANSTEEL_RUNTIME_LEVELS = new Set(["debug", "info", "warn", "error", "audit"]);
+const ANSTEEL_RUNTIME_ROLES = new Set(["tech-lead", "staff-engineer", "qa-engineer", "coordinator"]);
+const ANSTEEL_RUNTIME_SHA256 = /^[0-9a-f]{64}$/;
+const ANSTEEL_RUNTIME_RUN_ID = /^RUN-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
+const ANSTEEL_RUNTIME_TRACE_ID = /^[0-9a-f]{32}$/;
+const ANSTEEL_RUNTIME_SPAN_ID = /^[0-9a-f]{16}$/;
+const ANSTEEL_RUNTIME_OPAQUE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]*[A-Za-z0-9])?$/;
+
+function runtimeByteLength(value: string): number {
+	return Buffer.byteLength(value, "utf8");
+}
+
+function assertRuntimeExactKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>, subject: string): void {
+	const unknown = Object.keys(value).find((key) => !allowed.has(key));
+	if (unknown !== undefined) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime ${subject} contains unknown field ${unknown}`,
+		);
+	}
+}
+
+function assertRuntimeCanonicalUtc(value: unknown, field: string): asserts value is string {
+	if (typeof value !== "string" || Number.isNaN(Date.parse(value)) || new Date(value).toISOString() !== value) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime log entry field ${field} must be a canonical UTC timestamp`,
+		);
+	}
+}
+
+function assertRuntimeBoundedText(value: unknown, field: string, maximumBytes: number): asserts value is string {
+	if (
+		typeof value !== "string" ||
+		value.trim().length === 0 ||
+		value !== value.trim() ||
+		/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value) ||
+		runtimeByteLength(value) > maximumBytes
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime log entry field ${field} is not a bounded non-empty string`,
+		);
+	}
+}
+
+function assertRuntimeIdentifier(
+	value: unknown,
+	field: string,
+	pattern: RegExp = ANSTEEL_RUNTIME_OPAQUE_ID,
+): asserts value is string {
+	assertRuntimeBoundedText(value, field, ANSTEEL_RUNTIME_LOG_LIMITS.maxIdentifierBytes);
+	if (!pattern.test(value)) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			`Ansteel runtime log entry field ${field} has an invalid identifier format`,
+		);
+	}
+}
+
+function assertRuntimeJsonResources(value: unknown, field: string, depth = 1, ancestors = new Set<object>()): void {
+	if (depth > ANSTEEL_RUNTIME_LOG_LIMITS.maxDataDepth) {
+		throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime ${field} exceeds the depth limit`);
+	}
+	if (value === null || typeof value === "boolean") return;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime ${field} contains a non-finite number`,
+			);
+		}
+		return;
+	}
+	if (typeof value === "string") {
+		if (runtimeByteLength(value) > ANSTEEL_RUNTIME_LOG_LIMITS.maxStringBytes) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime ${field} contains an oversized string`,
+			);
+		}
+		return;
+	}
+	if (typeof value !== "object") {
+		throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime ${field} is not JSON-compatible`);
+	}
+	if (ancestors.has(value)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime ${field} contains a cycle`);
+	}
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > ANSTEEL_RUNTIME_LOG_LIMITS.maxArrayItems) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					`Ansteel runtime ${field} exceeds the array limit`,
+				);
+			}
+			for (let index = 0; index < value.length; index++) {
+				assertRuntimeJsonResources(value[index], `${field}[${index}]`, depth + 1, ancestors);
+			}
+			return;
+		}
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) {
+			throw new AnsteelObservabilityError("event-chain-invalid", `Ansteel runtime ${field} must use plain objects`);
+		}
+		const entries = Object.entries(value as Record<string, unknown>);
+		if (entries.length > ANSTEEL_RUNTIME_LOG_LIMITS.maxObjectProperties) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				`Ansteel runtime ${field} exceeds the object-field limit`,
+			);
+		}
+		for (const [key, child] of entries) {
+			if (key.length === 0 || runtimeByteLength(key) > ANSTEEL_RUNTIME_LOG_LIMITS.maxObjectKeyBytes) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					`Ansteel runtime ${field} contains an invalid key`,
+				);
+			}
+			assertRuntimeJsonResources(child, `${field}.${key}`, depth + 1, ancestors);
+		}
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
+function assertRuntimeDataResources(data: unknown): asserts data is Record<string, unknown> {
+	if (typeof data !== "object" || data === null || Array.isArray(data)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry data must be an object");
+	}
+	assertRuntimeJsonResources(data, "log entry data");
+	const serialized = JSON.stringify(data);
+	if (runtimeByteLength(serialized) > ANSTEEL_RUNTIME_LOG_LIMITS.maxDataBytes) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime log entry data exceeds the byte limit",
+		);
+	}
+}
+
+function expectedRuntimeArtifactStorageId(cwd: string, sha256: string): string {
+	return join(getAnsteelRuntimeArtifactDirectory(cwd), sha256);
+}
+
+function assertRuntimeArtifactRef(value: unknown, cwd: string): asserts value is AnsteelRuntimeArtifactRef {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact reference must be an object",
+		);
+	}
+	const artifact = value as Record<string, unknown>;
+	assertRuntimeExactKeys(artifact, new Set(["kind", "sha256", "storageId"]), "artifact reference");
+	assertRuntimeBoundedText(artifact.kind, "artifactRefs.kind", ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactKindBytes);
+	if (typeof artifact.sha256 !== "string" || !ANSTEEL_RUNTIME_SHA256.test(artifact.sha256)) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact reference has an invalid SHA-256",
+		);
+	}
+	if (
+		typeof artifact.storageId !== "string" ||
+		!isAbsolute(artifact.storageId) ||
+		runtimeByteLength(artifact.storageId) > ANSTEEL_RUNTIME_LOG_LIMITS.maxStorageIdBytes ||
+		basename(artifact.storageId) !== artifact.sha256
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact reference has an invalid storage ID",
+		);
+	}
+	const actual = normalize(resolve(artifact.storageId));
+	const expected = normalize(expectedRuntimeArtifactStorageId(cwd, artifact.sha256));
+	if (
+		(platform() === "win32" ? actual.toLowerCase() : actual) !==
+		(platform() === "win32" ? expected.toLowerCase() : expected)
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime artifact reference escapes the content-addressed storage namespace",
+		);
+	}
+}
+
+function assertAnsteelRuntimeEntryEnvelope(value: unknown, cwd: string): asserts value is AnsteelRuntimeLogEntry {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry must be an object");
+	}
+	const entry = value as Record<string, unknown>;
+	assertRuntimeExactKeys(entry, ANSTEEL_RUNTIME_ENTRY_KEYS, "log entry");
+	if (entry.schemaVersion !== 1 || entry.eventCatalogVersion !== ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime log entry has invalid schema metadata",
+		);
+	}
+	assertRuntimeCanonicalUtc(entry.timestampUtc, "timestampUtc");
+	if (typeof entry.monotonicElapsedNs !== "string" || !/^(?:0|[1-9][0-9]{0,19})$/.test(entry.monotonicElapsedNs)) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime log entry has an invalid monotonic clock",
+		);
+	}
+	if (!Number.isSafeInteger(entry.sequence) || (entry.sequence as number) < 1) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid sequence");
+	}
+	if (typeof entry.level !== "string" || !ANSTEEL_RUNTIME_LEVELS.has(entry.level)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid level");
+	}
+	assertRuntimeIdentifier(entry.runId, "runId", ANSTEEL_RUNTIME_RUN_ID);
+	assertRuntimeIdentifier(entry.traceId, "traceId", ANSTEEL_RUNTIME_TRACE_ID);
+	assertRuntimeIdentifier(entry.spanId, "spanId", ANSTEEL_RUNTIME_SPAN_ID);
+	if (entry.parentSpanId !== undefined) {
+		assertRuntimeIdentifier(entry.parentSpanId, "parentSpanId", ANSTEEL_RUNTIME_SPAN_ID);
+		if (entry.parentSpanId === entry.spanId) {
+			throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime span cannot parent itself");
+		}
+	}
+	assertRuntimeBoundedText(entry.teamId, "teamId", ANSTEEL_RUNTIME_LOG_LIMITS.maxIdentifierBytes);
+	if (entry.role !== undefined && (typeof entry.role !== "string" || !ANSTEEL_RUNTIME_ROLES.has(entry.role))) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid role");
+	}
+	if (entry.sessionId !== undefined) assertRuntimeIdentifier(entry.sessionId, "sessionId");
+	if (entry.taskId !== undefined) {
+		assertRuntimeIdentifier(entry.taskId, "taskId", /^TASK-[A-Z0-9]+(?:-[A-Z0-9]+)*$/);
+	}
+	if (entry.checkpointId !== undefined) {
+		assertRuntimeIdentifier(entry.checkpointId, "checkpointId", /^(?:CP|MILESTONE)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/);
+	}
+	if (entry.issueId !== undefined) {
+		assertRuntimeIdentifier(entry.issueId, "issueId", /^(?:PI|ISSUE)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/);
+	}
+	if (entry.toolCallId !== undefined) assertRuntimeIdentifier(entry.toolCallId, "toolCallId");
+	if (entry.providerRequestId !== undefined) {
+		assertRuntimeIdentifier(
+			entry.providerRequestId,
+			"providerRequestId",
+			/^PROVIDER-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/,
+		);
+	}
+	if (entry.processId !== undefined) {
+		assertRuntimeIdentifier(entry.processId, "processId", /^(?:PROC|PROCESS)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/);
+	}
+	if (entry.leaseId !== undefined) {
+		assertRuntimeIdentifier(
+			entry.leaseId,
+			"leaseId",
+			/^(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|LEASE-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)$/,
+		);
+	}
+	if (entry.revision !== undefined && (!Number.isSafeInteger(entry.revision) || (entry.revision as number) < 0)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid revision");
+	}
+	if (
+		entry.diffHash !== undefined &&
+		(typeof entry.diffHash !== "string" || !ANSTEEL_RUNTIME_SHA256.test(entry.diffHash))
+	) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid diff hash");
+	}
+	if (entry.causeEventId !== undefined) {
+		assertRuntimeBoundedText(entry.causeEventId, "causeEventId", ANSTEEL_RUNTIME_LOG_LIMITS.maxIdentifierBytes);
+	}
+	assertRuntimeBoundedText(entry.message, "message", ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes);
+	assertRuntimeDataResources(entry.data);
+	if (!Array.isArray(entry.artifactRefs) || entry.artifactRefs.length > ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime log entry has invalid artifact references",
+		);
+	}
+	const artifactKeys = new Set<string>();
+	for (const artifact of entry.artifactRefs) {
+		assertRuntimeArtifactRef(artifact, cwd);
+		const key = `${artifact.kind}:${artifact.sha256}`;
+		if (artifactKeys.has(key)) {
+			throw new AnsteelObservabilityError(
+				"event-chain-invalid",
+				"Ansteel runtime log entry repeats an artifact reference",
+			);
+		}
+		artifactKeys.add(key);
+	}
+	if (
+		entry.previousHash !== null &&
+		(typeof entry.previousHash !== "string" || !ANSTEEL_RUNTIME_SHA256.test(entry.previousHash))
+	) {
+		throw new AnsteelObservabilityError(
+			"event-chain-invalid",
+			"Ansteel runtime log entry has an invalid previous hash",
+		);
+	}
+	if (typeof entry.hash !== "string" || !ANSTEEL_RUNTIME_SHA256.test(entry.hash)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry has an invalid hash");
+	}
+	const serialized = JSON.stringify(entry);
+	if (runtimeByteLength(serialized) > ANSTEEL_RUNTIME_LOG_LIMITS.maxEntryBytes) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry exceeds the byte limit");
+	}
+}
+
+function assertAnsteelRuntimeInputEnvelope(input: AnsteelRuntimeLogInput): void {
+	const record = input as unknown as Record<string, unknown>;
+	assertRuntimeExactKeys(record, ANSTEEL_RUNTIME_INPUT_KEYS, "log input");
+	if (typeof input.level !== "string" || !ANSTEEL_RUNTIME_LEVELS.has(input.level)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log input has an invalid level");
+	}
+	assertRuntimeBoundedText(input.message, "message", ANSTEEL_RUNTIME_LOG_LIMITS.maxMessageBytes);
+	assertRuntimeDataResources(input.data);
+	if (input.spanId !== undefined) assertRuntimeIdentifier(input.spanId, "spanId", ANSTEEL_RUNTIME_SPAN_ID);
+	if (input.parentSpanId !== undefined) {
+		assertRuntimeIdentifier(input.parentSpanId, "parentSpanId", ANSTEEL_RUNTIME_SPAN_ID);
+		if (input.parentSpanId === input.spanId) {
+			throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime span cannot parent itself");
+		}
+	}
+	if (input.role !== undefined && !ANSTEEL_RUNTIME_ROLES.has(input.role)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log input has an invalid role");
+	}
+	if (input.sessionId !== undefined) assertRuntimeIdentifier(input.sessionId, "sessionId");
+	if (input.taskId !== undefined) {
+		assertRuntimeIdentifier(input.taskId, "taskId", /^TASK-[A-Z0-9]+(?:-[A-Z0-9]+)*$/);
+	}
+	if (input.checkpointId !== undefined) {
+		assertRuntimeIdentifier(input.checkpointId, "checkpointId", /^(?:CP|MILESTONE)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/);
+	}
+	if (input.issueId !== undefined) {
+		assertRuntimeIdentifier(input.issueId, "issueId", /^(?:PI|ISSUE)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/);
+	}
+	if (input.toolCallId !== undefined) assertRuntimeIdentifier(input.toolCallId, "toolCallId");
+	if (input.providerRequestId !== undefined) {
+		assertRuntimeIdentifier(
+			input.providerRequestId,
+			"providerRequestId",
+			/^PROVIDER-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/,
+		);
+	}
+	if (input.processId !== undefined) {
+		assertRuntimeIdentifier(input.processId, "processId", /^(?:PROC|PROCESS)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/);
+	}
+	if (input.leaseId !== undefined) {
+		assertRuntimeIdentifier(
+			input.leaseId,
+			"leaseId",
+			/^(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|LEASE-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)$/,
+		);
+	}
+	if (input.revision !== undefined && (!Number.isSafeInteger(input.revision) || input.revision < 0)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log input has an invalid revision");
+	}
+	if (input.diffHash !== undefined && !ANSTEEL_RUNTIME_SHA256.test(input.diffHash)) {
+		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log input has an invalid diff hash");
+	}
+	if (input.causeEventId !== undefined) {
+		assertRuntimeBoundedText(input.causeEventId, "causeEventId", ANSTEEL_RUNTIME_LOG_LIMITS.maxIdentifierBytes);
+	}
+	if (input.artifacts !== undefined) {
+		if (!Array.isArray(input.artifacts) || input.artifacts.length > ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactRefs) {
+			throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log input has invalid artifacts");
+		}
+		for (const artifact of input.artifacts) {
+			if (typeof artifact !== "object" || artifact === null || Array.isArray(artifact)) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					"Ansteel runtime artifact input must be an object",
+				);
+			}
+			assertRuntimeExactKeys(
+				artifact as unknown as Record<string, unknown>,
+				new Set(["kind", "content"]),
+				"artifact input",
+			);
+			assertRuntimeBoundedText(artifact.kind, "artifacts.kind", ANSTEEL_RUNTIME_LOG_LIMITS.maxArtifactKindBytes);
+			if (typeof artifact.content !== "string") {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					"Ansteel runtime artifact content must be a string",
+				);
+			}
+		}
+	}
+}
+
 function assertAnsteelRuntimeEventCombination(eventName: unknown, outcome: unknown): asserts eventName is string {
 	if (
 		typeof eventName !== "string" ||
@@ -1817,7 +2290,7 @@ function assertAnsteelRuntimeEventCombination(eventName: unknown, outcome: unkno
 	}
 }
 
-function parseRuntimeLogEntry(value: unknown): AnsteelRuntimeLogEntry {
+function parseRuntimeLogEntry(value: unknown, cwd: string): AnsteelRuntimeLogEntry {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log entry must be an object");
 	}
@@ -1835,6 +2308,7 @@ function parseRuntimeLogEntry(value: unknown): AnsteelRuntimeLogEntry {
 	if (catalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION) {
 		assertAnsteelRuntimeEventCombination(entry.eventName, entry.outcome);
 		assertAnsteelRuntimeEventData(entry.eventName, entry.outcome, entry.data);
+		assertAnsteelRuntimeEntryEnvelope(value, cwd);
 	}
 	if (
 		typeof entry.runId !== "string" ||
@@ -1882,7 +2356,18 @@ export function readAnsteelRuntimeLogs(cwd: string, runId: string): AnsteelRunti
 					cause: error,
 				});
 			}
-			const entry = parseRuntimeLogEntry(raw);
+			if (
+				typeof raw === "object" &&
+				raw !== null &&
+				(raw as Record<string, unknown>).eventCatalogVersion === ANSTEEL_RUNTIME_EVENT_CATALOG_VERSION &&
+				runtimeByteLength(line) > ANSTEEL_RUNTIME_LOG_LIMITS.maxEntryBytes
+			) {
+				throw new AnsteelObservabilityError(
+					"event-chain-invalid",
+					"Ansteel runtime log entry exceeds the byte limit",
+				);
+			}
+			const entry = parseRuntimeLogEntry(raw, cwd);
 			if (entry.runId !== runId || entry.sequence !== entries.length + 1 || entry.previousHash !== previousHash) {
 				throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime log chain is not contiguous");
 			}
@@ -2196,6 +2681,7 @@ function startRuntimeIndexRebuildAudit(
 	};
 	assertAnsteelRuntimeEventData(unsigned.eventName, unsigned.outcome, unsigned.data);
 	const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+	assertAnsteelRuntimeEntryEnvelope(entry, cwd);
 	mkdirSync(getAnsteelRuntimeLogDirectory(cwd), { recursive: true });
 	try {
 		writeNewDurableFile(getAnsteelRuntimeLogPath(cwd, runId), `${JSON.stringify(entry)}\n`);
@@ -2240,6 +2726,7 @@ function completeRuntimeIndexRebuildAudit(
 	};
 	assertAnsteelRuntimeEventData(unsigned.eventName, unsigned.outcome, unsigned.data);
 	const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+	assertAnsteelRuntimeEntryEnvelope(entry, cwd);
 	const path = getAnsteelRuntimeLogPath(cwd, audit.runId);
 	let fd: number | undefined;
 	try {
@@ -3890,6 +4377,7 @@ export function createAnsteelRuntimeLogger(
 			};
 		}
 		const validateInputMetadata = (input: AnsteelRuntimeLogInput): void => {
+			assertAnsteelRuntimeInputEnvelope(input);
 			assertAnsteelRuntimeEventCombination(input.eventName, input.outcome);
 			if (input.reasonCode !== undefined && !isAnsteelRuntimeReasonCode(input.reasonCode)) {
 				throw new AnsteelObservabilityError("event-chain-invalid", "Ansteel runtime reason code is invalid");
@@ -3945,6 +4433,7 @@ export function createAnsteelRuntimeLogger(
 		const preparedInputs = inputs.map((input) => {
 			validateInputMetadata(input);
 			const prepared = prepareInput(input);
+			assertAnsteelRuntimeInputEnvelope(prepared.input);
 			if (input.eventName.startsWith("security.") && prepared.security.findingCount > 0) {
 				throw new AnsteelObservabilityError(
 					"event-chain-invalid",
@@ -3977,6 +4466,7 @@ export function createAnsteelRuntimeLogger(
 				previousHash: nextPreviousHash,
 			};
 			const entry: AnsteelRuntimeLogEntry = { ...unsigned, hash: hashRuntimeLogEntry(unsigned) };
+			assertAnsteelRuntimeEntryEnvelope(entry, cwd);
 			nextSequence++;
 			nextPreviousHash = entry.hash;
 			persistedEntries.push(entry);
@@ -4064,15 +4554,21 @@ export function createAnsteelRuntimeLogger(
 				[],
 			);
 		};
-		for (const prepared of preparedInputs) {
+		const preparedEntryBatches = preparedInputs.map((prepared) => {
 			const { input, security } = prepared;
-			const storedArtifacts = (input.artifacts ?? []).map((artifact) => storeArtifact(cwd, artifact));
+			const preparedArtifacts = (input.artifacts ?? []).map((artifact) => prepareArtifact(cwd, artifact));
 			const source = appendEntry(
 				input,
-				storedArtifacts.map((artifact) => artifact.ref),
+				preparedArtifacts.map((artifact) => artifact.ref),
 			);
 			sourceEntries.push(source);
 			appendSecurityEvents(source, security);
+			return { source, preparedArtifacts };
+		});
+		// 先只在内存中为整批生成内容寻址引用并构造完整 source/security entries；即使后续输入的
+		// 引用重复或 entry 超限，writer 也尚未创建 artifact 目录或文件。整批通过后才执行 artifact I/O。
+		for (const { source, preparedArtifacts } of preparedEntryBatches) {
+			const storedArtifacts = preparedArtifacts.map((artifact) => storeArtifact(artifact));
 			for (const artifact of storedArtifacts) {
 				const stored = artifact.storageResult === "created";
 				appendEntry(

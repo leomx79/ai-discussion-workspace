@@ -34,6 +34,6 @@ jobs:
           cache-dependency-path: pi-agent/package-lock.json
       - run: npm ci --ignore-scripts
       - run: npm run build
-      - run: node packages/coding-agent/node_modules/vitest/vitest.mjs --run --no-file-parallelism packages/coding-agent/test/ansteel-discussion.test.ts packages/coding-agent/test/ansteel-adaptive-budget.test.ts packages/coding-agent/test/ansteel-cli.test.ts packages/coding-agent/test/ansteel-team.test.ts packages/coding-agent/test/ansteel-team-cli.test.ts packages/coding-agent/test/ansteel-team-extension.test.ts
+      - run: node packages/coding-agent/node_modules/vitest/vitest.mjs --run --no-file-parallelism packages/coding-agent/test/ansteel-discussion.test.ts packages/coding-agent/test/ansteel-adaptive-budget.test.ts packages/coding-agent/test/ansteel-cli.test.ts packages/coding-agent/test/ansteel-team.test.ts packages/coding-agent/test/ansteel-team-process.test.ts packages/coding-agent/test/ansteel-team-observability.test.ts packages/coding-agent/test/ansteel-team-cli.test.ts packages/coding-agent/test/ansteel-team-extension.test.ts
       - run: node_modules/.bin/tsgo --noEmit -p packages/coding-agent/tsconfig.build.json
       - run: git diff --check

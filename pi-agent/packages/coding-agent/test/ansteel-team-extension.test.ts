@@ -1075,7 +1075,7 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 			eventName: "run.completed",
 			outcome: "succeeded",
 			spanId: root.spanId,
-			parentSpanId: "forged-child-parent",
+			parentSpanId: "f".repeat(16),
 			role: "coordinator",
 			taskId: "TASK-BOARD-FORGED-ROOT-1",
 			message: "forged non-root terminal",
