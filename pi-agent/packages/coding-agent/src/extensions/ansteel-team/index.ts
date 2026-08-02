@@ -1322,7 +1322,10 @@ function buildActionReviewPrompt(checkpoint: AnsteelWorkCheckpoint): string {
 		"You are an independent peer reviewer for one immutable governed action binding.",
 		"Do not rely on another reviewer's response. Inspect the current project with read-only tools when needed.",
 		"This is pre-action authorization: the expected result is not supposed to exist yet. Review whether the proposed action is correctly scoped, evidence-backed, reversible or testable, and acceptable at its declared risk. Do not reject solely because the action has not already changed the target.",
-		"Call ansteel_review_action exactly once with this exact binding. If you identify a blocking or critical concern, first call ansteel_raise_process_issue against this checkpoint, then reject the action.",
+		"Call ansteel_review_action exactly once with this exact binding. Treat action.version as an opaque coordinator value: copy every field from the JSON byte-for-byte, especially the version; never retype, shorten, recompute, or guess an alternative version. If you identify a blocking or critical concern, first call ansteel_raise_process_issue against this checkpoint, then reject the action.",
+		checkpoint.taskId === undefined
+			? "Do not publish a checkpoint merely to narrate an ordinary action review; the structured action review is the governed result."
+			: `This binding belongs to ${checkpoint.taskId}. Do not publish a checkpoint merely to narrate an ordinary action review. If a genuine new checkpoint is required, include taskId exactly ${checkpoint.taskId}.`,
 		"Immutable binding:",
 		"```json",
 		JSON.stringify(binding),

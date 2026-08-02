@@ -2559,6 +2559,13 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 		expect(
 			harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-RESOLUTION-ROUTE")),
 		).toContain("must include taskId exactly TASK-RESOLUTION-ROUTE");
+		const actionReviewPrompt = harness.prompts.find((prompt) =>
+			prompt.includes("independent peer reviewer for one immutable governed action binding"),
+		);
+		expect(actionReviewPrompt).toContain("Treat action.version as an opaque coordinator value");
+		expect(actionReviewPrompt).toContain("copy every field from the JSON byte-for-byte");
+		expect(actionReviewPrompt).toContain("This binding belongs to TASK-RESOLUTION-ROUTE");
+		expect(actionReviewPrompt).toContain("include taskId exactly TASK-RESOLUTION-ROUTE");
 	});
 
 	it("rejects task assignment when an advisory cross-examination issue lacks a structured resolution", async () => {
