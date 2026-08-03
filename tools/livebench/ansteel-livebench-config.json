@@ -19,13 +19,13 @@
   "reportDirectory": ".pi/ansteel-reports",
   "reviewRoot": "cwd",
   "requiredEvidencePaths": ["benchmark-contract.md", "livebench-question.md"],
-  "stageTimeoutMs": 240000,
-  "maxToolCallsPerStage": 12,
+  "stageTimeoutMs": 2147483647,
+  "maxToolCallsPerStage": 32,
   "stageBudgetPolicy": {
-    "maxStageTimeoutMs": 270000,
+    "maxStageTimeoutMs": 2147483647,
     "maxStageExtensions": 0,
-    "projectTimeoutMs": 2700000,
-    "maxProjectToolCalls": 96
+    "projectTimeoutMs": 2147483647,
+    "maxProjectToolCalls": 1024
   },
   "allowProviderFallback": false,
   "allowSingleModel": false

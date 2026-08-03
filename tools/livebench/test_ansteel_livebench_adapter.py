@@ -100,10 +100,14 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
                 "volcengine-coding/kimi-k2.7-code",
             ],
         )
-        self.assertEqual(config["stageTimeoutMs"], 240000)
-        self.assertEqual(config["maxToolCallsPerStage"], 12)
-        self.assertEqual(config["stageBudgetPolicy"]["projectTimeoutMs"], 2700000)
-        self.assertEqual(config["stageBudgetPolicy"]["maxProjectToolCalls"], 96)
+        # These are the core protocol's representable maxima. Within the fixed
+        # two-revision topology, they do not impose a practical resource ceiling.
+        self.assertEqual(config["stageTimeoutMs"], 2147483647)
+        self.assertEqual(config["stageBudgetPolicy"]["maxStageTimeoutMs"], 2147483647)
+        self.assertEqual(config["stageBudgetPolicy"]["maxStageExtensions"], 0)
+        self.assertEqual(config["maxToolCallsPerStage"], 32)
+        self.assertEqual(config["stageBudgetPolicy"]["projectTimeoutMs"], 2147483647)
+        self.assertEqual(config["stageBudgetPolicy"]["maxProjectToolCalls"], 1024)
 
     def test_generated_answer_preserves_official_shape_without_cost_claim(self) -> None:
         question = {
