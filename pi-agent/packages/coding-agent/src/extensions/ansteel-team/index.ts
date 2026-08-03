@@ -766,7 +766,7 @@ function createTeamTaskTools(taskOperations: AnsteelTeamTaskOperations): ToolDef
 					content: [
 						{
 							type: "text",
-							text: `Submitted ${input.taskId} revision ${submission.revision}; the coordinator now requests or queues public collaboration updates.`,
+							text: `Submitted ${input.taskId} revision ${submission.revision}; the coordinator now requests or queues public collaboration updates from the two non-owner reviewers. Do not call ansteel_publish_task_collaboration or ansteel_review_task for your own revision.`,
 						},
 					],
 					details: { revision: submission.revision, taskId: input.taskId },
@@ -1518,6 +1518,7 @@ function buildTaskOwnerPrompt(
 		`Every ansteel_publish_checkpoint call made while executing this assigned task must include taskId exactly ${task.id}. A checkpoint without that taskId is public context only and cannot govern this task's action.`,
 		"After bounded inspection, use edit/write on the governed files to leave a syntactically valid implementation checkpoint before doing more research. A later epoch can continue from that real Git diff.",
 		"Call ansteel_submit_change with a real supported test command when the acceptance criteria are satisfied.",
+		"After ansteel_submit_change succeeds, do not call ansteel_publish_task_collaboration or ansteel_review_task for your own revision. Those are coordinator-scheduled non-owner stages; the submission receipt's collaboration message refers to the two peer reviewers, not to you.",
 		"Public prose alone is not task progress. Return a concise public update after making the governed state change, or report the concrete tool error that blocked it.",
 	]
 		.filter((section): section is string => section !== undefined)

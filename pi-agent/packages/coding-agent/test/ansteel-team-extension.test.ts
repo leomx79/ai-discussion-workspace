@@ -1514,6 +1514,9 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 		expect(prompts.filter((prompt) => prompt.includes("continuous collaborator for TASK-1 revision"))).toHaveLength(
 			2,
 		);
+		expect(
+			prompts.some((prompt) => prompt.startsWith("You are the staff-engineer continuous collaborator for TASK-1")),
+		).toBe(false);
 		expect(prompts.filter((prompt) => prompt.startsWith("You are the independent "))).toHaveLength(2);
 		const taskEventTypes = listAnsteelTeamEvents(ctx.cwd)
 			.filter((event) =>
