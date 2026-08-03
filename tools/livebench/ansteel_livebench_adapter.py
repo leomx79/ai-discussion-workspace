@@ -152,15 +152,18 @@ def extract_final_answer(report: str) -> str:
     if len(consensus_headers) != 1:
         raise ProtocolResultError("Ansteel report must contain exactly one Tech Lead consensus section")
     consensus = report[consensus_headers[0].end() :]
+    # Consensus prose may mention the tag literally. Only standalone tag lines
+    # delimit an answer, and the captured bytes must retain code indentation.
     pattern = re.compile(
-        re.escape(FINAL_ANSWER_OPEN) + r"\s*(.*?)\s*" + re.escape(FINAL_ANSWER_CLOSE),
+        rf"(?m)^{re.escape(FINAL_ANSWER_OPEN)}[ \t]*\r?\n"
+        rf"(?P<answer>.*?)\r?\n^{re.escape(FINAL_ANSWER_CLOSE)}[ \t]*$",
         re.DOTALL,
     )
     matches = list(pattern.finditer(consensus))
     if len(matches) != 1:
         raise ProtocolResultError("Approved consensus must contain exactly one final-answer block")
-    answer = matches[0].group(1).strip()
-    if not answer:
+    answer = matches[0].group("answer")
+    if not answer.strip():
         raise ProtocolResultError("Approved consensus final-answer block is empty")
     if FINAL_ANSWER_OPEN in answer or FINAL_ANSWER_CLOSE in answer:
         raise ProtocolResultError("Approved consensus final-answer block is malformed")

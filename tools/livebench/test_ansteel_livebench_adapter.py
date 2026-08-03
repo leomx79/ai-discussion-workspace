@@ -63,6 +63,26 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
 
         self.assertEqual(ADAPTER.extract_final_answer(report), "42")
 
+    def test_approved_consensus_preserves_multiline_code_and_ignores_tag_mentions(self) -> None:
+        report = "\n".join(
+            [
+                "# Ansteel Engineering Review",
+                "",
+                "## Status",
+                "- Governance result: APPROVED",
+                "",
+                "## Tech Lead Consensus",
+                "Use the `<livebench-final-answer>` block below exactly once.",
+                ADAPTER.FINAL_ANSWER_OPEN,
+                "",
+                '        """',
+                "        return 42",
+                ADAPTER.FINAL_ANSWER_CLOSE,
+            ]
+        )
+
+        self.assertEqual(ADAPTER.extract_final_answer(report), '\n        """\n        return 42')
+
     def test_rejected_or_ambiguous_report_never_becomes_answer(self) -> None:
         rejected = "## Status\n- Governance result: REJECTED\n\n## Tech Lead Consensus\n<livebench-final-answer>42</livebench-final-answer>"
         ambiguous = "## Status\n- Governance result: APPROVED\n\n## Tech Lead Consensus\n<livebench-final-answer>42</livebench-final-answer>\n<livebench-final-answer>43</livebench-final-answer>"
