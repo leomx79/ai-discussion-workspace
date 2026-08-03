@@ -22,8 +22,9 @@ three independent provider/model identities validated by the Ansteel r57 run:
   external checkout. This prevents upstream public-model presets from changing
   the selected local endpoint, output token ceiling, or request defaults.
 - These commands evaluate each model independently. They do not measure the
-  Ansteel multi-role protocol; a protocol benchmark needs a separate answer
-  adapter and must not be compared directly to these baselines.
+  Ansteel multi-role protocol. Use `Invoke-AnsteelLiveBench.ps1` for the
+  separate protocol score described below; do not compare its score directly
+  to a single-model baseline.
 - The public `2024-11-25` release is the default because the upstream README
   states that newer releases do not publish every question category. The
   launcher reads the downloaded local JSONL snapshot, not the live Hub, so all
@@ -81,3 +82,47 @@ Run the complete public benchmark sequentially, one provider at a time:
 Use `-Resume -RetryFailures` after a provider rate limit or transient failure.
 LiveBench stores answer and judgment files under its external checkout, so a
 re-run does not overwrite completed answers.
+
+## Ansteel Protocol Score
+
+`Invoke-AnsteelLiveBench.ps1` implements the protocol-level route:
+
+```text
+official question without ground truth
+  -> fresh external Ansteel workspace
+  -> checkpointed three-role review and final dual sign-off
+  -> immutable Tech Lead consensus answer
+  -> official LiveBench ground-truth scorer
+```
+
+The adapter copies only a non-secret role/model configuration into each fresh
+workspace. It gives every role a read-only question workspace containing the
+question turns and a coordinator-authored contract, never the `ground_truth`.
+It accepts an answer only when Pi's coordinator-owned report says
+`Governance result: APPROVED` and the immutable `Tech Lead Consensus` has one
+`<livebench-final-answer>` block. Timeout, rejection, malformed markers,
+missing sign-off, or scorer failure are retained as external diagnostic records
+and cannot write an error placeholder answer.
+
+Preview one question from one task without launching Pi or a provider:
+
+```powershell
+.\tools\livebench\Invoke-AnsteelLiveBench.ps1 -BenchName live_bench/reasoning/spatial -QuestionBegin 0 -QuestionEnd 1 -RunLabel r1 -DryRun
+```
+
+Run the same protocol-scored question after the three role credentials are
+valid:
+
+```powershell
+.\tools\livebench\Invoke-AnsteelLiveBench.ps1 -BenchName live_bench/reasoning/spatial -QuestionBegin 0 -QuestionEnd 1 -RunLabel r1
+```
+
+The adapter preserves every workspace, Ansteel checkpoint, report, console log,
+and scoring log under `F:\codex\benchmarks\LiveBench\ansteel-livebench-runs`.
+When Ansteel reports a resumable epoch boundary, use the same run label with
+`-Resume`; terminal rejected or failed runs require a new run label. The
+protocol output model name defaults to `ansteel-three-role-consensus-v1` and is
+scored separately from each individual provider baseline.
+
+`agentic_coding` remains excluded: it requires LiveBench's separate Docker
+harness and must not be represented as a regular Ansteel answer score.

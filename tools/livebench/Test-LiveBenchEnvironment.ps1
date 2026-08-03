@@ -30,6 +30,14 @@ $transportConfigPath = Join-Path $LiveBenchRoot "livebench\model\model_configs\a
 if (-not (Test-Path -LiteralPath $transportConfigPath)) {
 	throw "Local transport model aliases are missing at $transportConfigPath. Re-run Setup-LiveBench.ps1."
 }
+$protocolAdapterPath = Join-Path $PSScriptRoot "ansteel_livebench_adapter.py"
+$protocolConfigPath = Join-Path $PSScriptRoot "ansteel-livebench-config.json"
+$protocolTestPath = Join-Path $PSScriptRoot "test_ansteel_livebench_adapter.py"
+foreach ($required in @($protocolAdapterPath, $protocolConfigPath, $protocolTestPath)) {
+	if (-not (Test-Path -LiteralPath $required)) {
+		throw "Ansteel LiveBench adapter file is missing: $required"
+	}
+}
 
 if (-not (Test-Path -LiteralPath $PiModelsPath)) {
 	throw "Pi provider configuration was not found at $PiModelsPath."
@@ -85,5 +93,13 @@ foreach ($expected in $expectedModels) {
 	}
 }
 Write-Host "LiveBench local transport aliases OK"
+
+# The adapter tests use synthetic reports and inputs only. They prove that
+# ground truth cannot enter the role workspace and that no rejected consensus
+# can silently become a scored answer without spending provider tokens.
+& $venvPython $protocolTestPath
+if ($LASTEXITCODE -ne 0) {
+	throw "Ansteel LiveBench adapter offline contract tests failed."
+}
 
 Write-Host "LiveBench offline environment check passed. No provider request was sent."
