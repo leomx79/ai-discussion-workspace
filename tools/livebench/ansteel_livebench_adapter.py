@@ -381,8 +381,17 @@ def score_question(
         "--resume",
     ]
     log_path = workspace / "livebench-judgment.log"
+    scorer_environment = os.environ.copy()
+    # LiveBench configuration YAML is UTF-8 while Windows may default to GBK.
+    scorer_environment["PYTHONUTF8"] = "1"
     with log_path.open("w", encoding="utf-8", newline="") as log_file:
-        process = subprocess.run(command, cwd=livebench_root / "livebench", stdout=log_file, stderr=subprocess.STDOUT)
+        process = subprocess.run(
+            command,
+            cwd=livebench_root / "livebench",
+            env=scorer_environment,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
     return process.returncode, log_path
 
 
