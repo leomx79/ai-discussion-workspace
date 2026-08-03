@@ -1518,6 +1518,9 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 			prompts.some((prompt) => prompt.startsWith("You are the staff-engineer continuous collaborator for TASK-1")),
 		).toBe(false);
 		expect(prompts.filter((prompt) => prompt.startsWith("You are the independent "))).toHaveLength(2);
+		expect(
+			prompts.find((prompt) => prompt.startsWith("You are the independent tech-lead final-verification reviewer")),
+		).toContain("Coordinator-verified dependency delivery receipts:\n\n```json\n\n[]\n\n```");
 		const taskEventTypes = listAnsteelTeamEvents(ctx.cwd)
 			.filter((event) =>
 				["task-collaboration", "task-final-verification-requested", "task-review"].includes(event.type),

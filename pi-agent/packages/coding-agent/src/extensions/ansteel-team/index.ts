@@ -1254,9 +1254,30 @@ function buildTaskCollaborationPrompt(
 
 function buildTaskReviewPrompt(
 	role: AnsteelRole,
+	state: AnsteelTeamState,
 	task: AnsteelTeamTask,
 	submission: AnsteelTeamTaskSubmission,
 ): string {
+	const dependencyReceipts = task.dependsOn.map((dependencyId) => {
+		const dependency = state.tasks.find((candidate) => candidate.id === dependencyId);
+		const receipt = state.deliveryVerifications.find(
+			(candidate) =>
+				candidate.taskId === dependencyId &&
+				candidate.revision === dependency?.revision &&
+				candidate.status === "passed",
+		);
+		return receipt === undefined
+			? { taskId: dependencyId, status: "missing" }
+			: {
+				id: receipt.id,
+				taskId: receipt.taskId,
+				revision: receipt.revision,
+				status: receipt.status,
+				sourceCommit: receipt.sourceCommit,
+				diffHash: receipt.diffHash,
+				checks: receipt.checks.map((check) => ({ id: check.id, exitCode: check.exitCode })),
+			};
+	});
 	return [
 		`You are the independent ${role} final-verification reviewer for ${task.id} revision ${submission.revision}.`,
 		"Review the immutable evidence package below. Inspect the current project with read-only tools when needed. You cannot edit this task.",
@@ -1266,6 +1287,10 @@ function buildTaskReviewPrompt(
 		task.assignmentReason === undefined ? undefined : `Cross-role assignment reason: ${task.assignmentReason}`,
 		`Files: ${task.files.join(", ")}`,
 		`Dependencies: ${task.dependsOn.length === 0 ? "None" : task.dependsOn.join(", ")}`,
+		"Coordinator-verified dependency delivery receipts:",
+		"```json",
+		JSON.stringify(dependencyReceipts),
+		"```",
 		`Description: ${task.description}`,
 		`Acceptance criteria: ${task.acceptanceCriteria}`,
 		`Executed test command: ${submission.test.command}`,
@@ -2233,7 +2258,7 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 							ctx.cwd,
 							reviewer,
 							session,
-							buildTaskReviewPrompt(reviewer, task, submission),
+							buildTaskReviewPrompt(reviewer, activeTeam.state, task, submission),
 							activeTeam.stageTimeoutMs,
 							{ taskId: task.id },
 						);
