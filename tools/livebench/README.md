@@ -129,10 +129,11 @@ When Ansteel reports a resumable epoch boundary, use the same run label with
 protocol output model name defaults to `ansteel-three-role-consensus-v1` and is
 scored separately from each individual provider baseline.
 
-Each question has a 30-minute total protocol budget, while the 240-second
-per-stage limit, the 64-call project tool ceiling, and all three-role approval
-gates remain fixed. This reflects the observed duration of the full sequential
-governance path, rather than treating a partial review as a benchmark answer.
+Each question has a 45-minute total protocol budget and a 96-call project tool
+ceiling, while the 240-second per-stage limit and all three-role approval gates
+remain fixed. This reflects the observed duration of the full two-round
+sequential governance path, rather than treating a partial review as a
+benchmark answer.
 
 `agentic_coding` remains excluded: it requires LiveBench's separate Docker
 harness and must not be represented as a regular Ansteel answer score.

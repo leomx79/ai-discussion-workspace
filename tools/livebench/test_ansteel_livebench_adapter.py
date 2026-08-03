@@ -102,8 +102,8 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
         )
         self.assertEqual(config["stageTimeoutMs"], 240000)
         self.assertEqual(config["maxToolCallsPerStage"], 12)
-        self.assertEqual(config["stageBudgetPolicy"]["projectTimeoutMs"], 1800000)
-        self.assertEqual(config["stageBudgetPolicy"]["maxProjectToolCalls"], 64)
+        self.assertEqual(config["stageBudgetPolicy"]["projectTimeoutMs"], 2700000)
+        self.assertEqual(config["stageBudgetPolicy"]["maxProjectToolCalls"], 96)
 
     def test_generated_answer_preserves_official_shape_without_cost_claim(self) -> None:
         question = {
