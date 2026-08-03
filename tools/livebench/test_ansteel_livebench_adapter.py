@@ -183,5 +183,44 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
             self.assertEqual(persisted["scoring_exit_code"], 0)
 
 
+    def test_approved_consensus_uses_final_section_when_transcript_repeats_heading(self) -> None:
+        report = "\n".join(
+            [
+                "# Ansteel Engineering Review",
+                "",
+                "## Status",
+                "- Governance result: APPROVED",
+                "",
+                "## Full Transcript",
+                "### 13. tech-lead / consensus",
+                "## Tech Lead Consensus",
+                "Role text repeats the heading before the coordinator section.",
+                "",
+                "## Tech Lead Consensus",
+                "Decision accepted by final sign-off.",
+                ADAPTER.FINAL_ANSWER_OPEN,
+                "42",
+                ADAPTER.FINAL_ANSWER_CLOSE,
+            ]
+        )
+        self.assertEqual(ADAPTER.extract_final_answer(report), "42")
+
+    def test_approved_consensus_requires_final_section_when_heading_missing(self) -> None:
+        report = "\n".join(
+            [
+                "# Ansteel Engineering Review",
+                "",
+                "## Status",
+                "- Governance result: APPROVED",
+                "",
+                "## Some Other Section",
+                ADAPTER.FINAL_ANSWER_OPEN,
+                "42",
+                ADAPTER.FINAL_ANSWER_CLOSE,
+            ]
+        )
+        with self.assertRaises(ADAPTER.ProtocolResultError):
+            ADAPTER.extract_final_answer(report)
+
 if __name__ == "__main__":
     unittest.main()

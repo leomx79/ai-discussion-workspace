@@ -3055,7 +3055,6 @@ describe("runAnsteelDiscussion", () => {
 		["contradictory markers", "VERDICT: APPROVE\nVERDICT: REJECT"],
 		["a bullet-list contradiction", "VERDICT: APPROVE\n- VERDICT: REJECT"],
 		["a Markdown-heading contradiction", "VERDICT: APPROVE\n## VERDICT: REJECT"],
-		["an embedded contradictory verdict", "VERDICT: APPROVE\nThe audit says VERDICT: REJECT"],
 		["a pending marker after approval", "VERDICT: APPROVE\nVERDICT PENDING"],
 		["an isolated pending marker", "VERDICT PENDING"],
 	])("rejects %s in QA verification without running consensus", async (_description, qaVerdict) => {
@@ -3073,6 +3072,24 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.consensus).toBeUndefined();
 		expect(result.terminationReason).toBe("invalid-verdict");
 		expect(calls.map(({ role, stage }) => `${role}:${stage}`)).not.toContain("tech-lead:consensus");
+	});
+
+	it("accepts prose mentions of VERDICT markers when exactly one standalone verdict is present", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Review quoted marker prose",
+			runRole: async ({ role, stage }) => {
+				if (stage !== "qa-verification") return responseForMutualReviewStage(stage);
+				return [
+					"In every verification response emit exactly one `VERDICT: APPROVE` or `VERDICT: REJECT` marker as the final standalone line.",
+					"The audit found no `VERDICT:` marker in any work card.",
+					"VERDICT: APPROVE",
+				].join("\n");
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(result.consensus).toBeDefined();
+		expect(result.terminationReason).toBeUndefined();
 	});
 
 	it.each([

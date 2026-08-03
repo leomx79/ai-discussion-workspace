@@ -149,9 +149,11 @@ def extract_final_answer(report: str) -> str:
         raise ProtocolResultError("Ansteel report is not governance-approved")
 
     consensus_headers = list(re.finditer(r"(?m)^## Tech Lead Consensus\s*$", report))
-    if len(consensus_headers) != 1:
-        raise ProtocolResultError("Ansteel report must contain exactly one Tech Lead consensus section")
-    consensus = report[consensus_headers[0].end() :]
+    if not consensus_headers:
+        raise ProtocolResultError("Ansteel report is missing the Tech Lead consensus section")
+    # The coordinator always appends its consensus section after the full transcript;
+    # role text may legitimately repeat the heading, so the final occurrence is authoritative.
+    consensus = report[consensus_headers[-1].end() :]
     # Consensus prose may mention the tag literally. Only standalone tag lines
     # delimit an answer, and the captured bytes must retain code indentation.
     pattern = re.compile(

@@ -2443,7 +2443,15 @@ function buildRolePrompt(
 
 function isVerdictCandidate(line: string): boolean {
 	const contentAfterMarkdownPrefix = line.replace(/^\s*(?:(?:[-+*]|\d+[.)]|#{1,6}|>)\s+)+/, "");
-	return /\bVERDICT\s*:/i.test(line) || /^\s*VERDICT\s+(?:approve|reject|pending)\b/i.test(contentAfterMarkdownPrefix);
+	const normalized = normalizeWholeLineMarker(contentAfterMarkdownPrefix);
+	return (
+		normalized === "VERDICT: APPROVE" ||
+		normalized === "VERDICT: REJECT" ||
+		normalized === "VERDICT: PENDING" ||
+		normalized === "VERDICT APPROVE" ||
+		normalized === "VERDICT REJECT" ||
+		normalized === "VERDICT PENDING"
+	);
 }
 
 function getExplicitVerdict(response: string): "approved" | "rejected" | undefined {
