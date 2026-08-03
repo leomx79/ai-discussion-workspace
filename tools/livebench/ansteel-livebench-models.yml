@@ -1,0 +1,20 @@
+# These transport-only identities deliberately avoid LiveBench's upstream
+# provider-specific defaults. The provider endpoints come from the local Pi
+# configuration at runtime, while the real model name remains the API value.
+# That keeps the launcher's --max-tokens value authoritative and prevents an
+# unrelated public-model preset from overriding a local provider's limits.
+---
+display_name: ansteel-livebench-glm-5-2
+api_name:
+  local: glm-5.2
+default_provider: local
+---
+display_name: ansteel-livebench-deepseek-v4-flash
+api_name:
+  local: deepseek-v4-flash
+default_provider: local
+---
+display_name: ansteel-livebench-kimi-k2-7-code
+api_name:
+  local: kimi-k2.7-code
+default_provider: local
