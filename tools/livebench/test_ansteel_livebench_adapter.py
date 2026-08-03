@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 
 ADAPTER_PATH = Path(__file__).with_name("ansteel_livebench_adapter.py")
+PROTOCOL_CONFIG_PATH = Path(__file__).with_name("ansteel-livebench-config.json")
 SPEC = importlib.util.spec_from_file_location("ansteel_livebench_adapter", ADAPTER_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load adapter from {ADAPTER_PATH}")
@@ -79,6 +80,22 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
             loaded = ADAPTER.load_protocol_config(config_path)
 
         self.assertEqual(loaded["roles"]["qa-engineer"]["model"], "provider-c/model-c")
+
+    def test_repository_protocol_config_keeps_strict_role_and_budget_contract(self) -> None:
+        config = ADAPTER.load_protocol_config(PROTOCOL_CONFIG_PATH)
+
+        self.assertEqual(
+            [config["roles"][role]["model"] for role in ("tech-lead", "staff-engineer", "qa-engineer")],
+            [
+                "volcengine-agent-plan/glm-5.2",
+                "deepseek-flash/deepseek-v4-flash",
+                "volcengine-coding/kimi-k2.7-code",
+            ],
+        )
+        self.assertEqual(config["stageTimeoutMs"], 240000)
+        self.assertEqual(config["maxToolCallsPerStage"], 12)
+        self.assertEqual(config["stageBudgetPolicy"]["projectTimeoutMs"], 1800000)
+        self.assertEqual(config["stageBudgetPolicy"]["maxProjectToolCalls"], 64)
 
     def test_generated_answer_preserves_official_shape_without_cost_claim(self) -> None:
         question = {

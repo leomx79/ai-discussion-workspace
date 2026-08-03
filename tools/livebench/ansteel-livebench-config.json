@@ -24,7 +24,7 @@
   "stageBudgetPolicy": {
     "maxStageTimeoutMs": 270000,
     "maxStageExtensions": 0,
-    "projectTimeoutMs": 900000,
+    "projectTimeoutMs": 1800000,
     "maxProjectToolCalls": 64
   },
   "allowProviderFallback": false,
