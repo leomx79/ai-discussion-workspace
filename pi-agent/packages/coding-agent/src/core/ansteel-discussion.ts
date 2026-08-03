@@ -2153,6 +2153,7 @@ const CONFIDENCE_INSTRUCTIONS = [
 const ISSUE_LEDGER_INSTRUCTIONS = [
 	"When raising a challenge, put every required change on its own line as `ISSUE: <ID> | TARGET: <role>` using the role-specific uppercase prefix stated below and one of tech-lead, staff-engineer, or qa-engineer as target.",
 	"Each ISSUE marker must contain only the marker, uppercase ID, and target role, with no leading or trailing whitespace after the marker.",
+	"Every ISSUE must target a different role; never target yourself. During verification, do not use an ISSUE merely to correct your own work card. Staff Engineer or QA Engineer must instead target tech-lead as canonical revision owner for an identified cross-card inconsistency and name the flawed prior card in the issue evidence.",
 	"Never repeat an `ISSUE:` marker, including in a summary or conclusion. After its first use, refer to the ID as plain STAFF-1 or QA-1 without the `ISSUE:` prefix.",
 	"State evidence, impact, and the acceptance condition below each issue.",
 ].join(" ");

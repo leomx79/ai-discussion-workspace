@@ -2433,6 +2433,7 @@ describe("runAnsteelDiscussion", () => {
 		expect(architectureRevisionPrompt).toContain("The architecture lacks a failure boundary.");
 		expect(staffRevisionPrompt).toContain("The driver interface cannot meet the proposed timing.");
 		for (const verificationPrompt of [techLeadVerificationPrompt, staffVerificationPrompt, qaVerificationPrompt]) {
+			expect(verificationPrompt).toContain("Every ISSUE must target a different role; never target yourself.");
 			expect(verificationPrompt).toContain("RESOLUTION: TL-1 | RESOLVED");
 			expect(verificationPrompt).toContain("RESOLUTION: STAFF-1 | RESOLVED");
 			expect(verificationPrompt).toContain("RESOLUTION: QA-1 | RESOLVED");
@@ -2444,6 +2445,9 @@ describe("runAnsteelDiscussion", () => {
 				"If you reject, add at least one new targeted `ISSUE: <ID> | TARGET: <role>` marker before that final verdict line.",
 			);
 		}
+		expect(qaVerificationPrompt).toContain(
+			"Staff Engineer or QA Engineer must instead target tech-lead as canonical revision owner for an identified cross-card inconsistency",
+		);
 		expect(qaVerificationPrompt).not.toContain("STAFF-VERIFICATION-PRIVATE");
 	});
 
