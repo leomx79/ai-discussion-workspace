@@ -40,6 +40,7 @@ import type {
 	ToolCallEventResult,
 } from "../src/core/extensions/index.ts";
 import {
+	type AnsteelTeamTaskOperations,
 	type AnsteelTeamRoleSession,
 	type CreateAnsteelTeamRoleSessionOptions,
 	createAnsteelTeamExtension,
@@ -694,6 +695,68 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 			.join("\n");
 		expect(timeline).toContain("action-assessed");
 		expect(timeline).toContain("action-review");
+	});
+
+	it("collects required peer action reviews before releasing an owner mutation", async () => {
+		const config = createConfig();
+		config.teamTaskMaxEpochs = 1;
+		let ownerAssessment: Awaited<ReturnType<AnsteelTeamTaskOperations["assessAction"]>> | undefined;
+		const scheduledReviewers: string[] = [];
+		let harness: ReturnType<typeof setup>;
+		harness = setup(config, async (role, prompt) => {
+			const operations = harness.roleSessionOptions.find((entry) => entry.role === role)?.taskOperations;
+			if (!operations) throw new Error(`Missing task operations for ${role}`);
+			if (role === "staff-engineer" && prompt.includes("Execute governed task TASK-ACTION-HANDOFF")) {
+				await operations.publishCheckpoint({
+					id: "CP-ACTION-HANDOFF-0001",
+					taskId: "TASK-ACTION-HANDOFF",
+					goal: "Change the governed parser after exact peer authorization",
+					currentUnderstanding: "The task-local edit is ready for independent review",
+					assumptions: [],
+					evidenceRefs: ["file:src/parser.ts"],
+					uncertainties: [],
+					nextAction: { kind: "edit", target: "src/parser.ts", expectedResult: "The parser changes" },
+					risk: "yellow",
+					confidence: "L2",
+				});
+				ownerAssessment = await operations.assessAction("edit", { path: "src/parser.ts", edits: [] });
+				return "The owner received the coordinator's action-authorization result.";
+			}
+			if (prompt.includes("independent peer reviewer for one immutable governed action binding")) {
+				const checkpoint = operations.state.workCheckpoints.find((item) => item.id === "CP-ACTION-HANDOFF-0001");
+				if (!checkpoint?.governedAction) throw new Error("Missing action handoff checkpoint");
+				scheduledReviewers.push(role);
+				await operations.reviewAction({
+					checkpointId: checkpoint.id,
+					action: {
+						kind: checkpoint.governedAction.kind,
+						target: checkpoint.governedAction.target,
+						version: checkpoint.governedAction.version,
+					},
+					verdict: "approve",
+					reason: "The immutable action binding stays inside the task lease.",
+				});
+				return `${role} approved the immutable action binding.`;
+			}
+			return `${role} completed its stage.`;
+		});
+		initializeGitProject(harness.ctx.cwd);
+		const command = harness.commands.get("ansteel-team");
+		if (!command) throw new Error("Missing ansteel-team command");
+		await command("start Review the parser", harness.ctx);
+
+		await command(
+			'task {"id":"TASK-ACTION-HANDOFF","owner":"staff-engineer","type":"implementation","files":["src/parser.ts"],"description":"Change parser after peer authorization","acceptanceCriteria":"The parser test passes","dependsOn":[]}',
+			harness.ctx,
+		);
+
+		expect(ownerAssessment?.blockReason).toBeUndefined();
+		expect(scheduledReviewers.sort()).toEqual(["qa-engineer", "tech-lead"]);
+		expect(
+			loadAnsteelTeamState(harness.ctx.cwd)?.actionReviews.filter(
+				(review) => review.checkpointId === "CP-ACTION-HANDOFF-0001" && review.verdict === "approve",
+			),
+		).toHaveLength(2);
 	});
 
 	it("reports scope escalation as requiring a user decision instead of issue-author review", async () => {
@@ -2313,6 +2376,15 @@ describe("Ansteel team extension", { timeout: ANSTEEL_EXTENSION_TEST_TIMEOUT_MS 
 		expect(taskEpochs).toBe(2);
 		expect(harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-1"))).toContain(
 			"Read-only tool budget: 4 calls",
+		);
+		expect(harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-1"))).toContain(
+			"assumptions (use [] when none)",
+		);
+		expect(harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-1"))).toContain(
+			"Active task-bound checkpoints eligible for supersession: none",
+		);
+		expect(harness.prompts.find((prompt) => prompt.includes("Execute governed task TASK-1"))).toContain(
+			"Do not spend retries inspecting .pi or .git",
 		);
 		expect(loadAnsteelTeamState(harness.ctx.cwd)?.tasks[0]).toMatchObject({ id: "TASK-1", status: "claimed" });
 		expect(listAnsteelTeamEvents(harness.ctx.cwd).at(-1)).toMatchObject({

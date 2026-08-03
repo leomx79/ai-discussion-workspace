@@ -1521,6 +1521,16 @@ function buildTaskOwnerPrompt(
 			const action = checkpoint.governedAction!;
 			return `- ${checkpoint.id}: ${action.kind} ${action.target} @ ${action.version}`;
 		});
+	// A failed checkpoint call must not make an owner guess which historical id is active.
+	const activeTaskCheckpointLines = state.workCheckpoints
+		.filter((checkpoint) => checkpoint.taskId === task.id && checkpoint.status === "active")
+		.slice(-3)
+		.map((checkpoint) => {
+			const action = checkpoint.governedAction;
+			return action === null
+				? `- ${checkpoint.id}: no governed action`
+				: `- ${checkpoint.id}: ${action.kind} ${action.target} @ ${action.version}`;
+		});
 	return [
 		`Execute governed task ${task.id}. This is owner epoch ${epoch}.`,
 		`Owner: ${task.owner}`,
@@ -1541,6 +1551,11 @@ function buildTaskOwnerPrompt(
 			: `Fully peer-approved task actions available for execution:\n${approvedActionLines.join("\n")}\nThese exact bindings already satisfy the checkpoint-before-action rule. Execute the applicable approved action before publishing any new checkpoint for the same kind/target/version. A renamed or duplicate checkpoint has no inherited approvals and will be blocked again.`,
 		`Read-only tool budget: ${maxToolCallsPerStage} calls for this isolated epoch. Use exact known paths and batch independent reads; do not repeat directory scans or reread unchanged files.`,
 		`Every ansteel_publish_checkpoint call made while executing this assigned task must include taskId exactly ${task.id}. A checkpoint without that taskId is public context only and cannot govern this task's action.`,
+		"Checkpoint input checklist: every call needs id, taskId, goal, currentUnderstanding, assumptions (use [] when none), evidenceRefs, uncertainties, nextAction { kind, target, expectedResult }, risk, and confidence. Use a fresh unused CP id after an 'already exists' error. Only set supersedesCheckpointId to an active task-bound checkpoint listed below; otherwise omit it.",
+		activeTaskCheckpointLines.length === 0
+			? "Active task-bound checkpoints eligible for supersession: none"
+			: `Active task-bound checkpoints eligible for supersession:\n${activeTaskCheckpointLines.join("\n")}`,
+		"On a checkpoint validation error, repair the named field or identifier first and retry one corrected call. Do not spend retries inspecting .pi or .git, reusing an old id, or superseding a checkpoint that is not listed active.",
 		"After bounded inspection, use edit/write on the governed files to leave a syntactically valid implementation checkpoint before doing more research. A later epoch can continue from that real Git diff.",
 		"Call ansteel_submit_change with a real supported test command when the acceptance criteria are satisfied.",
 		"After ansteel_submit_change succeeds, do not call ansteel_publish_task_collaboration or ansteel_review_task for your own revision. Those are coordinator-scheduled non-owner stages; the submission receipt's collaboration message refers to the two peer reviewers, not to you.",
@@ -2937,7 +2952,29 @@ export function createAnsteelTeamExtension(dependencies: AnsteelTeamExtensionDep
 			state: activeTeam.state,
 			assessAction: async (toolName, args) => {
 				return await runObservedOperation(ctx.cwd, "action.assess", { role, data: { toolName } }, async () => {
-					const assessment = assessAnsteelTeamAction(ctx.cwd, activeTeam.state, role, { toolName, args });
+					let assessment = assessAnsteelTeamAction(ctx.cwd, activeTeam.state, role, { toolName, args });
+					const checkpoint =
+						assessment.checkpointId === undefined
+							? undefined
+							: activeTeam.state.workCheckpoints.find((item) => item.id === assessment.checkpointId);
+					const task =
+						checkpoint?.taskId === undefined
+							? undefined
+							: activeTeam.state.tasks.find((item) => item.id === checkpoint.taskId);
+					const awaitsPeerActionReviews =
+						checkpoint?.actor === role &&
+						task?.owner === role &&
+						assessment.blockReason ===
+							`Ansteel team checkpoint ${assessment.checkpointId} requires peer action reviews from ${assessment.requiredReviewers
+								.filter((reviewer) => !assessment.approvedReviewers.includes(reviewer))
+								.join(", ")}`;
+					if (awaitsPeerActionReviews && task !== undefined) {
+						// Keep the mutation suspended while the coordinator collects the immutable peer approvals.
+						// Returning a denied edit first would leave a persistent owner session waiting for reviews
+						// that the old post-stage scheduler cannot request until that same session completes.
+						await requestPendingActionReviews(activeTeam, ctx, task);
+						assessment = assessAnsteelTeamAction(ctx.cwd, activeTeam.state, role, { toolName, args });
+					}
 					recordAnsteelTeamActionAssessment(
 						ctx.cwd,
 						activeTeam.state,
