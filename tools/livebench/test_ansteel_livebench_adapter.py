@@ -37,6 +37,14 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
         self.assertNotIn("MUST_NOT_REACH_ANSTEEL", rendered)
         self.assertNotIn("ground_truth", rendered)
 
+    def test_benchmark_contract_requires_one_unquoted_final_verdict_marker(self) -> None:
+        contract = ADAPTER.render_benchmark_contract("question-1")
+        topic = ADAPTER.build_protocol_topic("question-1")
+
+        self.assertIn("exactly one `VERDICT: APPROVE` or `VERDICT: REJECT` marker", contract)
+        self.assertIn("Do not quote, restate, embed, or otherwise reproduce", contract)
+        self.assertIn("never quote a VERDICT marker elsewhere", topic)
+
     def test_approved_consensus_extracts_exactly_one_answer(self) -> None:
         report = "\n".join(
             [

@@ -104,6 +104,11 @@ It accepts an answer only when Pi's coordinator-owned report says
 missing sign-off, or scorer failure are retained as external diagnostic records
 and cannot write an error placeholder answer.
 
+Verification and final sign-off responses must use one exact, final verdict
+marker. The benchmark contract explicitly forbids quoting a verdict marker in
+the body, so a peer-approval reference cannot make an otherwise approving
+response fail Ansteel's strict marker parser.
+
 Preview one question from one task without launching Pi or a provider:
 
 ```powershell
