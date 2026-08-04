@@ -2190,6 +2190,7 @@ const REQUIRED_REVISION_WORK_CARD_SECTIONS = [
 
 const WORK_CARD_INSTRUCTIONS = [
 	`Use these visible sections in every work card: ${REQUIRED_WORK_CARD_SECTIONS.map((section) => `## ${section}`).join(", ")}.`,
+	"Every work card must contain all of these exact headings, each with nonempty content: Conclusion, Evidence, Assumptions and Unknowns, Alternatives and Trade-offs, Self-Refutation Conditions, Questions for Peers.",
 	"Evidence must name the current file, command, test, or source used. Do not present private reasoning as evidence.",
 ].join(" ");
 
@@ -2379,7 +2380,7 @@ interface BuildRolePromptOptions {
 	challengeLedger?: readonly AnsteelChallengeLedgerEntry[];
 	maxToolCallsPerStage?: number;
 	evidencePackage?: string;
-	formatRepair?: { reason: string; previousResponse: string };
+	formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
 	immutableLedgerSummary?: string;
 }
 
@@ -2423,8 +2424,10 @@ function buildRolePrompt(
 		"Response limit: keep the response within 800 tokens unless code or evidence requires more.",
 		...(options.formatRepair
 			? [
-					"Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that corrects only marker syntax, the role-specific namespace, or duplicate markers.",
-					`The prior response had this repairable marker error: ${options.formatRepair.reason}`,
+					options.formatRepair.kind === "sections"
+					? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that adds every missing required visible section while keeping all existing content unchanged."
+					: "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that corrects only marker syntax, the role-specific namespace, or duplicate markers.",
+					`The prior response had this repairable ${options.formatRepair.kind === "sections" ? "section-completeness" : "marker"} error: ${options.formatRepair.reason}`,
 					`Prior response to replace:\n${options.formatRepair.previousResponse}`,
 				]
 			: [
@@ -2634,6 +2637,28 @@ function formatRepairPreservesNonMarkerContent(previousResponse: string, repaire
 	const previous = nonMarkerContent(previousResponse);
 	const repaired = nonMarkerContent(repairedResponse);
 	return previous.length === repaired.length && previous.every((line, index) => line === repaired[index]);
+}
+
+function formatSectionRepairPreservesContent(previousResponse: string, repairedResponse: string): boolean {
+	const nonMarkerLines = (response: string): string[] =>
+		response.split(/\r?\n/).filter((line) => {
+			const normalized = normalizeWholeLineMarker(line);
+			return (
+				!normalized.startsWith("ISSUE:") &&
+				!normalized.startsWith("NO ISSUES") &&
+				!normalized.startsWith("RESOLUTION:") &&
+				!isVerdictCandidate(line)
+			);
+		});
+	const previous = nonMarkerLines(previousResponse);
+	const repaired = nonMarkerLines(repairedResponse);
+	let cursor = 0;
+	for (const line of previous) {
+		const index = repaired.indexOf(line, cursor);
+		if (index === -1) return false;
+		cursor = index + 1;
+	}
+	return true;
 }
 
 function resolveOpenChallengesForRole(
@@ -2995,7 +3020,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		round?: number;
 		context?: readonly AnsteelTranscriptEntry[];
 		challengeLedger?: readonly AnsteelChallengeLedgerEntry[];
-		formatRepair?: { reason: string; previousResponse: string };
+		formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
 		immutableLedgerSummary?: string;
 	}
 	const runStage = async (
@@ -3333,13 +3358,18 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		stageOptions: RunStageOptions,
 		previousEntry: AnsteelTranscriptEntry,
 		reason: string,
+		kind: "marker" | "sections" = "marker",
 	): Promise<{ response: string; entry: AnsteelTranscriptEntry } | { rejection: AnsteelDiscussionResult }> => {
 		const repairedResult = await runRequiredStage(role, stage, {
 			...stageOptions,
-			formatRepair: { reason, previousResponse: previousEntry.response },
+			formatRepair: { reason, previousResponse: previousEntry.response, kind },
 		});
 		if ("rejection" in repairedResult) return repairedResult;
-		if (formatRepairPreservesNonMarkerContent(previousEntry.response, repairedResult.response)) return repairedResult;
+		const preserves =
+			kind === "sections"
+				? formatSectionRepairPreservesContent(previousEntry.response, repairedResult.response)
+				: formatRepairPreservesNonMarkerContent(previousEntry.response, repairedResult.response);
+		if (preserves) return repairedResult;
 		return {
 			rejection: reject(
 				`${role} / ${stage} changed non-marker content during a format-only repair`,
@@ -3348,6 +3378,41 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				"invalid-challenge-ledger",
 			),
 		};
+	};
+
+	const repairMissingWorkCardSections = async (
+		role: AnsteelRole,
+		stage: AnsteelDiscussionStage,
+		stageOptions: RunStageOptions,
+		entry: AnsteelTranscriptEntry,
+		requiredSections: readonly string[],
+		allowParenthesizedQualifier: boolean,
+	): Promise<{ response: string; entry: AnsteelTranscriptEntry; repaired: boolean } | { rejection: AnsteelDiscussionResult }> => {
+		const missingSections = getMissingWorkCardSections(entry.response, requiredSections, allowParenthesizedQualifier);
+		if (missingSections.length === 0) {
+			return { response: entry.response, entry, repaired: false };
+		}
+		const repaired = await runSingleFormatRepair(
+			role,
+			stage,
+			stageOptions,
+			entry,
+			`${role} / ${stage} work card is missing required visible sections: ${missingSections.join(", ")}`,
+			"sections",
+		);
+		if ("rejection" in repaired) return repaired;
+		const stillMissing = getMissingWorkCardSections(repaired.response, requiredSections, allowParenthesizedQualifier);
+		if (stillMissing.length > 0) {
+			return {
+				rejection: reject(
+					`${role} / ${stage} work card is missing required visible sections: ${stillMissing.join(", ")}`,
+					undefined,
+					undefined,
+					"incomplete-work-card",
+				),
+			};
+		}
+		return { response: repaired.response, entry: repaired.entry, repaired: true };
 	};
 
 	const workCardStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
@@ -3359,16 +3424,16 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	for (const { role, stage } of workCardStages) {
 		const result = await runRequiredStage(role, stage, { context: [] });
 		if ("rejection" in result) return result.rejection;
-		const missingSections = getMissingWorkCardSections(result.response);
-		if (missingSections.length > 0) {
-			return reject(
-				`${role} / ${stage} work card is missing required visible sections: ${missingSections.join(", ")}`,
-				undefined,
-				undefined,
-				"incomplete-work-card",
-			);
-		}
-		workCards.push(result.entry);
+		const sectionRepair = await repairMissingWorkCardSections(
+			role,
+			stage,
+			{ context: [] },
+			result.entry,
+			REQUIRED_WORK_CARD_SECTIONS,
+			false,
+		);
+		if ("rejection" in sectionRepair) return sectionRepair.rejection;
+		workCards.push(sectionRepair.entry);
 	}
 
 	const crossExaminationStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
@@ -3402,23 +3467,28 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			const stageOptions = { round, context: revisionContext, challengeLedger };
 			let result = await runRequiredStage(role, stage, stageOptions);
 			if ("rejection" in result) return result.rejection;
-			let missingSections = getMissingWorkCardSections(result.response, REQUIRED_REVISION_WORK_CARD_SECTIONS, true);
-			if (missingSections.length > 0) {
-				return reject(
-					`${role} / ${stage} work card is missing required visible sections: ${missingSections.join(", ")}`,
-					undefined,
-					undefined,
-					"incomplete-work-card",
-				);
-			}
+			const sectionRepair = await repairMissingWorkCardSections(
+				role,
+				stage,
+				stageOptions,
+				result.entry,
+				REQUIRED_REVISION_WORK_CARD_SECTIONS,
+				true,
+			);
+			if ("rejection" in sectionRepair) return sectionRepair.rejection;
+			result = { response: sectionRepair.response, entry: sectionRepair.entry };
 			let resolutionError = resolveOpenChallengesForRole(challengeLedger, result.response, role);
-			if (resolutionError && isRepairableResolutionMarkerError(resolutionError)) {
+			if (resolutionError && !sectionRepair.repaired && isRepairableResolutionMarkerError(resolutionError)) {
 				result = await runSingleFormatRepair(role, stage, stageOptions, result.entry, resolutionError);
 				if ("rejection" in result) return result.rejection;
-				missingSections = getMissingWorkCardSections(result.response, REQUIRED_REVISION_WORK_CARD_SECTIONS, true);
-				if (missingSections.length > 0) {
+				const missingSectionsAfterRepair = getMissingWorkCardSections(
+					result.response,
+					REQUIRED_REVISION_WORK_CARD_SECTIONS,
+					true,
+				);
+				if (missingSectionsAfterRepair.length > 0) {
 					return reject(
-						`${role} / ${stage} work card is missing required visible sections: ${missingSections.join(", ")}`,
+						`${role} / ${stage} work card is missing required visible sections: ${missingSectionsAfterRepair.join(", ")}`,
 						undefined,
 						undefined,
 						"incomplete-work-card",

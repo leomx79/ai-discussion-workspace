@@ -128,6 +128,9 @@ const COMPLETE_REVISION_WORK_CARD = [
 	"## Recommended Actions\n[L2] Assign the next verification task with a scope and acceptance criterion.",
 ].join("\n\n");
 
+const INCOMPLETE_WORK_CARD = COMPLETE_WORK_CARD.split("\n\n").filter((section) => !section.startsWith("## Self-Refutation Conditions")).join("\n\n");
+const INCOMPLETE_REVISION_WORK_CARD = COMPLETE_REVISION_WORK_CARD.split("\n\n").filter((section) => !section.startsWith("## Recommended Actions")).join("\n\n");
+
 function completeWorkCard(response: string): string {
 	return `${response}\n\n${COMPLETE_REVISION_WORK_CARD}`;
 }
@@ -3090,6 +3093,53 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.verdict).toBe("approved");
 		expect(result.consensus).toBeDefined();
 		expect(result.terminationReason).toBeUndefined();
+	});
+
+	it("repairs a missing required section in an initial work card", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Review initial card section repair",
+			runRole: async ({ role, stage, prompt }) => {
+				if (stage === "architecture" && !prompt.includes("Format repair constraint")) {
+					return `[L2] Tech Lead work card\n\n${INCOMPLETE_WORK_CARD}`;
+				}
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(result.terminationReason).toBeUndefined();
+	});
+
+	it("repairs a missing required section in a revision work card", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Review revision card section repair",
+			runRole: async ({ role, stage, prompt }) => {
+				if (stage === "qa-revision" && !prompt.includes("Format repair constraint")) {
+					return `RESOLUTION: STAFF-CROSS | RESOLVED\n[L2] QA revised work card\n\n${INCOMPLETE_REVISION_WORK_CARD}`;
+				}
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(result.consensus).toBeDefined();
+		expect(result.terminationReason).toBeUndefined();
+	});
+
+	it("rejects a work card that still misses a required section after repair", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Review persistent missing section",
+			runRole: async ({ role, stage }) => {
+				if (stage === "qa-revision") {
+					return `RESOLUTION: STAFF-CROSS | RESOLVED\n[L2] QA revised work card\n\n${INCOMPLETE_REVISION_WORK_CARD}`;
+				}
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(result.terminationReason).toBe("incomplete-work-card");
+		expect(result.consensus).toBeUndefined();
 	});
 
 	it.each([
