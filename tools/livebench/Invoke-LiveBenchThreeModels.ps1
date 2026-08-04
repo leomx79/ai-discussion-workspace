@@ -25,10 +25,33 @@ $ErrorActionPreference = "Stop"
 # Run models sequentially by default. It prevents three independent provider
 # rate limits from multiplying on Windows and keeps each model's answer files
 # resumable through LiveBench's native --resume behavior.
-$modelPlan = @{
-	"tech-lead" = [pscustomobject]@{ Provider = "volcengine-agent-plan"; Model = "glm-5.2"; TransportModel = "ansteel-livebench-glm-5-2"; DisplayName = "livebench-glm-5.2" }
-	"staff-engineer" = [pscustomobject]@{ Provider = "deepseek-flash"; Model = "deepseek-v4-flash"; TransportModel = "ansteel-livebench-deepseek-v4-flash"; DisplayName = "livebench-deepseek-v4-flash" }
-	"qa-engineer" = [pscustomobject]@{ Provider = "qwen-token-plan-cn"; Model = "qwen3.8-max"; TransportModel = "ansteel-livebench-qwen3-8-max"; DisplayName = "livebench-qwen3.8-max" }
+$protocolConfigPath = Join-Path $PSScriptRoot "ansteel-livebench-config.json"
+if (-not (Test-Path -LiteralPath $protocolConfigPath)) {
+	throw "Protocol role-model config not found at $protocolConfigPath."
+}
+$protocolConfig = Get-Content -LiteralPath $protocolConfigPath -Raw | ConvertFrom-Json
+
+function ConvertTo-AnsteelTransportModel {
+	param([string]$ModelId)
+	$slug = ($ModelId -replace '[^A-Za-z0-9]+', '-')
+	return "ansteel-livebench-$slug"
+}
+
+# Role models come from the protocol config (single source of truth);
+# changing a role model means editing ansteel-livebench-config.json only.
+$modelPlan = @{}
+foreach ($roleName in @("tech-lead", "staff-engineer", "qa-engineer")) {
+	$reference = [string]$protocolConfig.roles.$roleName.model
+	$provider, $model = $reference -split '/', 2
+	if ([string]::IsNullOrWhiteSpace($provider) -or [string]::IsNullOrWhiteSpace($model)) {
+		throw "Role '$roleName' in $protocolConfigPath must use provider/model form."
+	}
+	$modelPlan[$roleName] = [pscustomobject]@{
+		Provider = $provider
+		Model = $model
+		TransportModel = ConvertTo-AnsteelTransportModel $model
+		DisplayName = "livebench-$model"
+	}
 }
 
 function Assert-ForwardedQuestionRange {

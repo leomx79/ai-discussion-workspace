@@ -112,14 +112,15 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
     def test_repository_protocol_config_keeps_strict_role_and_budget_contract(self) -> None:
         config = ADAPTER.load_protocol_config(PROTOCOL_CONFIG_PATH)
 
-        self.assertEqual(
-            [config["roles"][role]["model"] for role in ("tech-lead", "staff-engineer", "qa-engineer")],
-            [
-                "volcengine-agent-plan/glm-5.2",
-                "deepseek-flash/deepseek-v4-flash",
-                "qwen-token-plan-cn/qwen3.8-max",
-            ],
-        )
+        models = [config["roles"][role]["model"] for role in ("tech-lead", "staff-engineer", "qa-engineer")]
+        self.assertEqual(len(models), 3)
+        # The model set is intentionally not hard-coded: the repository config is
+        # the single source of truth for role models, so switching a role model
+        # must not require touching this test. Only distinctness is enforced here.
+        self.assertEqual(len(set(models)), 3, "three role models must be distinct")
+        for model in models:
+            provider, separator, model_id = model.partition("/")
+            self.assertTrue(separator and provider and model_id, f"model must use provider/model form: {model}")
         # These are the core protocol's representable maxima. Within the fixed
         # two-revision topology, they do not impose a practical resource ceiling.
         self.assertEqual(config["stageTimeoutMs"], 2147483647)

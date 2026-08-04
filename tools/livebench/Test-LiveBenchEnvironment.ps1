@@ -9,11 +9,28 @@ $ErrorActionPreference = "Stop"
 # These identities match the successful r57 topology. The test deliberately
 # verifies only provider metadata and credential presence, never credential text
 # and never a billable model request.
-$expectedModels = @(
-	[pscustomobject]@{ Role = "tech-lead"; Provider = "volcengine-agent-plan"; Model = "glm-5.2"; TransportModel = "ansteel-livebench-glm-5-2"; DisplayName = "livebench-glm-5.2" },
-	[pscustomobject]@{ Role = "staff-engineer"; Provider = "deepseek-flash"; Model = "deepseek-v4-flash"; TransportModel = "ansteel-livebench-deepseek-v4-flash"; DisplayName = "livebench-deepseek-v4-flash" },
-	[pscustomobject]@{ Role = "qa-engineer"; Provider = "qwen-token-plan-cn"; Model = "qwen3.8-max"; TransportModel = "ansteel-livebench-qwen3-8-max"; DisplayName = "livebench-qwen3.8-max" }
-)
+$protocolConfigPath = Join-Path $PSScriptRoot "ansteel-livebench-config.json"
+if (-not (Test-Path -LiteralPath $protocolConfigPath)) {
+	throw "Protocol role-model config not found at $protocolConfigPath."
+}
+$protocolConfig = Get-Content -LiteralPath $protocolConfigPath -Raw | ConvertFrom-Json
+
+function ConvertTo-AnsteelTransportModel {
+	param([string]$ModelId)
+	$slug = ($ModelId -replace '[^A-Za-z0-9]+', '-')
+	return "ansteel-livebench-$slug"
+}
+
+# Role identities come from the protocol config (single source of truth).
+$expectedModels = @()
+foreach ($roleName in @("tech-lead", "staff-engineer", "qa-engineer")) {
+	$reference = [string]$protocolConfig.roles.$roleName.model
+	$provider, $model = $reference -split '/', 2
+	if ([string]::IsNullOrWhiteSpace($provider) -or [string]::IsNullOrWhiteSpace($model)) {
+		throw "Role '$roleName' in $protocolConfigPath must use provider/model form."
+	}
+	$expectedModels += [pscustomobject]@{ Role = $roleName; Provider = $provider; Model = $model; TransportModel = ConvertTo-AnsteelTransportModel $model; DisplayName = "livebench-$model" }
+}
 $identityCount = @($expectedModels | ForEach-Object { "$($_.Provider)/$($_.Model)" } | Select-Object -Unique).Count
 if ($identityCount -ne $expectedModels.Count) {
 	throw "LiveBench requires three distinct provider/model identities."
