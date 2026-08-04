@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $expectedModels = @(
 	[pscustomobject]@{ Role = "tech-lead"; Provider = "volcengine-agent-plan"; Model = "glm-5.2"; TransportModel = "ansteel-livebench-glm-5-2"; DisplayName = "livebench-glm-5.2" },
 	[pscustomobject]@{ Role = "staff-engineer"; Provider = "deepseek-flash"; Model = "deepseek-v4-flash"; TransportModel = "ansteel-livebench-deepseek-v4-flash"; DisplayName = "livebench-deepseek-v4-flash" },
-	[pscustomobject]@{ Role = "qa-engineer"; Provider = "volcengine-coding"; Model = "kimi-k2.7-code"; TransportModel = "ansteel-livebench-kimi-k2-7-code"; DisplayName = "livebench-kimi-k2.7-code" }
+	[pscustomobject]@{ Role = "qa-engineer"; Provider = "qwen-token-plan-cn"; Model = "qwen3.8-max"; TransportModel = "ansteel-livebench-qwen3-8-max"; DisplayName = "livebench-qwen3.8-max" }
 )
 $identityCount = @($expectedModels | ForEach-Object { "$($_.Provider)/$($_.Model)" } | Select-Object -Unique).Count
 if ($identityCount -ne $expectedModels.Count) {

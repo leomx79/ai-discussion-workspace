@@ -117,7 +117,7 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
             [
                 "volcengine-agent-plan/glm-5.2",
                 "deepseek-flash/deepseek-v4-flash",
-                "volcengine-coding/kimi-k2.7-code",
+                "qwen-token-plan-cn/qwen3.8-max",
             ],
         )
         # These are the core protocol's representable maxima. Within the fixed

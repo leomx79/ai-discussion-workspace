@@ -28,7 +28,7 @@ $ErrorActionPreference = "Stop"
 $modelPlan = @{
 	"tech-lead" = [pscustomobject]@{ Provider = "volcengine-agent-plan"; Model = "glm-5.2"; TransportModel = "ansteel-livebench-glm-5-2"; DisplayName = "livebench-glm-5.2" }
 	"staff-engineer" = [pscustomobject]@{ Provider = "deepseek-flash"; Model = "deepseek-v4-flash"; TransportModel = "ansteel-livebench-deepseek-v4-flash"; DisplayName = "livebench-deepseek-v4-flash" }
-	"qa-engineer" = [pscustomobject]@{ Provider = "volcengine-coding"; Model = "kimi-k2.7-code"; TransportModel = "ansteel-livebench-kimi-k2-7-code"; DisplayName = "livebench-kimi-k2.7-code" }
+	"qa-engineer" = [pscustomobject]@{ Provider = "qwen-token-plan-cn"; Model = "qwen3.8-max"; TransportModel = "ansteel-livebench-qwen3-8-max"; DisplayName = "livebench-qwen3.8-max" }
 }
 
 function Assert-ForwardedQuestionRange {
