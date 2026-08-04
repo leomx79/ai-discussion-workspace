@@ -202,12 +202,40 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		expect(result.verdict).toBe("approved");
-		expect(progress).toEqual(
-			MUTUAL_REVIEW_STAGE_ORDER.flatMap(({ role, stage }) => [
-				`started:${role}/${stage}`,
-				`completed:${role}/${stage}`,
-			]),
-		);
+		// Independent stages start in parallel: all started events of a group
+		// are emitted first (role order), then all completed events (commit order).
+		expect(progress).toEqual([
+			"started:tech-lead/architecture",
+			"completed:tech-lead/architecture",
+			"started:staff-engineer/staff-critique",
+			"started:qa-engineer/qa-critique",
+			"completed:staff-engineer/staff-critique",
+			"completed:qa-engineer/qa-critique",
+			"started:tech-lead/tech-lead-cross-examination",
+			"started:staff-engineer/staff-cross-examination",
+			"started:qa-engineer/qa-cross-examination",
+			"completed:tech-lead/tech-lead-cross-examination",
+			"completed:staff-engineer/staff-cross-examination",
+			"completed:qa-engineer/qa-cross-examination",
+			"started:tech-lead/architecture-revision",
+			"completed:tech-lead/architecture-revision",
+			"started:staff-engineer/staff-revision",
+			"completed:staff-engineer/staff-revision",
+			"started:qa-engineer/qa-revision",
+			"completed:qa-engineer/qa-revision",
+			"started:tech-lead/tech-lead-verification",
+			"started:staff-engineer/staff-verification",
+			"started:qa-engineer/qa-verification",
+			"completed:tech-lead/tech-lead-verification",
+			"completed:staff-engineer/staff-verification",
+			"completed:qa-engineer/qa-verification",
+			"started:tech-lead/consensus",
+			"completed:tech-lead/consensus",
+			"started:staff-engineer/staff-sign-off",
+			"started:qa-engineer/qa-sign-off",
+			"completed:staff-engineer/staff-sign-off",
+			"completed:qa-engineer/qa-sign-off",
+		]);
 	});
 
 	it("replays a committed transcript entry without calling the completed role stage again", async () => {
@@ -2983,7 +3011,8 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.terminationReason).toBe("final-sign-off-rejected");
 		expect(result.consensus).toBe("[L1] Immutable consensus");
 		expect(result.markdown).toContain("- Total recorded challenges: 3");
-		expect(calls.map(({ role, stage }) => `${role}:${stage}`)).not.toContain("qa-engineer:qa-sign-off");
+		expect(calls.map(({ role, stage }) => `${role}:${stage}`)).toContain("staff-engineer:staff-sign-off");
+		expect(result.transcript.some((entry) => entry.stage === "qa-sign-off")).toBe(false);
 	});
 
 	it("requires Staff and QA final sign-off on the immutable Tech Lead consensus", async () => {
@@ -3030,7 +3059,7 @@ describe("runAnsteelDiscussion", () => {
 			expect(result.consensus).toBe("[L1] Immutable consensus");
 			expect(result.markdown).not.toContain("## Tech Lead Consensus");
 			expect(result.markdown).toContain("- Governance result: REJECTED");
-			expect(calls.at(-1)).toEqual({ role: rejectedRole, stage: rejectedStage });
+			expect(result.transcript.at(-1)).toMatchObject({ role: rejectedRole, stage: rejectedStage });
 		},
 	);
 
@@ -3183,7 +3212,14 @@ describe("runAnsteelDiscussion", () => {
 					? "[L1] Immutable consensus"
 					: undefined,
 			);
-			expect(calls).toEqual(stageOrder.slice(0, blankIndex + 1));
+			// Parallel groups invoke every independent member; archiving keeps protocol order.
+			const parallelGroupEnd: Record<string, number> = {
+				"staff-critique": 2,
+				"staff-verification": 11,
+				"staff-sign-off": 14,
+			};
+			const expectedEnd = Math.max(blankIndex, parallelGroupEnd[blankStage] ?? blankIndex);
+			expect(calls).toEqual(stageOrder.slice(0, expectedEnd + 1));
 			expect(result.transcript.at(-1)?.response).toBe(rawWhitespace);
 			expect(result.markdown).toContain(
 				`${blankRole} / ${blankStage} returned an empty or whitespace-only response`,
@@ -3223,6 +3259,7 @@ describe("runAnsteelDiscussion", () => {
 		expect(calls).toEqual([
 			{ role: "tech-lead", stage: "architecture" },
 			{ role: "staff-engineer", stage: "staff-critique" },
+			{ role: "qa-engineer", stage: "qa-critique" },
 		]);
 		expect(result.markdown).toContain("## Stage Failure");
 		expect(result.markdown).toContain("- Failed role: staff-engineer");
@@ -3312,7 +3349,7 @@ describe("runAnsteelDiscussion", () => {
 				response: completeWorkCard("[L1] Architecture evidence "),
 			}),
 		]);
-		expect(prompts.map(({ role }) => role)).toEqual(["tech-lead", "staff-engineer"]);
+		expect(prompts.map(({ role }) => role)).toEqual(["tech-lead", "staff-engineer", "qa-engineer"]);
 		expect(prompts.some(({ prompt }) => prompt.includes("Current stage: consensus."))).toBe(false);
 		expect(created).toEqual(["tech-lead", "staff-engineer", "qa-engineer"]);
 		expect(disposed).toEqual(["tech-lead", "staff-engineer", "qa-engineer"]);

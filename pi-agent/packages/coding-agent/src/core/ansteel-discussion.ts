@@ -3022,11 +3022,13 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	let epochCommittedStages = 0;
 
 	const transcript: AnsteelTranscriptEntry[] = options.initialState?.transcript.map((entry) => ({ ...entry })) ?? [];
-	const stageAudits: AnsteelStageAudit[] = options.initialState?.stageAudits?.map((audit) => ({
-		...audit,
-		events: audit.events.map((event) => ({ ...event })),
-	})) ?? [];
-	const budgetLedger: AnsteelBudgetLedgerEntry[] = options.initialState?.budgetLedger?.map((entry) => ({ ...entry })) ?? [];
+	const stageAudits: AnsteelStageAudit[] =
+		options.initialState?.stageAudits?.map((audit) => ({
+			...audit,
+			events: audit.events.map((event) => ({ ...event })),
+		})) ?? [];
+	const budgetLedger: AnsteelBudgetLedgerEntry[] =
+		options.initialState?.budgetLedger?.map((entry) => ({ ...entry })) ?? [];
 	const adaptiveBudgetEvents = [
 		...(options.initialState?.adaptiveBudgetEvents?.map((event) => ({ ...event })) ?? []),
 		...(options.adaptiveBudgetEvents?.map((event) => ({ ...event })) ?? []),
@@ -3037,7 +3039,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	const challengeLedger: AnsteelChallengeLedgerEntry[] = [];
 	const revisionRounds: AnsteelRevisionRound[] = [];
 	let immutableLedgerSummary: string | undefined;
-	type StageResult = { response: string; entry: AnsteelTranscriptEntry } | { failure: AnsteelDiscussionFailure };
+	type StageResult =
+		| { response: string; entry: AnsteelTranscriptEntry; deferred?: boolean; replayed?: boolean }
+		| { failure: AnsteelDiscussionFailure };
 	type TimedRoleResult =
 		| { kind: "response"; response: string }
 		| { kind: "failure"; error: unknown }
@@ -3048,21 +3052,61 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		challengeLedger?: readonly AnsteelChallengeLedgerEntry[];
 		formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
 		immutableLedgerSummary?: string;
+		/**
+		 * When true, the stage result is returned without appending its transcript
+		 * entry. The caller decides afterwards whether the entry is committed, which
+		 * lets independent parallel role stages share one deterministic transcript
+		 * order and lets a failed peer keep the transcript identical to the
+		 * sequential protocol.
+		 */
+		deferCommit?: boolean;
+		/**
+		 * Explicit protected-verification reserve shared by every member of a
+		 * parallel stage group. Parallel stages must not overwrite each other's
+		 * budget reserve while their tool calls are in flight.
+		 */
+		reserveOverride?: number;
 	}
+	let commitChain: Promise<void> = Promise.resolve();
+	const commitStageEntry = (entry: AnsteelTranscriptEntry, emitCompleted?: () => void): Promise<void> => {
+		const next = commitChain.then(() => {
+			transcript.push(entry);
+			replayIndex++;
+			epochCommittedStages++;
+			options.onCommittedState?.({
+				projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
+				transcript: transcript.map((item) => ({ ...item })),
+				stageAudits: stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })),
+				budgetLedger: budgetLedger.map((item) => ({ ...item })),
+				adaptiveBudgetEvents: adaptiveBudgetEvents.map((event) => ({ ...event })),
+			});
+			emitCompleted?.();
+		});
+		commitChain = next.then(
+			() => undefined,
+			() => undefined,
+		);
+		return next;
+	};
 	const runStage = async (
 		role: AnsteelRole,
 		stage: AnsteelDiscussionStage,
 		stageOptions: RunStageOptions = {},
 	): Promise<StageResult> => {
 		projectToolBudget.setProtectedVerificationReserve(
-			getRequiredProtectedVerificationReserve(stage, adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0, stageOptions.round),
+			stageOptions.reserveOverride ??
+				getRequiredProtectedVerificationReserve(
+					stage,
+					adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0,
+					stageOptions.round,
+				),
 		);
 		const stageStartedAt = Date.now();
 		let currentStageTimeoutMs = stageBudgetPolicy.stageTimeoutMs;
 		let extensions = 0;
-		const unresolvedChallengeCount = stageOptions.challengeLedger?.filter(
-			(entry) => entry.status === "open" && entry.targetRole === role,
-		).length ?? 0;
+		const unresolvedChallengeCount =
+			stageOptions.challengeLedger?.filter((entry) => entry.status === "open" && entry.targetRole === role).length ??
+			0;
 		const adaptiveBudgetState = adaptiveBudgetPolicy
 			? createAnsteelAdaptiveBudgetState({
 					policy: adaptiveBudgetPolicy,
@@ -3082,7 +3126,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				})
 			: undefined;
 		if (adaptiveBudgetState) {
-			adaptiveBudgetState.remainingProjectToolCalls = Math.max(0, projectToolBudget.getMaximumToolCalls() - projectToolBudget.getUsedToolCalls());
+			adaptiveBudgetState.remainingProjectToolCalls = Math.max(
+				0,
+				projectToolBudget.getMaximumToolCalls() - projectToolBudget.getUsedToolCalls(),
+			);
 		}
 		const prompt = buildRolePrompt(role, stage, topic, stageOptions.context ?? transcript, {
 			round: stageOptions.round,
@@ -3108,7 +3155,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			Boolean(replayedEntry.formatRepair) === Boolean(stageOptions.formatRepair)
 		) {
 			replayIndex++;
-			return { response: replayedEntry.response, entry: replayedEntry };
+			return { response: replayedEntry.response, entry: replayedEntry, deferred: true, replayed: true };
 		}
 		options.onNextAction?.(call);
 		if (
@@ -3182,7 +3229,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		const requestToolExtension = (): number | undefined => {
 			if (!adaptiveBudgetState || !adaptiveBudgetPolicy) return undefined;
 			recordObservedAdaptiveToolEvents();
-			adaptiveBudgetState.remainingProjectToolCalls = Math.max(0, projectToolBudget.getMaximumToolCalls() - projectToolBudget.getUsedToolCalls());
+			adaptiveBudgetState.remainingProjectToolCalls = Math.max(
+				0,
+				projectToolBudget.getMaximumToolCalls() - projectToolBudget.getUsedToolCalls(),
+			);
 			const decision = decideAnsteelAdaptiveAllocation({
 				state: adaptiveBudgetState,
 				policy: adaptiveBudgetPolicy,
@@ -3305,17 +3355,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			...(stageOptions.round === undefined ? {} : { round: stageOptions.round }),
 			...(stageOptions.formatRepair ? { formatRepair: true as const } : {}),
 		};
-		transcript.push(entry);
-		replayIndex++;
-		epochCommittedStages++;
-		options.onCommittedState?.({
-			projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
-			transcript: transcript.map((item) => ({ ...item })),
-			stageAudits: stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })),
-			budgetLedger: budgetLedger.map((item) => ({ ...item })),
-			adaptiveBudgetEvents: adaptiveBudgetEvents.map((event) => ({ ...event })),
-		});
-		emitStageEvent("completed");
+		if (stageOptions.deferCommit) {
+			return { response, entry, deferred: true };
+		}
+		await commitStageEntry(entry, () => emitStageEvent("completed"));
 		return { response, entry };
 	};
 	const reject = (
@@ -3377,6 +3420,108 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			};
 		}
 		return { response: stageResult.response, entry: stageResult.entry };
+	};
+	const runParallelStageGroup = async <
+		T extends { role: AnsteelRole; stage: AnsteelDiscussionStage; options: RunStageOptions },
+	>(
+		group: readonly T[],
+		handle: (
+			member: T,
+			outcome: { response: string; entry: AnsteelTranscriptEntry },
+		) => Promise<AnsteelDiscussionResult | void> | AnsteelDiscussionResult | void,
+		rejectionContext: { consensus?: string } = {},
+	): Promise<AnsteelDiscussionResult | undefined> => {
+		// Parallel groups share one protected-verification reserve so concurrent
+		// stages cannot overwrite each other's budget protection.
+		const reserveOverride =
+			group.length === 0
+				? undefined
+				: Math.max(
+						...group.map(({ stage, options }) =>
+							options.reserveOverride ??
+							getRequiredProtectedVerificationReserve(
+								stage,
+								adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0,
+								options.round,
+							),
+						),
+					);
+		const emitGroupCompleted = (member: T): void => {
+			try {
+				options.onStageEvent?.({
+					type: "completed",
+					role: member.role,
+					stage: member.stage,
+					...(member.options.round === undefined ? {} : { round: member.options.round }),
+					budget: {
+						stageTimeoutMs: stageBudgetPolicy.stageTimeoutMs,
+						maxStageTimeoutMs: stageBudgetPolicy.maxStageTimeoutMs,
+						projectTimeoutMs: stageBudgetPolicy.projectTimeoutMs,
+						maxToolCallsPerStage: stageBudgetPolicy.maxToolCallsPerStage,
+						maxProjectToolCalls: projectToolBudget.getMaximumToolCalls(),
+						projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
+					},
+				});
+			} catch {
+				// Progress reporting must not affect discussion governance.
+			}
+		};
+		if (adaptiveBudgetPolicy && epochCommittedStages > 0 && elapsedSince(epochStartedAt) >= adaptiveBudgetPolicy.epochTimeoutMs) {
+			// Epoch boundary pause: register only the first member as nextAction.
+			const first = group[0];
+			if (first !== undefined) {
+				try {
+					options.onNextAction?.({
+						role: first.role,
+						stage: first.stage,
+						prompt: "",
+						...(first.options.round === undefined ? {} : { round: first.options.round }),
+						...(first.options.formatRepair ? { formatRepair: true as const } : {}),
+					});
+				} catch {
+					// Progress reporting must not affect governance.
+				}
+			}
+			throw new AnsteelEpochPausedError();
+		}
+		const outcomes = await Promise.all(
+			group.map(async (member) => {
+				const result = await runStage(member.role, member.stage, {
+					...member.options,
+					deferCommit: true,
+					...(reserveOverride === undefined ? {} : { reserveOverride }),
+				});
+				return { member, result };
+			}),
+		);
+		// Members start in parallel, but archiving and verdicts follow protocol order:
+		// any failure, blank response, or business rejection keeps earlier members
+		// archived and leaves later member results uncommitted.
+		for (const { member, result } of outcomes) {
+			if ("failure" in result) {
+				return reject(
+					formatStageFailureStopReason(result.failure),
+					result.failure,
+					rejectionContext.consensus,
+					getStageFailureTerminationReason(result.failure),
+				);
+			}
+			if (isBlankRoleResponse(result.response)) {
+				await commitStageEntry(result.entry, emitGroupCompleted.bind(undefined, member));
+				return reject(
+					formatBlankResponseStopReason(member.role, member.stage),
+					undefined,
+					rejectionContext.consensus,
+					"blank-response",
+				);
+			}
+			if (!result.replayed) {
+				await commitStageEntry(result.entry, emitGroupCompleted.bind(undefined, member));
+			}
+			const stop = await handle(member, { response: result.response, entry: result.entry });
+			if (stop) return stop;
+		}
+		return undefined;
 	};
 	const runSingleFormatRepair = async (
 		role: AnsteelRole,
@@ -3441,44 +3586,68 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		return { response: repaired.response, entry: repaired.entry, repaired: true };
 	};
 
-	const workCardStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
-		{ role: "tech-lead", stage: "architecture" },
-		{ role: "staff-engineer", stage: "staff-critique" },
-		{ role: "qa-engineer", stage: "qa-critique" },
-	];
 	const workCards: AnsteelTranscriptEntry[] = [];
-	for (const { role, stage } of workCardStages) {
-		const result = await runRequiredStage(role, stage, { context: [] });
-		if ("rejection" in result) return result.rejection;
-		const sectionRepair = await repairMissingWorkCardSections(
-			role,
-			stage,
-			{ context: [] },
-			result.entry,
-			REQUIRED_WORK_CARD_SECTIONS,
-			false,
-		);
-		if ("rejection" in sectionRepair) return sectionRepair.rejection;
-		workCards.push(sectionRepair.entry);
-	}
+	// TL architecture runs first; the independent Staff/QA critiques run in
+	// parallel and commit in protocol order.
+	const architectureResult = await runRequiredStage("tech-lead", "architecture", { context: [] });
+	if ("rejection" in architectureResult) return architectureResult.rejection;
+	const architectureRepair = await repairMissingWorkCardSections(
+		"tech-lead",
+		"architecture",
+		{ context: [] },
+		architectureResult.entry,
+		REQUIRED_WORK_CARD_SECTIONS,
+		false,
+	);
+	if ("rejection" in architectureRepair) return architectureRepair.rejection;
+	workCards.push(architectureRepair.entry);
+	const workCardStop = await runParallelStageGroup(
+		[
+			{ role: "staff-engineer", stage: "staff-critique", options: { context: [] } },
+			{ role: "qa-engineer", stage: "qa-critique", options: { context: [] } },
+		],
+		async (member, { entry }) => {
+			const sectionRepair = await repairMissingWorkCardSections(
+				member.role,
+				member.stage,
+				member.options,
+				entry,
+				REQUIRED_WORK_CARD_SECTIONS,
+				false,
+			);
+			if ("rejection" in sectionRepair) return sectionRepair.rejection;
+			workCards.push(sectionRepair.entry);
+			return undefined;
+		},
+	);
+	if (workCardStop) return workCardStop;
 
-	const crossExaminationStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
-		{ role: "tech-lead", stage: "tech-lead-cross-examination" },
-		{ role: "staff-engineer", stage: "staff-cross-examination" },
-		{ role: "qa-engineer", stage: "qa-cross-examination" },
-	];
-	for (const { role, stage } of crossExaminationStages) {
-		const stageOptions = { context: workCards };
-		let result = await runRequiredStage(role, stage, stageOptions);
-		if ("rejection" in result) return result.rejection;
-		let challengeError = addChallengeIds(challengeLedger, role, 0, result.response, false, true, true);
-		if (challengeError && isRepairableChallengeMarkerError(challengeError)) {
-			result = await runSingleFormatRepair(role, stage, stageOptions, result.entry, challengeError);
-			if ("rejection" in result) return result.rejection;
-			challengeError = addChallengeIds(challengeLedger, role, 0, result.response, false, true, true);
-		}
-		if (challengeError) return reject(challengeError, undefined, undefined, "invalid-challenge-ledger");
-	}
+	// The three cross-examinations are independent; they run in parallel and
+	// their challenges are registered in protocol order.
+	const crossExaminationStop = await runParallelStageGroup(
+		[
+			{ role: "tech-lead", stage: "tech-lead-cross-examination", options: { context: workCards } },
+			{ role: "staff-engineer", stage: "staff-cross-examination", options: { context: workCards } },
+			{ role: "qa-engineer", stage: "qa-cross-examination", options: { context: workCards } },
+		],
+		async (member, { response, entry }) => {
+			let challengeError = addChallengeIds(challengeLedger, member.role, 0, response, false, true, true);
+			if (challengeError && isRepairableChallengeMarkerError(challengeError)) {
+				const repaired = await runSingleFormatRepair(
+					member.role,
+					member.stage,
+					member.options,
+					entry,
+					challengeError,
+				);
+				if ("rejection" in repaired) return repaired.rejection;
+				challengeError = addChallengeIds(challengeLedger, member.role, 0, repaired.response, false, true, true);
+			}
+			if (challengeError) return reject(challengeError, undefined, undefined, "invalid-challenge-ledger");
+			return undefined;
+		},
+	);
+	if (crossExaminationStop) return crossExaminationStop;
 
 	let collaborationAccepted = false;
 	for (let round = 1; round <= ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS; round++) {
@@ -3534,70 +3703,88 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		}
 
 		const verificationLedger = challengeLedger.map((challenge) => ({ ...challenge }));
-		const verificationStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
-			{ role: "tech-lead", stage: "tech-lead-verification" },
-			{ role: "staff-engineer", stage: "staff-verification" },
-			{ role: "qa-engineer", stage: "qa-verification" },
-		];
 		const verificationVerdicts = {} as Record<AnsteelRole, "approved" | "rejected">;
-		for (const { role, stage } of verificationStages) {
-			const stageOptions = {
-				round,
-				context: revisedWorkCards,
-				challengeLedger: verificationLedger,
-			};
-			let result = await runRequiredStage(role, stage, stageOptions);
-			if ("rejection" in result) return result.rejection;
-			let usedFormatRepair = false;
-			let verdict = getExplicitVerdict(result.response);
-			if (!verdict && isRepairableVerdictMarkerError(result.response)) {
-				result = await runSingleFormatRepair(
-					role,
-					stage,
-					stageOptions,
-					result.entry,
-					`${role} / ${stage} did not provide the required exact verdict`,
-				);
-				if ("rejection" in result) return result.rejection;
-				usedFormatRepair = true;
-				verdict = getExplicitVerdict(result.response);
-			}
-			if (!verdict) {
-				return reject(
-					`${role} / ${stage} did not provide the required exact verdict`,
-					undefined,
-					undefined,
-					"invalid-verdict",
-				);
-			}
-			verificationVerdicts[role] = verdict;
-			if (verdict === "rejected") {
-				let verificationError = addChallengeIds(challengeLedger, role, round, result.response, true, true);
-				if (verificationError && !usedFormatRepair && isRepairableChallengeMarkerError(verificationError)) {
-					result = await runSingleFormatRepair(role, stage, stageOptions, result.entry, verificationError);
-					if ("rejection" in result) return result.rejection;
-					verdict = getExplicitVerdict(result.response);
-					if (!verdict) {
-						return reject(
-							`${role} / ${stage} did not provide the required exact verdict`,
-							undefined,
-							undefined,
-							"invalid-verdict",
-						);
-					}
-					if (verdict !== "rejected") {
-						return reject(
-							`${role} / ${stage} changed its rejection during a format-only repair`,
-							undefined,
-							undefined,
-							"invalid-challenge-ledger",
-						);
-					}
-					verificationError = addChallengeIds(challengeLedger, role, round, result.response, true, true);
+		// Three roles independently verify the same revision and ledger in parallel.
+		const verificationStop = await runParallelStageGroup(
+			[
+				{
+					role: "tech-lead",
+					stage: "tech-lead-verification",
+					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger },
+				},
+				{
+					role: "staff-engineer",
+					stage: "staff-verification",
+					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger },
+				},
+				{
+					role: "qa-engineer",
+					stage: "qa-verification",
+					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger },
+				},
+			],
+			async (member, { response, entry }) => {
+				const role = member.role;
+				const stage = member.stage;
+				const stageOptions = member.options;
+				let currentResponse = response;
+				let currentEntry = entry;
+				let usedFormatRepair = false;
+				let verdict = getExplicitVerdict(currentResponse);
+				if (!verdict && isRepairableVerdictMarkerError(currentResponse)) {
+					const repaired = await runSingleFormatRepair(
+						role,
+						stage,
+						stageOptions,
+						currentEntry,
+						`${role} / ${stage} did not provide the required exact verdict`,
+					);
+					if ("rejection" in repaired) return repaired.rejection;
+					usedFormatRepair = true;
+					currentResponse = repaired.response;
+					currentEntry = repaired.entry;
+					verdict = getExplicitVerdict(currentResponse);
 				}
-				if (verificationError) return reject(verificationError, undefined, undefined, "invalid-challenge-ledger");
-			}
-		}
+				if (!verdict) {
+					return reject(
+						`${role} / ${stage} did not provide the required exact verdict`,
+						undefined,
+						undefined,
+						"invalid-verdict",
+					);
+				}
+				verificationVerdicts[role] = verdict;
+				if (verdict === "rejected") {
+					let verificationError = addChallengeIds(challengeLedger, role, round, currentResponse, true, true);
+					if (verificationError && !usedFormatRepair && isRepairableChallengeMarkerError(verificationError)) {
+						const repaired = await runSingleFormatRepair(role, stage, stageOptions, currentEntry, verificationError);
+						if ("rejection" in repaired) return repaired.rejection;
+						currentResponse = repaired.response;
+						verdict = getExplicitVerdict(currentResponse);
+						if (!verdict) {
+							return reject(
+								`${role} / ${stage} did not provide the required exact verdict`,
+								undefined,
+								undefined,
+								"invalid-verdict",
+							);
+						}
+						if (verdict !== "rejected") {
+							return reject(
+								`${role} / ${stage} changed its rejection during a format-only repair`,
+								undefined,
+								undefined,
+								"invalid-challenge-ledger",
+							);
+						}
+						verificationError = addChallengeIds(challengeLedger, role, round, currentResponse, true, true);
+					}
+					if (verificationError) return reject(verificationError, undefined, undefined, "invalid-challenge-ledger");
+				}
+				return undefined;
+			},
+		);
+		if (verificationStop) return verificationStop;
 
 		const outcome = ANSTEEL_ROLES.every((role) => verificationVerdicts[role] === "approved")
 			? "approved"
@@ -3646,73 +3833,61 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	}
 	const consensus = consensusResult.response;
 
-	const finalSignOffStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
-		{ role: "staff-engineer", stage: "staff-sign-off" },
-		{ role: "qa-engineer", stage: "qa-sign-off" },
-	];
-	for (const { role, stage } of finalSignOffStages) {
-		let signOffResult = await runStage(role, stage, { immutableLedgerSummary });
-		if ("failure" in signOffResult) {
-			return reject(
-				formatStageFailureStopReason(signOffResult.failure),
-				signOffResult.failure,
-				consensus,
-				getStageFailureTerminationReason(signOffResult.failure),
-			);
-		}
-		if (isBlankRoleResponse(signOffResult.response)) {
-			return reject(formatBlankResponseStopReason(role, stage), undefined, consensus, "blank-response");
-		}
-		const signOffLedgerCountClaim = getManualLedgerCountClaim(signOffResult.response);
-		if (signOffLedgerCountClaim) {
-			return reject(
-				`${role} / ${stage} manually stated a ledger count (${signOffLedgerCountClaim}) instead of citing the immutable coordinator summary`,
-				undefined,
-				consensus,
-				"final-sign-off-rejected",
-			);
-		}
-		let verdict = getExplicitVerdict(signOffResult.response);
-		if (!verdict && isRepairableVerdictMarkerError(signOffResult.response)) {
-			const priorEntry = transcript.at(-1);
-			if (!priorEntry) throw new Error(`Ansteel ${role} / ${stage} completed without a transcript entry`);
-			signOffResult = await runStage(role, stage, {
-				formatRepair: {
-					reason: `${role} / ${stage} did not provide the required exact verdict`,
-					previousResponse: priorEntry.response,
-				},
-				immutableLedgerSummary,
-			});
-			if ("failure" in signOffResult) {
+	// Staff and QA final sign-off are independent and run in parallel.
+	const finalSignOffStop = await runParallelStageGroup(
+		[
+			{ role: "staff-engineer", stage: "staff-sign-off", options: { immutableLedgerSummary } },
+			{ role: "qa-engineer", stage: "qa-sign-off", options: { immutableLedgerSummary } },
+		],
+		async (member, { response, entry }) => {
+			const role = member.role;
+			const stage = member.stage;
+			const signOffLedgerCountClaim = getManualLedgerCountClaim(response);
+			if (signOffLedgerCountClaim) {
 				return reject(
-					formatStageFailureStopReason(signOffResult.failure),
-					signOffResult.failure,
-					consensus,
-					getStageFailureTerminationReason(signOffResult.failure),
-				);
-			}
-			if (isBlankRoleResponse(signOffResult.response)) {
-				return reject(formatBlankResponseStopReason(role, stage), undefined, consensus, "blank-response");
-			}
-			if (!formatRepairPreservesNonMarkerContent(priorEntry.response, signOffResult.response)) {
-				return reject(
-					`${role} / ${stage} changed non-marker content during a format-only repair`,
+					`${role} / ${stage} manually stated a ledger count (${signOffLedgerCountClaim}) instead of citing the immutable coordinator summary`,
 					undefined,
 					consensus,
 					"final-sign-off-rejected",
 				);
 			}
-			verdict = getExplicitVerdict(signOffResult.response);
-		}
-		if (verdict !== "approved") {
-			return reject(
-				`${role} / ${stage} did not provide the required explicit approval`,
-				undefined,
-				consensus,
-				"final-sign-off-rejected",
-			);
-		}
-	}
+			let currentResponse = response;
+			let currentEntry = entry;
+			let verdict = getExplicitVerdict(currentResponse);
+			if (!verdict && isRepairableVerdictMarkerError(currentResponse)) {
+				const repaired = await runSingleFormatRepair(
+					role,
+					stage,
+					{ immutableLedgerSummary },
+					currentEntry,
+					`${role} / ${stage} did not provide the required exact verdict`,
+				);
+				if ("rejection" in repaired) return repaired.rejection;
+				if (!formatRepairPreservesNonMarkerContent(currentEntry.response, repaired.response)) {
+					return reject(
+						`${role} / ${stage} changed non-marker content during a format-only repair`,
+						undefined,
+						consensus,
+						"final-sign-off-rejected",
+					);
+				}
+				currentResponse = repaired.response;
+				currentEntry = repaired.entry;
+				verdict = getExplicitVerdict(currentResponse);
+			}
+			if (verdict !== "approved") {
+				return reject(
+					`${role} / ${stage} did not provide the required explicit approval`,
+					undefined,
+					consensus,
+					"final-sign-off-rejected",
+				);
+			}
+			return undefined;
+		},
+		{ consensus },
+	);
+	if (finalSignOffStop) return finalSignOffStop;
 
 	return {
 		topic,
