@@ -120,6 +120,7 @@ def render_benchmark_contract(question_id: str) -> str:
             "- The team must complete the normal three-role Ansteel review. A timeout, rejected challenge, missing verification, or missing final sign-off is a benchmark protocol failure, not an answer.",
             "- No source-code change or delivery claim is required for this question-answer evaluation. The Ansteel report's delivery status remains the protocol's existing review status.",
             "- In every verification or final sign-off response, emit exactly one `VERDICT: APPROVE` or `VERDICT: REJECT` marker as the final standalone line. Do not quote, restate, embed, or otherwise reproduce either `VERDICT:` marker in headings, prose, evidence, code, or references to another role's sign-off.",
+"- Keep every stage response concise: each architecture, work card, critique, revision, verification, and sign-off should fit within roughly 600-1000 words. Long prose is not evidence and risks output truncation; state the answer, the supporting evidence, and the verdict directly without restating the question or repeating peers.",
             "- In the immutable Tech Lead consensus only, emit exactly one answer block using the following tags. The content must be the direct final answer to the benchmark question and may be multiline when the task requires code or structured output.",
             "",
             FINAL_ANSWER_OPEN,
