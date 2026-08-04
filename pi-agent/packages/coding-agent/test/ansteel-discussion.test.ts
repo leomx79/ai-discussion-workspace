@@ -1280,7 +1280,15 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		expect(result.verdict).toBe("approved");
-		expect(createdModels).toEqual(["tech/primary", "staff/primary", "qa/primary", "tech/fallback"]);
+		expect(createdModels).toEqual([
+		"tech/primary",
+		"staff/primary",
+		"qa/primary",
+		"tech/primary",
+		"tech/primary",
+		"tech/primary",
+		"tech/fallback",
+		]);
 		expect(disposedModels).toContain("tech/primary");
 		expect(result.providerFallbacks).toEqual([
 			expect.objectContaining({

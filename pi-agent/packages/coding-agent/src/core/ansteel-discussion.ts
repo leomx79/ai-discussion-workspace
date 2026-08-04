@@ -201,6 +201,8 @@ export const ANSTEEL_DEFAULT_MAX_STAGE_EXTENSIONS = 1;
 export const ANSTEEL_MAX_BASH_TIMEOUT_SECONDS = 20;
 const ANSTEEL_MAX_STAGE_TIMEOUT_MS = 2_147_483_647;
 const ANSTEEL_MAX_TOOL_CALLS_PER_STAGE = 32;
+const ANSTEEL_PROVIDER_RETRY_LIMIT = 3;
+const ANSTEEL_PROVIDER_RETRY_DELAY_MS = 1_000;
 const ANSTEEL_ABORT_GRACE_MS = 250;
 
 export interface AnsteelChallengeLedgerEntry {
@@ -1975,6 +1977,30 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 					return await session.prompt(prompt, promptOptions);
 				} catch (error) {
 					let failure = error;
+					// Same-model retries absorb transient provider overload (503/408/504) and rate
+					// limits (429) before any fallback logic; provider fallback stays gated by
+					// allowProviderFallback (false in strict configs), so these retries are the only
+					// recovery path and must not fail the whole question on a single transient error.
+					// A fresh session is created for each retry so a partially recorded prompt cannot
+					// be replayed into a stateful conversation.
+					for (let retry = 1; retry <= ANSTEEL_PROVIDER_RETRY_LIMIT; retry++) {
+						const failureClass = classifyAnsteelProviderFailure(failure);
+						if (failureClass !== "rate-limited" && failureClass !== "transient") break;
+						await new Promise((resolve) => setTimeout(resolve, ANSTEEL_PROVIDER_RETRY_DELAY_MS * retry));
+						try {
+							await session.dispose();
+						} catch (cleanupError) {
+							replacementCleanupFailures.push({ role, reason: sanitizeAnsteelFailureReason(cleanupError) });
+						}
+						session = await createRoleSession(role, activeModels[role]);
+						sessions.set(role, session);
+						session.setToolBudgetExtensionHandler?.(requestToolExtension);
+						try {
+							return await session.prompt(prompt, promptOptions);
+						} catch (retryError) {
+							failure = retryError;
+						}
+					}
 					while (config.allowProviderFallback) {
 						const failureClass = classifyAnsteelProviderFailure(failure);
 						if (failureClass !== "rate-limited" && failureClass !== "transient") throw failure;
