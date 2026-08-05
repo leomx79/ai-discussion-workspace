@@ -380,6 +380,8 @@ export interface AnsteelConfig {
 	/** Disabled by default; requires a role-local fallbackModels chain. */
 	allowProviderFallback?: boolean;
 	/** Explicitly permits one model across all roles; this is not cross-model verification. */
+	/** When true, review roles may run bounded single-command bash computation (timeout <= 20s). */
+	allowBashComputation?: boolean;
 	allowSingleModel?: boolean;
 }
 
@@ -941,11 +943,29 @@ export interface AnsteelReviewToolPolicy {
 }
 
 /** Restricts review evidence collection to the reviewed project and non-generated evidence paths. */
-export function createAnsteelReviewToolPolicy(cwd: string): AnsteelReviewToolPolicy {
+export function createAnsteelReviewToolPolicy(
+	cwd: string,
+	options?: { allowBashComputation?: boolean },
+): AnsteelReviewToolPolicy {
 	const root = canonicalizePath(resolvePath(cwd));
 	return {
 		beforeToolCall: (toolName, args) => {
 			if (toolName === "bash") {
+				if (options?.allowBashComputation === true) {
+					const timeout = isRecord(args) ? args.timeout : undefined;
+					if (
+						typeof timeout !== "number" ||
+						!Number.isFinite(timeout) ||
+						timeout <= 0 ||
+						timeout > ANSTEEL_MAX_BASH_TIMEOUT_SECONDS
+					) {
+						return {
+							block: true,
+							reason: `Ansteel bash requires an explicit timeout of at most ${ANSTEEL_MAX_BASH_TIMEOUT_SECONDS} seconds.`,
+						};
+					}
+					return undefined;
+				}
 				return {
 					block: true,
 					reason: "Ansteel reviews do not permit shell execution; use the bounded read-only review tools.",
@@ -1435,6 +1455,9 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 			"configuration",
 		);
 	}
+	if (value.allowBashComputation !== undefined && typeof value.allowBashComputation !== "boolean") {
+		throw new Error("Ansteel config allowBashComputation must be a boolean");
+	}
 	if (value.allowSingleModel !== undefined && typeof value.allowSingleModel !== "boolean") {
 		throw new AnsteelGovernanceSetupError("Ansteel config allowSingleModel must be a boolean", "configuration");
 	}
@@ -1523,6 +1546,7 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		...(teamTaskMaxEpochs === undefined ? {} : { teamTaskMaxEpochs }),
 		...(teamTaskMaxNoProgressEpochs === undefined ? {} : { teamTaskMaxNoProgressEpochs }),
 		allowSingleModel: value.allowSingleModel ?? false,
+		allowBashComputation: value.allowBashComputation === true,
 	};
 }
 

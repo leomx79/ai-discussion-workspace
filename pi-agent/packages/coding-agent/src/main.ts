@@ -935,7 +935,7 @@ export async function main(args: string[], options?: MainOptions) {
 					});
 					const toolBudget = createAnsteelToolBudget(maxToolCallsPerStage, projectToolBudget);
 					const configuredToolNames = [...tools];
-					const reviewToolPolicy = createAnsteelReviewToolPolicy(roleCwd);
+					const reviewToolPolicy = createAnsteelReviewToolPolicy(roleCwd, { allowBashComputation: config?.allowBashComputation === true });
 					const previousBeforeToolCall = created.session.agent.beforeToolCall;
 					const previousShouldStopAfterTurn = created.session.agent.shouldStopAfterTurn;
 					created.session.agent.toolExecution = "sequential";

@@ -4616,4 +4616,58 @@ describe("runAnsteelDiscussion", () => {
 			expect(() => loadAnsteelConfig(cwd)).toThrow("adaptiveArchitectureRevisionCap cannot be lower");
 		});
 	});
+
+	describe("review bash computation policy", () => {
+		it("allows bounded bash computation when enabled", () => {
+			const policy = createAnsteelReviewToolPolicy(process.cwd(), { allowBashComputation: true });
+			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"", timeout: 10 })).toBeUndefined();
+			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"", timeout: 20 })).toBeUndefined();
+			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"", timeout: 21 })).toEqual({
+				block: true,
+				reason: "Ansteel bash requires an explicit timeout of at most 20 seconds.",
+			});
+			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"" })).toEqual({
+				block: true,
+				reason: "Ansteel bash requires an explicit timeout of at most 20 seconds.",
+			});
+		});
+
+		it("blocks bash by default in review policy", () => {
+			const policy = createAnsteelReviewToolPolicy(process.cwd());
+			expect(policy.beforeToolCall("bash", { command: "ls", timeout: 10 })).toEqual({
+				block: true,
+				reason: "Ansteel reviews do not permit shell execution; use the bounded read-only review tools.",
+			});
+		});
+
+		it("parses allowBashComputation from config", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+			temporaryDirectories.push(cwd);
+			mkdirSync(join(cwd, ".pi"));
+			writeFileSync(
+				join(cwd, ".pi", "ansteel.json"),
+				JSON.stringify({
+					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					allowBashComputation: true,
+				}),
+			);
+
+			const config = loadAnsteelConfig(cwd);
+			expect(config.allowBashComputation).toBe(true);
+		});
+
+		it("rejects a non-boolean allowBashComputation", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+			temporaryDirectories.push(cwd);
+			mkdirSync(join(cwd, ".pi"));
+			writeFileSync(
+				join(cwd, ".pi", "ansteel.json"),
+				JSON.stringify({
+					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					allowBashComputation: "yes",
+				}),
+			);
+			expect(() => loadAnsteelConfig(cwd)).toThrow("allowBashComputation must be a boolean");
+		});
+	});
 });
