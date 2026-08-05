@@ -2,23 +2,41 @@
   "roles": {
     "tech-lead": {
       "model": "volcengine-agent-plan/glm-5.2",
-      "thinkingLevel": "high",
-      "tools": ["read", "grep", "find", "ls"]
+      "thinkingLevel": "medium",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ]
     },
     "staff-engineer": {
       "model": "volcengine-coding/kimi-k2.7-code",
-      "thinkingLevel": "high",
-      "tools": ["read", "grep", "find", "ls"]
+      "thinkingLevel": "medium",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ]
     },
     "qa-engineer": {
       "model": "qwen-token-plan-cn/qwen3.8-max",
-      "thinkingLevel": "high",
-      "tools": ["read", "grep", "find", "ls"]
+      "thinkingLevel": "medium",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ]
     }
   },
   "reportDirectory": ".pi/ansteel-reports",
   "reviewRoot": "cwd",
-  "requiredEvidencePaths": ["benchmark-contract.md", "livebench-question.md"],
+  "requiredEvidencePaths": [
+    "benchmark-contract.md",
+    "livebench-question.md"
+  ],
   "stageTimeoutMs": 2147483647,
   "maxToolCallsPerStage": 32,
   "stageBudgetPolicy": {
