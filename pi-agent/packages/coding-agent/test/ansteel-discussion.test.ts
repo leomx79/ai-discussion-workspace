@@ -23,6 +23,7 @@ import {
 	resolveAnsteelReviewRoot,
 	runAnsteelDiscussion,
 	runAnsteelProjectReview,
+	shouldExtendRevisionRounds,
 	updateAnsteelRunCheckpoint,
 	validateAnsteelRunCheckpointForResume,
 	writeAnsteelReport,
@@ -2596,6 +2597,84 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.markdown).toContain("maximum of 2 revision rounds");
 	});
 
+	it("extends revision rounds adaptively while the ledger narrows, then stops at the cap", async () => {
+		const calls: Array<{ role: AnsteelRole; stage: string }> = [];
+		let revisionCount = 0;
+
+		const result = await runAnsteelDiscussion({
+			topic: "Review adaptive revision rounds",
+			maxArchitectureRevisionRounds: 2,
+			adaptiveArchitectureRevisions: true,
+			adaptiveArchitectureRevisionCap: 3,
+			runRole: async ({ role, stage }) => {
+				calls.push({ role, stage });
+				switch (stage) {
+					case "architecture-revision":
+						revisionCount++;
+						return completeWorkCard(
+							revisionCount === 1 ? "RESOLUTION: QA-CROSS | RESOLVED" : "[L2] No new Tech Lead challenge.",
+						);
+					case "staff-revision":
+						return completeWorkCard(
+							revisionCount === 1
+								? "RESOLUTION: TL-CROSS | RESOLVED"
+								: `RESOLUTION: QA-VERIFY-${revisionCount - 1} | RESOLVED`,
+						);
+					case "qa-revision":
+						return completeWorkCard(
+							revisionCount === 1 ? "RESOLUTION: STAFF-CROSS | RESOLVED" : "[L2] No new QA challenge.",
+						);
+					case "qa-verification":
+						return `VERDICT: REJECT\nISSUE: QA-VERIFY-${revisionCount} | TARGET: staff-engineer\n[L1] The safety test still cannot prove the fault path.`;
+					default:
+						return responseForMutualReviewStage(stage);
+				}
+			},
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(calls.filter((call) => call.stage === "architecture-revision")).toHaveLength(3);
+		expect(result.markdown).toContain("maximum of 3 revision rounds");
+		expect(result.revisionRounds.at(-1)?.extension).toContain("reached the configured revision round cap");
+	});
+
+	it("does not extend revision rounds when new issues grow", async () => {
+		let revisionCount = 0;
+
+		const result = await runAnsteelDiscussion({
+			topic: "Review diverging revision rounds",
+			maxArchitectureRevisionRounds: 2,
+			adaptiveArchitectureRevisions: true,
+			adaptiveArchitectureRevisionCap: 4,
+			runRole: async ({ role, stage }) => {
+				switch (stage) {
+					case "architecture-revision":
+						revisionCount++;
+						return completeWorkCard(
+							revisionCount === 1 ? "RESOLUTION: QA-CROSS | RESOLVED" : "[L2] No new Tech Lead challenge.",
+						);
+					case "staff-revision":
+						return completeWorkCard(
+							revisionCount === 1 ? "RESOLUTION: TL-CROSS | RESOLVED" : "RESOLUTION: QA-VERIFY-1 | RESOLVED",
+						);
+					case "qa-revision":
+						return completeWorkCard(
+							revisionCount === 1 ? "RESOLUTION: STAFF-CROSS | RESOLVED" : "[L2] No new QA challenge.",
+						);
+					case "qa-verification":
+						return revisionCount === 1
+							? "VERDICT: REJECT\nISSUE: QA-VERIFY-1 | TARGET: staff-engineer\n[L1] issue one."
+							: "VERDICT: REJECT\nISSUE: QA-VERIFY-2 | TARGET: staff-engineer\n[L1] issue two.\nISSUE: QA-VERIFY-3 | TARGET: tech-lead\n[L1] issue three.";
+					default:
+						return responseForMutualReviewStage(stage);
+				}
+			},
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(result.markdown).toContain("new issues grew from 1 to 2");
+	});
+
 	it("rejects an architecture revision that does not answer every challenge ID", async () => {
 		const calls: Array<{ role: AnsteelRole; stage: string }> = [];
 
@@ -2897,6 +2976,9 @@ describe("runAnsteelDiscussion", () => {
 				staffVerdict: "approved",
 				qaVerdict: "rejected",
 				outcome: "needs-revision",
+				newIssues: 1,
+				resolvedIssues: 3,
+				extension: "within the baseline revision rounds",
 			},
 			{
 				round: 2,
@@ -2904,6 +2986,8 @@ describe("runAnsteelDiscussion", () => {
 				staffVerdict: "approved",
 				qaVerdict: "approved",
 				outcome: "approved",
+				newIssues: 0,
+				resolvedIssues: 1,
 			},
 		]);
 		expect(calls.filter((call) => call.stage === "staff-revision")).toHaveLength(2);
@@ -4458,5 +4542,78 @@ describe("runAnsteelDiscussion", () => {
 		expect(markdown).toContain("API key: [REDACTED]");
 		expect(markdown).not.toContain("top-secret-token");
 		expect(markdown).not.toContain("super-secret-key");
+	});
+
+	describe("shouldExtendRevisionRounds", () => {
+		const base = { baseline: 2, cap: 4, adaptive: true, resolvedThisRound: 1, newIssuesThisRound: 1, newIssuesPreviousRound: 1 };
+
+		it("extends within the baseline", () => {
+			expect(shouldExtendRevisionRounds({ ...base, round: 1 }).extend).toBe(true);
+		});
+
+		it("extends on converging signals", () => {
+			expect(shouldExtendRevisionRounds({ ...base, round: 2 }).extend).toBe(true);
+		});
+
+		it("rejects when adaptive extensions are disabled", () => {
+			const decision = shouldExtendRevisionRounds({ ...base, round: 2, adaptive: false });
+			expect(decision.extend).toBe(false);
+			expect(decision.reason).toContain("disabled");
+		});
+
+		it("rejects when no previously open issue was resolved", () => {
+			const decision = shouldExtendRevisionRounds({ ...base, round: 2, resolvedThisRound: 0 });
+			expect(decision.extend).toBe(false);
+			expect(decision.reason).toContain("no previously open issue");
+		});
+
+		it("rejects when new issues grow", () => {
+			const decision = shouldExtendRevisionRounds({ ...base, round: 2, newIssuesThisRound: 2 });
+			expect(decision.extend).toBe(false);
+			expect(decision.reason).toContain("grew from 1 to 2");
+		});
+
+		it("rejects at the configured cap", () => {
+			const decision = shouldExtendRevisionRounds({ ...base, round: 4, cap: 4 });
+			expect(decision.extend).toBe(false);
+			expect(decision.reason).toContain("cap");
+		});
+	});
+
+	describe("adaptive revision round config parsing", () => {
+		it("parses the adaptive revision round policy", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+			temporaryDirectories.push(cwd);
+			mkdirSync(join(cwd, ".pi"));
+			writeFileSync(
+				join(cwd, ".pi", "ansteel.json"),
+				JSON.stringify({
+					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					maxArchitectureRevisionRounds: 3,
+					adaptiveArchitectureRevisions: true,
+					adaptiveArchitectureRevisionCap: 5,
+				}),
+			);
+
+			const config = loadAnsteelConfig(cwd);
+			expect(config.maxArchitectureRevisionRounds).toBe(3);
+			expect(config.adaptiveArchitectureRevisions).toBe(true);
+			expect(config.adaptiveArchitectureRevisionCap).toBe(5);
+		});
+
+		it("rejects a revision cap below the baseline", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+			temporaryDirectories.push(cwd);
+			mkdirSync(join(cwd, ".pi"));
+			writeFileSync(
+				join(cwd, ".pi", "ansteel.json"),
+				JSON.stringify({
+					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					maxArchitectureRevisionRounds: 4,
+					adaptiveArchitectureRevisionCap: 2,
+				}),
+			);
+			expect(() => loadAnsteelConfig(cwd)).toThrow("adaptiveArchitectureRevisionCap cannot be lower");
+		});
 	});
 });

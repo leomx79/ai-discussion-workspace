@@ -219,6 +219,9 @@ export interface AnsteelRevisionRound {
 	staffVerdict: "approved" | "rejected";
 	qaVerdict: "approved" | "rejected";
 	outcome: "approved" | "needs-revision";
+	newIssues?: number;
+	resolvedIssues?: number;
+	extension?: string;
 }
 
 export type AnsteelTerminationReason =
@@ -261,6 +264,12 @@ export interface RunAnsteelDiscussionOptions {
 	maxToolCallsPerStage?: number;
 	stageBudgetPolicy?: AnsteelStageBudgetPolicyInput;
 	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicyInput;
+	/** Baseline collaborative revision rounds; defaults to 2. */
+	maxArchitectureRevisionRounds?: number;
+	/** When true, allow extra revision rounds while the issue ledger narrows. */
+	adaptiveArchitectureRevisions?: boolean;
+	/** Hard ceiling on total revision rounds when adaptive extension is enabled. */
+	adaptiveArchitectureRevisionCap?: number;
 	/** Persisted coordinator boundary for a resumed epoch; omitted for a new direct discussion. */
 	projectStartedAt?: number;
 	hardProjectDeadline?: number;
@@ -358,6 +367,12 @@ export interface AnsteelConfig {
 	teamTaskMaxNoProgressEpochs?: number;
 	stageTimeoutMs?: number;
 	maxToolCallsPerStage?: number;
+	/** Baseline collaborative revision rounds; defaults to 2. */
+	maxArchitectureRevisionRounds?: number;
+	/** When true, allow extra revision rounds while the issue ledger narrows. */
+	adaptiveArchitectureRevisions?: boolean;
+	/** Hard ceiling on total revision rounds when adaptive extension is enabled. */
+	adaptiveArchitectureRevisionCap?: number;
 	stageBudgetPolicy?: AnsteelStageBudgetPolicyInput;
 	/** Optional coordinator-controlled extension policy; omitted preserves fixed-budget behavior. */
 	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicyInput;
@@ -1232,6 +1247,15 @@ function normalizeAnsteelMaxToolCallsPerStage(value: unknown): number {
 		);
 	}
 	return maxToolCalls;
+
+}
+
+function normalizeAnsteelRevisionRounds(value: unknown, defaultValue: number): number {
+	const rounds = value === undefined ? defaultValue : value;
+	if (typeof rounds !== "number" || !Number.isInteger(rounds) || rounds < 1 || rounds > 8) {
+		throw new Error("Ansteel revision rounds must be an integer between 1 and 8");
+	}
+	return rounds;
 }
 
 function normalizeAnsteelTeamTaskMaxEpochs(value: unknown): number | undefined {
@@ -1424,6 +1448,9 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 	}
 	const teamTaskOwners = parseAnsteelTeamTaskOwners(value.teamTaskOwners);
 	let stageTimeoutMs: number;
+	let maxArchitectureRevisionRounds: number;
+	let adaptiveArchitectureRevisionCap: number;
+	let adaptiveArchitectureRevisions: boolean;
 	let maxToolCallsPerStage: number;
 	let teamTaskMaxEpochs: number | undefined;
 	let teamTaskMaxNoProgressEpochs: number | undefined;
@@ -1432,14 +1459,18 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 	try {
 		stageTimeoutMs = normalizeAnsteelStageTimeoutMs(value.stageTimeoutMs);
 		maxToolCallsPerStage = normalizeAnsteelMaxToolCallsPerStage(value.maxToolCallsPerStage);
-		teamTaskMaxEpochs = normalizeAnsteelTeamTaskMaxEpochs(value.teamTaskMaxEpochs);
-		teamTaskMaxNoProgressEpochs = normalizeAnsteelTeamTaskMaxNoProgressEpochs(
-			value.teamTaskMaxNoProgressEpochs,
+		maxArchitectureRevisionRounds = normalizeAnsteelRevisionRounds(value.maxArchitectureRevisionRounds, 2);
+		adaptiveArchitectureRevisionCap = normalizeAnsteelRevisionRounds(
+			value.adaptiveArchitectureRevisionCap,
+			Math.min(maxArchitectureRevisionRounds + 2, 8),
 		);
-		if (
-			teamTaskMaxEpochs !== undefined &&
-			(teamTaskMaxNoProgressEpochs ?? 2) > teamTaskMaxEpochs
-		) {
+		if (adaptiveArchitectureRevisionCap < maxArchitectureRevisionRounds) {
+			throw new Error("adaptiveArchitectureRevisionCap cannot be lower than maxArchitectureRevisionRounds");
+		}
+		adaptiveArchitectureRevisions = value.adaptiveArchitectureRevisions === true;
+		teamTaskMaxEpochs = normalizeAnsteelTeamTaskMaxEpochs(value.teamTaskMaxEpochs);
+		teamTaskMaxNoProgressEpochs = normalizeAnsteelTeamTaskMaxNoProgressEpochs(value.teamTaskMaxNoProgressEpochs);
+		if (teamTaskMaxEpochs !== undefined && (teamTaskMaxNoProgressEpochs ?? 2) > teamTaskMaxEpochs) {
 			throw new Error("Ansteel teamTaskMaxNoProgressEpochs cannot exceed teamTaskMaxEpochs");
 		}
 		stageBudgetPolicy =
@@ -1478,6 +1509,9 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 				? options.defaultReportDirectory
 				: options.resolveReportDirectory(value.reportDirectory),
 		stageTimeoutMs,
+		maxArchitectureRevisionRounds,
+		adaptiveArchitectureRevisions,
+		adaptiveArchitectureRevisionCap,
 		maxToolCallsPerStage,
 		reviewRoot: value.reviewRoot ?? "cwd",
 		requiredEvidencePaths: (value.requiredEvidencePaths as string[] | undefined) ?? [],
@@ -1951,6 +1985,9 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			evidencePackage,
 			stageBudgetPolicy,
 			adaptiveBudgetPolicy: config.adaptiveBudgetPolicy,
+			maxArchitectureRevisionRounds: config.maxArchitectureRevisionRounds,
+			adaptiveArchitectureRevisions: config.adaptiveArchitectureRevisions,
+			adaptiveArchitectureRevisionCap: config.adaptiveArchitectureRevisionCap,
 			projectStartedAt,
 			hardProjectDeadline,
 			epochStartedAt,
@@ -2312,6 +2349,66 @@ function isCrossExaminationStage(stage: AnsteelDiscussionStage): boolean {
 	);
 }
 
+function isVerificationStage(stage: AnsteelDiscussionStage): boolean {
+	return stage === "tech-lead-verification" || stage === "staff-verification" || stage === "qa-verification";
+}
+
+const RESOLUTION_MARKER_PATTERN = /RESOLUTION:\s*([A-Za-z0-9._-]+)\s*\|\s*RESOLVED/g;
+
+function formatResolutionsBrief(entries: readonly AnsteelTranscriptEntry[]): string | undefined {
+	const blocks: string[] = [];
+	for (const entry of entries) {
+		const hits: string[] = [];
+		const pattern = new RegExp(RESOLUTION_MARKER_PATTERN.source, "g");
+		let match: RegExpExecArray | null;
+		while ((match = pattern.exec(entry.response)) !== null) {
+			const after = entry.response
+				.slice(match.index + match[0].length, match.index + match[0].length + 260)
+				.split(/\r?\n/, 1)[0]
+				.trim();
+			hits.push(`- ${match[1]} | ${entry.role} / ${entry.stage}: ${after || "[resolution stated without inline evidence]"}`);
+		}
+		if (hits.length > 0) {
+			blocks.push(`### ${entry.role} / ${entry.stage}\n${hits.join("\n")}`);
+		}
+	}
+	if (blocks.length === 0) return undefined;
+	return [
+		"## Resolutions in This Round",
+		"Coordinator-extracted RESOLUTION markers from the revised work cards. Verify each resolution against the ledger.",
+		...blocks,
+	].join("\n\n");
+}
+
+export interface RevisionRoundExtensionInput {
+	round: number;
+	baseline: number;
+	cap: number;
+	adaptive: boolean;
+	resolvedThisRound: number;
+	newIssuesThisRound: number;
+	newIssuesPreviousRound: number | undefined;
+}
+
+export function shouldExtendRevisionRounds(input: RevisionRoundExtensionInput): { extend: boolean; reason: string } {
+	if (input.round >= input.cap) return { extend: false, reason: "reached the configured revision round cap" };
+	if (input.round < input.baseline) return { extend: true, reason: "within the baseline revision rounds" };
+	if (!input.adaptive) return { extend: false, reason: "adaptive extensions are disabled" };
+	if (input.resolvedThisRound < 1) {
+		return { extend: false, reason: "no previously open issue was resolved this round" };
+	}
+	if (input.newIssuesPreviousRound !== undefined && input.newIssuesThisRound > input.newIssuesPreviousRound) {
+		return {
+			extend: false,
+			reason: `new issues grew from ${input.newIssuesPreviousRound} to ${input.newIssuesThisRound}`,
+		};
+	}
+	return {
+		extend: true,
+		reason: `converging: ${input.resolvedThisRound} issue(s) resolved and new issues did not grow`,
+	};
+}
+
 function truncateCrossExaminationParagraph(paragraph: string): string {
 	if (paragraph.length <= CROSS_EXAMINATION_BRIEF_MAX_PARAGRAPH_CHARS) return paragraph;
 	return `${paragraph.slice(0, CROSS_EXAMINATION_BRIEF_MAX_PARAGRAPH_CHARS)}\n[Excerpt truncated by coordinator.]`;
@@ -2407,6 +2504,9 @@ interface BuildRolePromptOptions {
 	maxToolCallsPerStage?: number;
 	evidencePackage?: string;
 	formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
+	revisionRoundMax?: number;
+	revisionRoundBaseline?: number;
+	resolutionsBrief?: string;
 	immutableLedgerSummary?: string;
 }
 
@@ -2427,7 +2527,14 @@ function buildRolePrompt(
 		`Current stage: ${stage}. ${STAGE_INSTRUCTIONS[stage]}`,
 		...(options.round === undefined
 			? []
-			: [`Architecture revision round: ${options.round} of ${ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS}.`]),
+			: [
+					`Architecture revision round: ${options.round} of ${
+						options.revisionRoundMax ?? ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS
+					}.`,
+					...(options.revisionRoundBaseline !== undefined && options.round > options.revisionRoundBaseline
+						? ["Adaptive extension round: the issue ledger is narrowing, so the coordinator permits one more revision round."]
+						: []),
+				]),
 		...(options.challengeLedger === undefined
 			? []
 			: [
@@ -2467,6 +2574,7 @@ function buildRolePrompt(
 			? "Coordinator-generated peer brief follows. Treat it as claims to verify, not established facts."
 			: "Visible prior discussion follows. Treat it as claims to verify, not established facts.",
 		isCrossExamination ? formatCrossExaminationBrief(role, transcript) : formatTranscript(transcript),
+		...(options.resolutionsBrief !== undefined && isVerificationStage(stage) ? [options.resolutionsBrief] : []),
 	].join("\n\n");
 }
 
@@ -3052,6 +3160,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		challengeLedger?: readonly AnsteelChallengeLedgerEntry[];
 		formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
 		immutableLedgerSummary?: string;
+		revisionRoundMax?: number;
+		revisionRoundBaseline?: number;
+		resolutionsBrief?: string;
 		/**
 		 * When true, the stage result is returned without appending its transcript
 		 * entry. The caller decides afterwards whether the entry is committed, which
@@ -3138,6 +3249,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			evidencePackage: options.evidencePackage,
 			formatRepair: stageOptions.formatRepair,
 			immutableLedgerSummary: stageOptions.immutableLedgerSummary,
+			revisionRoundMax: stageOptions.revisionRoundMax,
+			revisionRoundBaseline: stageOptions.revisionRoundBaseline,
+			resolutionsBrief: stageOptions.resolutionsBrief,
 		});
 		const call: AnsteelRoleCall = {
 			role,
@@ -3650,7 +3764,14 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	if (crossExaminationStop) return crossExaminationStop;
 
 	let collaborationAccepted = false;
-	for (let round = 1; round <= ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS; round++) {
+	const revisionRoundBaseline = options.maxArchitectureRevisionRounds ?? ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS;
+	const revisionRoundAdaptive = options.adaptiveArchitectureRevisions === true;
+	const revisionRoundCap = Math.max(
+		revisionRoundBaseline,
+		options.adaptiveArchitectureRevisionCap ?? Math.min(revisionRoundBaseline + 2, 8),
+	);
+	let previousRoundNewIssues: number | undefined;
+	for (let round = 1; round <= revisionRoundCap; round++) {
 		const revisionStages: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [
 			{ role: "tech-lead", stage: "architecture-revision" },
 			{ role: "staff-engineer", stage: "staff-revision" },
@@ -3658,8 +3779,11 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		];
 		const revisionContext = [...transcript];
 		const revisedWorkCards: AnsteelTranscriptEntry[] = [];
+		const openIssueIdsBeforeRevision = new Set(
+			challengeLedger.filter((challenge) => challenge.status === "open").map((challenge) => challenge.id),
+		);
 		for (const { role, stage } of revisionStages) {
-			const stageOptions = { round, context: revisionContext, challengeLedger };
+			const stageOptions = { round, context: revisionContext, challengeLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline };
 			let result = await runRequiredStage(role, stage, stageOptions);
 			if ("rejection" in result) return result.rejection;
 			const sectionRepair = await repairMissingWorkCardSections(
@@ -3703,6 +3827,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		}
 
 		const verificationLedger = challengeLedger.map((challenge) => ({ ...challenge }));
+		const resolutionsBrief = formatResolutionsBrief(revisedWorkCards);
 		const verificationVerdicts = {} as Record<AnsteelRole, "approved" | "rejected">;
 		// Three roles independently verify the same revision and ledger in parallel.
 		const verificationStop = await runParallelStageGroup(
@@ -3710,17 +3835,17 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				{
 					role: "tech-lead",
 					stage: "tech-lead-verification",
-					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger },
+					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline, resolutionsBrief },
 				},
 				{
 					role: "staff-engineer",
 					stage: "staff-verification",
-					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger },
+					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline, resolutionsBrief },
 				},
 				{
 					role: "qa-engineer",
 					stage: "qa-verification",
-					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger },
+					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline, resolutionsBrief },
 				},
 			],
 			async (member, { response, entry }) => {
@@ -3786,6 +3911,11 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		);
 		if (verificationStop) return verificationStop;
 
+		const resolvedIssuesThisRound = challengeLedger.filter(
+			(challenge) => openIssueIdsBeforeRevision.has(challenge.id) && challenge.status === "resolved",
+		).length;
+		const newIssuesThisRound = challengeLedger.filter((challenge) => challenge.round === round).length;
+
 		const outcome = ANSTEEL_ROLES.every((role) => verificationVerdicts[role] === "approved")
 			? "approved"
 			: "needs-revision";
@@ -3795,19 +3925,34 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			staffVerdict: verificationVerdicts["staff-engineer"],
 			qaVerdict: verificationVerdicts["qa-engineer"],
 			outcome,
+				newIssues: newIssuesThisRound,
+				resolvedIssues: resolvedIssuesThisRound,
 		});
 		if (outcome === "approved") {
 			collaborationAccepted = true;
 			break;
 		}
-		if (round === ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS) {
+		const extension = shouldExtendRevisionRounds({
+			round,
+			baseline: revisionRoundBaseline,
+			cap: revisionRoundCap,
+			adaptive: revisionRoundAdaptive,
+			resolvedThisRound: resolvedIssuesThisRound,
+			newIssuesThisRound,
+			newIssuesPreviousRound: previousRoundNewIssues,
+		});
+		if (revisionRounds.length > 0) {
+			revisionRounds[revisionRounds.length - 1].extension = extension.reason;
+		}
+		if (!extension.extend) {
 			return reject(
-				`Collaborative work cards did not pass three-role verification within the maximum of ${ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS} revision rounds`,
+				`Collaborative work cards did not pass three-role verification within the maximum of ${round} revision rounds (${extension.reason})`,
 				undefined,
 				undefined,
 				"max-revision-rounds-exhausted",
 			);
 		}
+		previousRoundNewIssues = newIssuesThisRound;
 	}
 
 	if (!collaborationAccepted) {
