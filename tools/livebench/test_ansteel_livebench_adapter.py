@@ -109,6 +109,23 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
 
         self.assertEqual(loaded["roles"]["qa-engineer"]["model"], "provider-c/model-c")
 
+    def test_protocol_config_accepts_bash_review_tool(self) -> None:
+        config = {
+            "roles": {
+                "tech-lead": {"model": "provider-a/model-a", "tools": ["read", "bash"]},
+                "staff-engineer": {"model": "provider-b/model-b", "tools": ["grep", "bash"]},
+                "qa-engineer": {"model": "provider-c/model-c", "tools": ["find", "ls", "bash"]},
+            },
+            "allowProviderFallback": False,
+            "allowSingleModel": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "ansteel.json"
+            config_path.write_text(ADAPTER.json_text(config), encoding="utf-8")
+            loaded = ADAPTER.load_protocol_config(config_path)
+
+        self.assertEqual(loaded["roles"]["tech-lead"]["tools"], ["read", "bash"])
+
     def test_repository_protocol_config_keeps_strict_role_and_budget_contract(self) -> None:
         config = ADAPTER.load_protocol_config(PROTOCOL_CONFIG_PATH)
 

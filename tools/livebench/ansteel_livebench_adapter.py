@@ -70,8 +70,8 @@ def load_protocol_config(path: Path) -> dict[str, Any]:
         tools = role_config.get("tools")
         if not isinstance(model, str) or model.count("/") != 1 or any(not part for part in model.split("/")):
             raise ProtocolResultError(f"Protocol role {role} must use an explicit provider/model identity")
-        if not isinstance(tools, list) or any(tool not in {"read", "grep", "find", "ls"} for tool in tools):
-            raise ProtocolResultError(f"Protocol role {role} must use only read-only review tools")
+        if not isinstance(tools, list) or any(tool not in {"read", "grep", "find", "ls", "bash"} for tool in tools):
+            raise ProtocolResultError(f"Protocol role {role} must use only review tools")
         identities.append(model)
 
     if len(set(identities)) != len(required_roles):
@@ -128,6 +128,7 @@ def render_benchmark_contract(question_id: str) -> str:
             FINAL_ANSWER_CLOSE,
             "",
             "- Do not emit those tags in work cards, critiques, revisions, verification, or sign-off. Staff Engineer and QA Engineer must sign off on the same immutable consensus containing this block.",
+            "- Bounded computation is permitted: a role with the bash tool may run short calculations to verify answers (each bash call requires an explicit timeout of at most 20 seconds, e.g. evaluating a generating-function coefficient). Do not modify files or read outside the review scope.",
         ]
     ) + "\n"
 

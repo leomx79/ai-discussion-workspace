@@ -281,6 +281,7 @@ export interface RunAnsteelDiscussionOptions {
 	getProviderFallbacks?: () => readonly AnsteelProviderFallbackEvent[];
 	abortRole?: (call: AnsteelRoleCall) => void | Promise<void>;
 	getStageAudit?: (call: AnsteelRoleCall) => { events: AnsteelStageAuditEvent[] } | undefined;
+	getRoleBashEnabled?: (role: AnsteelRole) => boolean;
 	onStageEvent?: (event: AnsteelStageProgressEvent) => void;
 	/** Persists the next uncommitted coordinator action before it can be started or paused. */
 	onNextAction?: (call: AnsteelRoleCall) => void;
@@ -1988,6 +1989,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			maxArchitectureRevisionRounds: config.maxArchitectureRevisionRounds,
 			adaptiveArchitectureRevisions: config.adaptiveArchitectureRevisions,
 			adaptiveArchitectureRevisionCap: config.adaptiveArchitectureRevisionCap,
+			getRoleBashEnabled: (role) => config.roles[role].tools.includes("bash"),
 			projectStartedAt,
 			hardProjectDeadline,
 			epochStartedAt,
@@ -2507,6 +2509,7 @@ interface BuildRolePromptOptions {
 	revisionRoundMax?: number;
 	revisionRoundBaseline?: number;
 	resolutionsBrief?: string;
+	bashEnabled?: boolean;
 	immutableLedgerSummary?: string;
 }
 
@@ -2566,7 +2569,7 @@ function buildRolePrompt(
 			: [
 					isCrossExamination
 						? "Tool governance: no tools are available during cross-examination. Use the immutable project evidence package and coordinator-generated peer briefs; provide the evidence-labelled conclusion directly."
-						: `Tool governance: execute at most ${options.maxToolCallsPerStage ?? ANSTEEL_DEFAULT_MAX_TOOL_CALLS_PER_STAGE} bounded read-only tools during this stage. Shell execution is not available. If a tool request is blocked or the budget is exhausted, stop requesting tools and provide the evidence-labelled conclusion.`,
+						: `Tool governance: execute at most ${options.maxToolCallsPerStage ?? ANSTEEL_DEFAULT_MAX_TOOL_CALLS_PER_STAGE} bounded review tools during this stage. ${options.bashEnabled ? "Bounded bash computation is available for calculations and verification (each call needs an explicit timeout of at most 20 seconds)." : "Shell execution is not available."} If a tool request is blocked or the budget is exhausted, stop requesting tools and provide the evidence-labelled conclusion.`,
 				]),
 		"Evidence boundary: use project source, documentation, and current command output. Do not read or cite prior Ansteel reports from .pi/ansteel-reports; they are historical model output, not current evidence.",
 		options.evidencePackage ?? NO_PROJECT_EVIDENCE_PACKAGE,
@@ -3163,6 +3166,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		revisionRoundMax?: number;
 		revisionRoundBaseline?: number;
 		resolutionsBrief?: string;
+		bashEnabled?: boolean;
 		/**
 		 * When true, the stage result is returned without appending its transcript
 		 * entry. The caller decides afterwards whether the entry is committed, which
@@ -3252,6 +3256,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			revisionRoundMax: stageOptions.revisionRoundMax,
 			revisionRoundBaseline: stageOptions.revisionRoundBaseline,
 			resolutionsBrief: stageOptions.resolutionsBrief,
+			bashEnabled: options.getRoleBashEnabled?.(role) ?? false,
 		});
 		const call: AnsteelRoleCall = {
 			role,
