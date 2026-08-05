@@ -4670,4 +4670,58 @@ describe("runAnsteelDiscussion", () => {
 			expect(() => loadAnsteelConfig(cwd)).toThrow("allowBashComputation must be a boolean");
 		});
 	});
+
+	describe("over-length response enforcement", () => {
+		it("rewrites an over-length response once and completes", async () => {
+			let repairCalls = 0;
+
+			const result = await runAnsteelDiscussion({
+				topic: "Review over-length response repair",
+				maxStageResponseChars: 1000,
+				runRole: async ({ role, stage, formatRepair }) => {
+					if (stage === "architecture") {
+						if (formatRepair) {
+							repairCalls++;
+							return COMPLETE_WORK_CARD;
+						}
+						return "x".repeat(2000) + "\n\n" + COMPLETE_WORK_CARD;
+					}
+					return responseForMutualReviewStage(stage);
+				},
+			});
+
+			expect(result.verdict).toBe("approved");
+			expect(repairCalls).toBe(1);
+		});
+
+		it("rejects a response that stays over-length after the concise rewrite", async () => {
+			const result = await runAnsteelDiscussion({
+				topic: "Review persistent over-length response",
+				maxStageResponseChars: 1000,
+				runRole: async ({ role, stage }) => {
+					if (stage === "architecture") return "x".repeat(2000);
+					return responseForMutualReviewStage(stage);
+				},
+			});
+
+			expect(result.verdict).toBe("rejected");
+			expect(result.markdown).toContain("response still exceeds 1000 characters");
+		});
+
+		it("parses maxStageResponseChars from config", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-"));
+			temporaryDirectories.push(cwd);
+			mkdirSync(join(cwd, ".pi"));
+			writeFileSync(
+				join(cwd, ".pi", "ansteel.json"),
+				JSON.stringify({
+					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					maxStageResponseChars: 24000,
+				}),
+			);
+
+			const config = loadAnsteelConfig(cwd);
+			expect(config.maxStageResponseChars).toBe(24000);
+		});
+	});
 });

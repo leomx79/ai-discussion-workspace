@@ -228,6 +228,7 @@ export type AnsteelTerminationReason =
 	| "stage-failure"
 	| "stage-timeout"
 	| "blank-response"
+	| "response-over-length"
 	| "invalid-verdict"
 	| "invalid-challenge-ledger"
 	| "invalid-ledger-summary"
@@ -282,6 +283,7 @@ export interface RunAnsteelDiscussionOptions {
 	abortRole?: (call: AnsteelRoleCall) => void | Promise<void>;
 	getStageAudit?: (call: AnsteelRoleCall) => { events: AnsteelStageAuditEvent[] } | undefined;
 	getRoleBashEnabled?: (role: AnsteelRole) => boolean;
+	maxStageResponseChars?: number;
 	onStageEvent?: (event: AnsteelStageProgressEvent) => void;
 	/** Persists the next uncommitted coordinator action before it can be started or paused. */
 	onNextAction?: (call: AnsteelRoleCall) => void;
@@ -382,6 +384,8 @@ export interface AnsteelConfig {
 	/** Explicitly permits one model across all roles; this is not cross-model verification. */
 	/** When true, review roles may run bounded single-command bash computation (timeout <= 20s). */
 	allowBashComputation?: boolean;
+	/** Hard ceiling on a single stage response length in characters; longer responses get one concise rewrite. */
+	maxStageResponseChars?: number;
 	allowSingleModel?: boolean;
 }
 
@@ -1456,6 +1460,12 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		);
 	}
 	if (value.allowBashComputation !== undefined && typeof value.allowBashComputation !== "boolean") {
+	if (
+		value.maxStageResponseChars !== undefined &&
+		(!Number.isInteger(value.maxStageResponseChars) || (value.maxStageResponseChars as number) < 1)
+	) {
+		throw new Error("Ansteel config maxStageResponseChars must be a positive integer");
+	}
 		throw new Error("Ansteel config allowBashComputation must be a boolean");
 	}
 	if (value.allowSingleModel !== undefined && typeof value.allowSingleModel !== "boolean") {
@@ -1547,6 +1557,7 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		...(teamTaskMaxNoProgressEpochs === undefined ? {} : { teamTaskMaxNoProgressEpochs }),
 		allowSingleModel: value.allowSingleModel ?? false,
 		allowBashComputation: value.allowBashComputation === true,
+		maxStageResponseChars: value.maxStageResponseChars as number | undefined,
 	};
 }
 
@@ -2014,6 +2025,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			adaptiveArchitectureRevisions: config.adaptiveArchitectureRevisions,
 			adaptiveArchitectureRevisionCap: config.adaptiveArchitectureRevisionCap,
 			getRoleBashEnabled: (role) => config.roles[role].tools.includes("bash"),
+			maxStageResponseChars: config.maxStageResponseChars,
 			projectStartedAt,
 			hardProjectDeadline,
 			epochStartedAt,
@@ -2529,7 +2541,7 @@ interface BuildRolePromptOptions {
 	challengeLedger?: readonly AnsteelChallengeLedgerEntry[];
 	maxToolCallsPerStage?: number;
 	evidencePackage?: string;
-	formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
+	formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" | "over-length" };
 	revisionRoundMax?: number;
 	revisionRoundBaseline?: number;
 	resolutionsBrief?: string;
@@ -2586,8 +2598,10 @@ function buildRolePrompt(
 			? [
 					options.formatRepair.kind === "sections"
 					? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that adds every missing required visible section while keeping all existing content unchanged."
-					: "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that corrects only marker syntax, the role-specific namespace, or duplicate markers.",
-					`The prior response had this repairable ${options.formatRepair.kind === "sections" ? "section-completeness" : "marker"} error: ${options.formatRepair.reason}`,
+					: options.formatRepair.kind === "over-length"
+						? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Rewrite the response concisely within the stated character limit. Preserve every conclusion, evidence label, issue, resolution, verdict, and marker; remove rambling, restatements, redundant prose, and repeated content."
+						: "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that corrects only marker syntax, the role-specific namespace, or duplicate markers.",
+					`The prior response had this repairable ${options.formatRepair.kind === "sections" ? "section-completeness" : options.formatRepair.kind === "over-length" ? "over-length" : "marker"} error: ${options.formatRepair.reason}`,
 					`Prior response to replace:\n${options.formatRepair.previousResponse}`,
 				]
 			: [
@@ -3185,7 +3199,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		round?: number;
 		context?: readonly AnsteelTranscriptEntry[];
 		challengeLedger?: readonly AnsteelChallengeLedgerEntry[];
-		formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" };
+		formatRepair?: { reason: string; previousResponse: string; kind?: "marker" | "sections" | "over-length" };
 		immutableLedgerSummary?: string;
 		revisionRoundMax?: number;
 		revisionRoundBaseline?: number;
@@ -3546,7 +3560,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		stage: AnsteelDiscussionStage,
 		stageOptions: RunStageOptions = {},
 	): Promise<{ response: string; entry: AnsteelTranscriptEntry } | { rejection: AnsteelDiscussionResult }> => {
-		const stageResult = await runStage(role, stage, stageOptions);
+		let stageResult = await runStage(role, stage, stageOptions);
 		if ("failure" in stageResult) {
 			return {
 				rejection: reject(
@@ -3561,6 +3575,47 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			return {
 				rejection: reject(formatBlankResponseStopReason(role, stage), undefined, undefined, "blank-response"),
 			};
+		}
+		const maxStageResponseChars = options.maxStageResponseChars;
+		if (
+			maxStageResponseChars !== undefined &&
+			stageResult.response.length > maxStageResponseChars &&
+			stageOptions.formatRepair === undefined
+		) {
+			const repaired = await runStage(role, stage, {
+				...stageOptions,
+				formatRepair: {
+					reason: `response exceeds ${maxStageResponseChars} characters; rewrite it within that limit`,
+					previousResponse: stageResult.response,
+					kind: "over-length" as const,
+				},
+			});
+			if ("failure" in repaired) {
+				return {
+					rejection: reject(
+						formatStageFailureStopReason(repaired.failure),
+						repaired.failure,
+						undefined,
+						getStageFailureTerminationReason(repaired.failure),
+					),
+				};
+			}
+			if (isBlankRoleResponse(repaired.response)) {
+				return {
+					rejection: reject(formatBlankResponseStopReason(role, stage), undefined, undefined, "blank-response"),
+				};
+			}
+			if (repaired.response.length > maxStageResponseChars) {
+				return {
+					rejection: reject(
+						`${role} / ${stage} response still exceeds ${maxStageResponseChars} characters after the concise rewrite`,
+						undefined,
+						undefined,
+						"response-over-length",
+					),
+				};
+			}
+			stageResult = repaired;
 		}
 		return { response: stageResult.response, entry: stageResult.entry };
 	};

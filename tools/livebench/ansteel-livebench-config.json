@@ -53,5 +53,6 @@
   "maxArchitectureRevisionRounds": 2,
   "adaptiveArchitectureRevisions": true,
   "adaptiveArchitectureRevisionCap": 4,
-  "allowBashComputation": true
+  "allowBashComputation": true,
+  "maxStageResponseChars": 24000
 }
