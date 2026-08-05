@@ -174,6 +174,40 @@ def extract_final_answer(report: str) -> str:
     return answer
 
 
+def read_ground_truth_score(
+    livebench_root: Path,
+    task_name: str,
+    model_display_name: str,
+    question_id: str,
+) -> int | None:
+    """Return the official ground-truth score for one question, or None when absent."""
+    judgment_path = (
+        livebench_root
+        / "livebench"
+        / "data"
+        / task_name
+        / "model_judgment"
+        / "ground_truth_judgment.jsonl"
+    )
+    if not judgment_path.is_file():
+        return None
+    try:
+        for line in judgment_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if (
+                isinstance(record, dict)
+                and record.get("question_id") == question_id
+                and record.get("model") == model_display_name
+                and isinstance(record.get("score"), int)
+            ):
+                return record["score"]
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
 def build_livebench_answer(
     question: dict[str, Any],
     answer: str,
@@ -561,6 +595,9 @@ def process_question(
     manifest["scoring_exit_code"] = score_exit_code
     manifest["scoring_log"] = score_log.name
     manifest["scoring_status"] = "passed" if score_exit_code == 0 else "failed"
+    manifest["scoring_score"] = read_ground_truth_score(
+        args.livebench_root, task_name, args.model_display_name, question["question_id"]
+    )
     write_json(workspace / "protocol-result.json", manifest)
     if score_exit_code != 0:
         print(f"SCORE FAILED {question['question_id']} {task_name}: answer is retained for diagnosis")
