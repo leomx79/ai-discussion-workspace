@@ -11,7 +11,7 @@
       ]
     },
     "staff-engineer": {
-      "model": "volcengine-coding/kimi-k2.7-code",
+      "model": "deepseek-flash/deepseek-v4-flash",
       "thinkingLevel": "medium",
       "tools": [
         "read",
