@@ -4671,6 +4671,28 @@ describe("runAnsteelDiscussion", () => {
 		});
 	});
 
+
+		describe("provider-truncation repair (parallel group)", () => {
+			it("rewrites a provider-truncated cross-examination once and completes", async () => {
+				let repairCalls = 0;
+				const result = await runAnsteelDiscussion({
+					topic: "Review truncated cross-examination repair",
+					maxStageResponseChars: 1000,
+					runRole: async ({ role, stage, formatRepair }) => {
+						if (role === "staff-engineer" && stage === "staff-cross-examination") {
+							if (formatRepair) {
+								repairCalls++;
+								return "ISSUE: STAFF-CROSS | TARGET: qa-engineer\nNO ISSUES | TARGET: tech-lead\n[L2] Check the test strategy.";
+							}
+							throw new Error("Ansteel role stage failed: output-truncated");
+						}
+						return responseForMutualReviewStage(stage);
+					},
+				});
+				expect(result.verdict).toBe("approved");
+				expect(repairCalls).toBe(1);
+			});
+		});
 	describe("provider-truncation repair", () => {
 		it("rewrites a provider-truncated response once and completes", async () => {
 			let repairCalls = 0;

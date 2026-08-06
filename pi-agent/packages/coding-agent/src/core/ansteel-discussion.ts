@@ -3756,11 +3756,30 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		}
 		const outcomes = await Promise.all(
 			group.map(async (member) => {
-				const result = await runStage(member.role, member.stage, {
+				let result = await runStage(member.role, member.stage, {
 					...member.options,
 					deferCommit: true,
 					...(reserveOverride === undefined ? {} : { reserveOverride }),
 				});
+				// Parallel stages share the same over-length / truncation concise rewrite as sequential stages.
+				const maxCharsForGroup = options.maxStageResponseChars;
+				const needsGroupRepair =
+					(("failure" in result) && isOutputTruncatedFailure(result.failure) && member.options.formatRepair === undefined) ||
+					((!("failure" in result)) && maxCharsForGroup !== undefined && result.response.length > maxCharsForGroup && member.options.formatRepair === undefined);
+				if (needsGroupRepair) {
+					const repairReason = "failure" in result
+						? "response was truncated by the provider; rewrite the full response concisely"
+						: `response exceeds ${maxCharsForGroup} characters; rewrite it within that limit`;
+					const priorResponse = "failure" in result ? "" : result.response;
+					const repaired = await runStage(member.role, member.stage, {
+						...member.options,
+						deferCommit: true,
+						...(reserveOverride === undefined ? {} : { reserveOverride }),
+						formatRepair: { reason: repairReason, previousResponse: priorResponse, kind: "over-length" as const },
+					});
+					result = repaired;
+				}
+				return { member, result };
 				return { member, result };
 			}),
 		);
