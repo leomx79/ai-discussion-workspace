@@ -93,9 +93,7 @@ describe("parseArgs", () => {
 
 	describe("--ansteel-supervise flags", () => {
 		test("parses supervision modes and rejects Ansteel mode conflicts", () => {
-			expect(
-				parseArgs(["--ansteel-supervise", "Review", "--ansteel-supervise-max-epochs", "2"]),
-			).toMatchObject({
+			expect(parseArgs(["--ansteel-supervise", "Review", "--ansteel-supervise-max-epochs", "2"])).toMatchObject({
 				ansteelSupervise: "Review",
 				ansteelSuperviseMaxEpochs: 2,
 			});

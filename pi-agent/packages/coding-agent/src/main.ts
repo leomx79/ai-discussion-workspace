@@ -9,8 +9,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
-import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
 import { runAnsteelSupervisorCli } from "./cli/ansteel-supervisor.ts";
+import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
@@ -31,11 +31,11 @@ import {
 	createAnsteelReviewToolPolicy,
 	createAnsteelSetupFailureMarkdown,
 	createAnsteelToolBudget,
-	getAnsteelRunCheckpointPath,
 	getAnsteelDefaultReportDirectory,
 	getAnsteelReviewExitCode,
-	loadAnsteelRunCheckpoint,
+	getAnsteelRunCheckpointPath,
 	loadAnsteelConfig,
+	loadAnsteelRunCheckpoint,
 	runAnsteelProjectReview,
 	writeAnsteelReport,
 } from "./core/ansteel-discussion.ts";
@@ -849,7 +849,12 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
-	if (appMode !== "interactive" && !session.model && parsed.ansteel === undefined && parsed.ansteelResume === undefined) {
+	if (
+		appMode !== "interactive" &&
+		!session.model &&
+		parsed.ansteel === undefined &&
+		parsed.ansteelResume === undefined
+	) {
 		console.error(chalk.red(formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}

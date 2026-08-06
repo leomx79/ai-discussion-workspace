@@ -117,7 +117,11 @@ export function createAnsteelAdaptiveBudgetPolicy(
 		timeExtensionMs: positiveInteger(input.timeExtensionMs, 30_000, "timeExtensionMs"),
 		toolExtensionCalls: positiveInteger(input.toolExtensionCalls, 4, "toolExtensionCalls"),
 		maxBlockedRequestsPerStage: positiveInteger(input.maxBlockedRequestsPerStage, 2, "maxBlockedRequestsPerStage"),
-		maxDuplicateRequestsPerStage: positiveInteger(input.maxDuplicateRequestsPerStage, 2, "maxDuplicateRequestsPerStage"),
+		maxDuplicateRequestsPerStage: positiveInteger(
+			input.maxDuplicateRequestsPerStage,
+			2,
+			"maxDuplicateRequestsPerStage",
+		),
 		protectedVerificationTimeMs,
 		protectedVerificationToolCalls,
 		epochTimeoutMs: positiveInteger(input.epochTimeoutMs, 600_000, "epochTimeoutMs"),
@@ -142,7 +146,11 @@ export function createAnsteelAdaptiveBudgetState(options: {
 	const now = options.now ?? Date.now();
 	const projectStartedAt = options.projectStartedAt ?? now;
 	const hardProjectDeadline = options.hardProjectDeadline ?? projectStartedAt + options.policy.projectTimeoutMs;
-	if (!Number.isFinite(projectStartedAt) || !Number.isFinite(hardProjectDeadline) || hardProjectDeadline < projectStartedAt) {
+	if (
+		!Number.isFinite(projectStartedAt) ||
+		!Number.isFinite(hardProjectDeadline) ||
+		hardProjectDeadline < projectStartedAt
+	) {
 		throw new Error("Ansteel adaptive budget project deadline must be a finite time after project start");
 	}
 	return {
@@ -226,7 +234,8 @@ export function decideAnsteelAdaptiveAllocation(options: {
 			state.stageHardTimeoutMs - state.stageGrantedTimeoutMs,
 			state.remainingProjectTimeMs - policy.protectedVerificationTimeMs,
 		);
-		if (granted <= 0) return deny("Stage hard timeout or protected project reserve prevents further time allocation.");
+		if (granted <= 0)
+			return deny("Stage hard timeout or protected project reserve prevents further time allocation.");
 		state.stageGrantedTimeoutMs += granted;
 		return appendAllocationEvent(state, {
 			role: state.role,
@@ -247,7 +256,8 @@ export function decideAnsteelAdaptiveAllocation(options: {
 		state.stageHardToolCalls - state.stageGrantedToolCalls,
 		state.remainingProjectToolCalls - policy.protectedVerificationToolCalls,
 	);
-	if (granted <= 0) return deny("Stage hard tool limit or protected project reserve prevents further tool allocation.");
+	if (granted <= 0)
+		return deny("Stage hard tool limit or protected project reserve prevents further tool allocation.");
 	state.stageGrantedToolCalls += granted;
 	state.remainingProjectToolCalls -= granted;
 	return appendAllocationEvent(state, {

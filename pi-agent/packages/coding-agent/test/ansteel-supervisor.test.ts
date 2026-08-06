@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	type AnsteelEpochCall,
 	runAnsteelEpochSupervisor,
 	runAnsteelEpochSupervisorWithLock,
 	runAnsteelSupervisorCli,
-	type AnsteelEpochCall,
 } from "../src/cli/ansteel-supervisor.ts";
 import {
 	createAnsteelRunCheckpoint,
@@ -281,8 +281,12 @@ describe("runAnsteelEpochSupervisor", () => {
 
 		expect(result).toMatchObject({ outcome: "terminal", runId, epochsStarted: 2, exitCode: 0 });
 		expect(childArguments).toHaveLength(2);
-		expect(childArguments[0]).toEqual(expect.arrayContaining(["-e", "provider.ts", "--api-key", "test-key", "--ansteel", "Review"]));
-		expect(childArguments[1]).toEqual(expect.arrayContaining(["-e", "provider.ts", "--api-key", "test-key", "--ansteel-resume", runId]));
+		expect(childArguments[0]).toEqual(
+			expect.arrayContaining(["-e", "provider.ts", "--api-key", "test-key", "--ansteel", "Review"]),
+		);
+		expect(childArguments[1]).toEqual(
+			expect.arrayContaining(["-e", "provider.ts", "--api-key", "test-key", "--ansteel-resume", runId]),
+		);
 		for (const args of childArguments) {
 			expect(args).not.toContain("--ansteel-supervise");
 			expect(args).not.toContain("--ansteel-supervise-max-epochs");
@@ -392,9 +396,9 @@ describe("runAnsteelEpochSupervisor", () => {
 		const lock = JSON.stringify({ version: 1, pid: 41, startedAt: "2026-07-28T00:00:00.000Z" });
 		writeFileSync(lockPath, lock);
 
-		await expect(
-			runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false }),
-		).rejects.toThrow(/legacy lock cannot be safely recovered/i);
+		await expect(runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false })).rejects.toThrow(
+			/legacy lock cannot be safely recovered/i,
+		);
 
 		expect(calls).toHaveLength(0);
 		expect(readFileSync(lockPath, "utf8")).toBe(lock);
@@ -451,9 +455,9 @@ describe("runAnsteelEpochSupervisor", () => {
 		});
 		writeFileSync(lockPath, lock);
 
-		await expect(
-			runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false }),
-		).rejects.toThrow(/epoch startup cannot be safely recovered/i);
+		await expect(runAnsteelEpochSupervisorWithLock({ ...options, isProcessAlive: () => false })).rejects.toThrow(
+			/epoch startup cannot be safely recovered/i,
+		);
 
 		expect(calls).toHaveLength(0);
 		expect(readFileSync(lockPath, "utf8")).toBe(lock);
@@ -461,7 +465,11 @@ describe("runAnsteelEpochSupervisor", () => {
 
 	it.each([
 		{ name: "malformed JSON", lock: "{", alive: () => false },
-		{ name: "missing integer PID", lock: JSON.stringify({ version: 1, startedAt: "2026-07-28T00:00:00.000Z" }), alive: () => false },
+		{
+			name: "missing integer PID",
+			lock: JSON.stringify({ version: 1, startedAt: "2026-07-28T00:00:00.000Z" }),
+			alive: () => false,
+		},
 		{
 			name: "unverifiable PID due to EPERM",
 			lock: JSON.stringify({ version: 2, pid: 42, startedAt: "2026-07-28T00:00:00.000Z", epochState: "idle" }),

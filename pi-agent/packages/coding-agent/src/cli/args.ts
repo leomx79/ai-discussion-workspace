@@ -178,19 +178,28 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				const runId = args[++i];
 				if (!/^ansteel-run-[A-Za-z0-9-]+$/.test(runId)) {
-					result.diagnostics.push({ type: "error", message: "--ansteel-supervise-resume requires a safe Ansteel run ID" });
+					result.diagnostics.push({
+						type: "error",
+						message: "--ansteel-supervise-resume requires a safe Ansteel run ID",
+					});
 				} else {
 					result.ansteelSuperviseResume = runId;
 				}
 			}
 		} else if (arg === "--ansteel-supervise-max-epochs") {
 			if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
-				result.diagnostics.push({ type: "error", message: "--ansteel-supervise-max-epochs requires an integer from 1 to 128" });
+				result.diagnostics.push({
+					type: "error",
+					message: "--ansteel-supervise-max-epochs requires an integer from 1 to 128",
+				});
 			} else {
 				const value = args[++i];
 				const maxEpochs = /^\d+$/.test(value) ? Number(value) : Number.NaN;
 				if (!Number.isInteger(maxEpochs) || maxEpochs < 1 || maxEpochs > 128) {
-					result.diagnostics.push({ type: "error", message: "--ansteel-supervise-max-epochs must be an integer from 1 to 128" });
+					result.diagnostics.push({
+						type: "error",
+						message: "--ansteel-supervise-max-epochs must be an integer from 1 to 128",
+					});
 				} else {
 					result.ansteelSuperviseMaxEpochs = maxEpochs;
 				}
@@ -264,7 +273,10 @@ export function parseArgs(args: string[]): Args {
 		result.ansteelSuperviseResume,
 	].filter((value) => value !== undefined).length;
 	if (ansteelModeCount > 1) {
-		result.diagnostics.push({ type: "error", message: "only one Ansteel run or supervision mode can be used at a time" });
+		result.diagnostics.push({
+			type: "error",
+			message: "only one Ansteel run or supervision mode can be used at a time",
+		});
 	}
 	if (result.resume === true && (result.ansteelResume !== undefined || result.ansteelSuperviseResume !== undefined)) {
 		result.diagnostics.push({ type: "error", message: "--resume cannot be used with an Ansteel resume mode" });
@@ -274,7 +286,10 @@ export function parseArgs(args: string[]): Args {
 		result.ansteelSupervise === undefined &&
 		result.ansteelSuperviseResume === undefined
 	) {
-		result.diagnostics.push({ type: "error", message: "--ansteel-supervise-max-epochs requires an Ansteel supervision mode" });
+		result.diagnostics.push({
+			type: "error",
+			message: "--ansteel-supervise-max-epochs requires an Ansteel supervision mode",
+		});
 	}
 
 	return result;

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -227,12 +227,7 @@ async function runCli(
 	return await new Promise((resolvePromise, reject) => {
 		const child = spawn(
 			process.execPath,
-			[
-				cliPath,
-				"-e",
-				join(projectDir, ".pi", "extensions", extensionName),
-				...args,
-			],
+			[cliPath, "-e", join(projectDir, ".pi", "extensions", extensionName), ...args],
 			{
 				cwd: projectDir,
 				env: {

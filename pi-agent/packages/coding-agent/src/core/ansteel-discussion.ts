@@ -4,18 +4,24 @@ import { dirname, extname, join, relative } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { canonicalizePath, getCwdRelativePath, resolvePath } from "../utils/paths.ts";
 import {
-	createAnsteelAdaptiveBudgetState,
-	createAnsteelAdaptiveBudgetPolicy,
-	decideAnsteelAdaptiveAllocation,
-	recordAnsteelAdaptiveEvidence,
 	type AnsteelAdaptiveBudgetEvent,
 	type AnsteelAdaptiveBudgetPolicy,
 	type AnsteelAdaptiveBudgetPolicyInput,
+	createAnsteelAdaptiveBudgetPolicy,
+	createAnsteelAdaptiveBudgetState,
+	decideAnsteelAdaptiveAllocation,
+	recordAnsteelAdaptiveEvidence,
 } from "./ansteel-adaptive-budget.ts";
-export type { AnsteelAdaptiveBudgetEvent, AnsteelAdaptiveBudgetPolicy, AnsteelAdaptiveBudgetPolicyInput } from "./ansteel-adaptive-budget.ts";
+
+export type {
+	AnsteelAdaptiveBudgetEvent,
+	AnsteelAdaptiveBudgetPolicy,
+	AnsteelAdaptiveBudgetPolicyInput,
+} from "./ansteel-adaptive-budget.ts";
+
 import {
-	type AnsteelRunCheckpoint,
 	type AnsteelEvidenceManifest,
+	type AnsteelRunCheckpoint,
 	createAnsteelRunCheckpoint,
 	getAnsteelRunCheckpointPath,
 	loadAnsteelRunCheckpoint,
@@ -24,18 +30,18 @@ import {
 } from "./ansteel-run.ts";
 
 export type {
+	AnsteelEvidenceManifest,
 	AnsteelRunCheckpoint,
 	AnsteelRunCheckpointEvent,
 	AnsteelRunCheckpointState,
 	AnsteelRunCheckpointStatus,
-	AnsteelEvidenceManifest,
 	CreateAnsteelRunCheckpointOptions,
 	UpdateAnsteelRunCheckpointOptions,
 } from "./ansteel-run.ts";
 export {
 	createAnsteelRunCheckpoint,
-	getAnsteelRunDirectory,
 	getAnsteelRunCheckpointPath,
+	getAnsteelRunDirectory,
 	loadAnsteelRunCheckpoint,
 	updateAnsteelRunCheckpoint,
 	validateAnsteelRunCheckpointForResume,
@@ -594,7 +600,10 @@ function resolveFrozenAnsteelEvidenceFiles(
 	requiredFiles: readonly string[],
 ): string[] {
 	if (frozenEvidencePaths.length > ANSTEEL_EVIDENCE_MAX_FILES) {
-		throw new AnsteelGovernanceSetupError("Ansteel frozen evidence manifest has an invalid file count", "configuration");
+		throw new AnsteelGovernanceSetupError(
+			"Ansteel frozen evidence manifest has an invalid file count",
+			"configuration",
+		);
 	}
 	const frozenFiles = new Map<string, string>();
 	for (const frozenEvidencePath of frozenEvidencePaths) {
@@ -606,10 +615,16 @@ function resolveFrozenAnsteelEvidenceFiles(
 			isExcludedFromAnsteelEvidence(relativePath) ||
 			!isAnsteelEvidenceTextFile(relativePath)
 		) {
-			throw new AnsteelGovernanceSetupError("Ansteel frozen evidence manifest contains an unsafe path", "configuration");
+			throw new AnsteelGovernanceSetupError(
+				"Ansteel frozen evidence manifest contains an unsafe path",
+				"configuration",
+			);
 		}
 		if (frozenFiles.has(frozenEvidencePath)) {
-			throw new AnsteelGovernanceSetupError("Ansteel frozen evidence manifest contains a duplicate path", "configuration");
+			throw new AnsteelGovernanceSetupError(
+				"Ansteel frozen evidence manifest contains a duplicate path",
+				"configuration",
+			);
 		}
 		frozenFiles.set(frozenEvidencePath, resolvedPath);
 	}
@@ -667,7 +682,9 @@ export function createAnsteelEvidencePackage(
 					const requiredFileSet = new Set(requiredFiles);
 					return [
 						...requiredFiles,
-						...files.filter((path) => !requiredFileSet.has(path)).slice(0, ANSTEEL_EVIDENCE_MAX_FILES - requiredFiles.length),
+						...files
+							.filter((path) => !requiredFileSet.has(path))
+							.slice(0, ANSTEEL_EVIDENCE_MAX_FILES - requiredFiles.length),
 					];
 				})()
 			: (() => {
@@ -730,7 +747,7 @@ export function createAnsteelEvidencePackage(
 			: manifest),
 		...(eligibleFileCount > selectedFiles.length
 			? [
-				`- ${eligibleFileCount - selectedFiles.length} additional eligible files omitted by the ${ANSTEEL_EVIDENCE_MAX_FILES}-file limit.`,
+					`- ${eligibleFileCount - selectedFiles.length} additional eligible files omitted by the ${ANSTEEL_EVIDENCE_MAX_FILES}-file limit.`,
 				]
 			: []),
 		"### Line-numbered excerpts",
@@ -1374,7 +1391,9 @@ export function createAnsteelProjectToolBudget(
 		protectedVerificationToolCalls < 0 ||
 		protectedVerificationToolCalls >= maximum
 	) {
-		throw new Error("Ansteel protected verification tool calls must be an integer below the configured project budget");
+		throw new Error(
+			"Ansteel protected verification tool calls must be an integer below the configured project budget",
+		);
 	}
 	let usedToolCalls = initialUsedToolCalls;
 	let requiredProtectedVerificationReserve = protectedVerificationToolCalls;
@@ -1939,7 +1958,10 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			toolBudgetCheckpoint
 				? (usedToolCalls) => {
 						updateAnsteelRunCheckpoint(toolBudgetCheckpoint, {
-							workflowState: { ...toolBudgetCheckpoint.state.workflowState, projectToolCallsUsed: usedToolCalls },
+							workflowState: {
+								...toolBudgetCheckpoint.state.workflowState,
+								projectToolCallsUsed: usedToolCalls,
+							},
 						});
 					}
 				: undefined,
@@ -2045,9 +2067,9 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 					...(formatRepair ? { formatRepair } : {}),
 					toolsEnabled: !formatRepair && !isCrossExaminationStage(stage),
 				};
-			let session = sessions.get(role);
-			if (!session) throw new Error(`Ansteel role session is missing: ${role}`);
-			session.setToolBudgetExtensionHandler?.(requestToolExtension);
+				let session = sessions.get(role);
+				if (!session) throw new Error(`Ansteel role session is missing: ${role}`);
+				session.setToolBudgetExtensionHandler?.(requestToolExtension);
 				try {
 					return await session.prompt(prompt, promptOptions);
 				} catch (error) {
@@ -2181,7 +2203,9 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 					challengeLedger: discussion.challengeLedger,
 					revisionRounds: discussion.revisionRounds,
 					providerFallbacks: discussion.providerFallbacks,
-					...(discussion.immutableLedgerSummary === undefined ? {} : { immutableLedgerSummary: discussion.immutableLedgerSummary }),
+					...(discussion.immutableLedgerSummary === undefined
+						? {}
+						: { immutableLedgerSummary: discussion.immutableLedgerSummary }),
 					...(discussion.consensus === undefined ? {} : { consensus: discussion.consensus }),
 				},
 				event: {
@@ -2210,7 +2234,9 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 				providerFallbacks: workflow.providerFallbacks,
 				challengeLedger: workflow.challengeLedger,
 				revisionRounds: workflow.revisionRounds,
-				...(workflow.immutableLedgerSummary === undefined ? {} : { immutableLedgerSummary: workflow.immutableLedgerSummary }),
+				...(workflow.immutableLedgerSummary === undefined
+					? {}
+					: { immutableLedgerSummary: workflow.immutableLedgerSummary }),
 				...(workflow.consensus === undefined ? {} : { consensus: workflow.consensus }),
 				markdown: `# Ansteel Engineering Review: ${options.topic}\n\n## Status\n\n- Governance result: PAUSED\n- Epoch state: READY_TO_RESUME\n- Run ID: ${runCheckpoint.state.id}\n`,
 				roleModels,
@@ -3071,11 +3097,12 @@ function formatAdaptiveBudgetLedger(events: readonly AnsteelAdaptiveBudgetEvent[
 	if (events.length === 0) return "No adaptive budget decision was made.";
 	return events
 		.map((event) => {
-			const granted = event.granted?.timeMs !== undefined
-				? `; granted-time=${event.granted.timeMs}ms`
-				: event.granted?.toolCalls !== undefined
-					? `; granted-tools=${event.granted.toolCalls}`
-					: "";
+			const granted =
+				event.granted?.timeMs !== undefined
+					? `; granted-time=${event.granted.timeMs}ms`
+					: event.granted?.toolCalls !== undefined
+						? `; granted-tools=${event.granted.toolCalls}`
+						: "";
 			return `- ${event.role} / ${event.stage}: ${event.action}${granted}; evidence=${event.evidenceProgressCount}; open-challenges=${event.unresolvedChallengeCount}; remaining-time=${event.remainingProjectTimeMs}ms; remaining-tools=${event.remainingProjectToolCalls}; reason=${formatAuditValue(event.reason)}`;
 		})
 		.join("\n");

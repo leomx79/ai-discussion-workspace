@@ -279,7 +279,8 @@ function cloneWorkflowState(state: AnsteelRunWorkflowState | undefined): Ansteel
 	return {
 		projectToolCallsUsed: state?.projectToolCallsUsed ?? 0,
 		transcript: state?.transcript.map((entry) => ({ ...entry })) ?? [],
-		stageAudits: state?.stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })) ?? [],
+		stageAudits:
+			state?.stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })) ?? [],
 		budgetLedger: state?.budgetLedger.map((entry) => ({ ...entry })) ?? [],
 		adaptiveBudgetEvents: state?.adaptiveBudgetEvents.map((event) => ({ ...event })) ?? [],
 		challengeLedger: state?.challengeLedger.map((entry) => ({ ...entry })) ?? [],
@@ -348,11 +349,11 @@ export function createAnsteelRunCheckpoint(options: CreateAnsteelRunCheckpointOp
 		...(options.evidenceManifest === undefined
 			? {}
 			: {
-				evidenceManifest: {
-					paths: [...options.evidenceManifest.paths],
-					eligibleFileCount: options.evidenceManifest.eligibleFileCount,
-				},
-			}),
+					evidenceManifest: {
+						paths: [...options.evidenceManifest.paths],
+						eligibleFileCount: options.evidenceManifest.eligibleFileCount,
+					},
+				}),
 		configFingerprint: options.configFingerprint,
 		projectStartedAt: options.projectStartedAt,
 		hardProjectDeadline: options.hardProjectDeadline,
@@ -388,9 +389,7 @@ export function updateAnsteelRunCheckpoint(
 		!isAnsteelTerminalCheckpointStatus(checkpoint.state.status) &&
 		!isAllowedAnsteelCheckpointTransition(checkpoint.state.status, options.status)
 	) {
-		throw new Error(
-			`Ansteel run checkpoint cannot transition from ${checkpoint.state.status} to ${options.status}`,
-		);
+		throw new Error(`Ansteel run checkpoint cannot transition from ${checkpoint.state.status} to ${options.status}`);
 	}
 	if (
 		options.status !== undefined &&
@@ -437,8 +436,10 @@ function isAllowedAnsteelCheckpointTransition(
 	to: AnsteelRunCheckpointStatus,
 ): boolean {
 	if (from === to) return true;
-	if (from === "ready-to-resume") return to === "waiting-provider" || to === "blocked" || to === "expired" || to === "completed" || to === "failed";
-	if (from === "waiting-provider") return to === "ready-to-resume" || to === "blocked" || to === "expired" || to === "failed";
+	if (from === "ready-to-resume")
+		return to === "waiting-provider" || to === "blocked" || to === "expired" || to === "completed" || to === "failed";
+	if (from === "waiting-provider")
+		return to === "ready-to-resume" || to === "blocked" || to === "expired" || to === "failed";
 	if (from === "blocked") return to === "ready-to-resume" || to === "expired" || to === "failed";
 	return false;
 }

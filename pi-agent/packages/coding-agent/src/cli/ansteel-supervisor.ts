@@ -2,16 +2,14 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isBunBinary } from "../config.ts";
-import { parseArgs } from "./args.ts";
 import {
+	type AnsteelRunCheckpointStatus,
 	getAnsteelRunCheckpointPath,
 	loadAnsteelRunCheckpoint,
-	type AnsteelRunCheckpointStatus,
 } from "../core/ansteel-run.ts";
+import { parseArgs } from "./args.ts";
 
-export type AnsteelEpochCall =
-	| { kind: "new"; topic: string }
-	| { kind: "resume"; runId: string };
+export type AnsteelEpochCall = { kind: "new"; topic: string } | { kind: "resume"; runId: string };
 
 export interface AnsteelEpochSupervisorOptions {
 	topic?: string;
@@ -114,11 +112,7 @@ export async function runAnsteelEpochSupervisor(
 			return { outcome: "invalid-checkpoint", runId, epochsStarted: epoch + 1, exitCode: 1 };
 		}
 		if (checkpoint.status === "ready-to-resume") continue;
-		if (
-			checkpoint.status === "completed" ||
-			checkpoint.status === "failed" ||
-			checkpoint.status === "expired"
-		) {
+		if (checkpoint.status === "completed" || checkpoint.status === "failed" || checkpoint.status === "expired") {
 			return { outcome: "terminal", runId, epochsStarted: epoch + 1, exitCode: 0 };
 		}
 		return { outcome: "invalid-checkpoint", runId, epochsStarted: epoch + 1, exitCode: 1 };
@@ -156,7 +150,7 @@ export async function runAnsteelEpochSupervisorWithLock(
 			onRunId: (runId) => {
 				updateSupervisorLockRunId(lockPath, owner, runId);
 				options.onRunId?.(runId);
-		},
+			},
 			onEpochStarted: (pid) => {
 				markSupervisorEpochRunning(lockPath, owner, pid);
 				options.onEpochStarted?.(pid);
@@ -173,7 +167,12 @@ export async function runAnsteelSupervisorCli(
 ): Promise<AnsteelEpochSupervisorResult> {
 	const parsed = parseArgs([...options.args]);
 	if (parsed.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
-		throw new Error(parsed.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message).join("; "));
+		throw new Error(
+			parsed.diagnostics
+				.filter((diagnostic) => diagnostic.type === "error")
+				.map((diagnostic) => diagnostic.message)
+				.join("; "),
+		);
 	}
 	const maxEpochs = parsed.ansteelSuperviseMaxEpochs ?? 64;
 	const topic = parsed.ansteelSupervise;
@@ -277,7 +276,8 @@ function acquireSupervisorLock(
 		writeFileSync(lockPath, JSON.stringify(owner), { encoding: "utf8", flag: "wx" });
 		return;
 	} catch (error) {
-		if (getErrorCode(error) !== "EEXIST") throw new Error(`Ansteel supervisor lock cannot be created: ${formatError(error)}`);
+		if (getErrorCode(error) !== "EEXIST")
+			throw new Error(`Ansteel supervisor lock cannot be created: ${formatError(error)}`);
 	}
 
 	const existingOwner = readSupervisorLock(lockPath);
@@ -331,13 +331,18 @@ function releaseSupervisorLock(lockPath: string, owner: AnsteelSupervisorLockOwn
 		if (getErrorCode(error) === "ENOENT") return;
 		throw error;
 	}
-	if (currentOwner.version !== owner.version || currentOwner.pid !== owner.pid || currentOwner.startedAt !== owner.startedAt) {
+	if (
+		currentOwner.version !== owner.version ||
+		currentOwner.pid !== owner.pid ||
+		currentOwner.startedAt !== owner.startedAt
+	) {
 		throw new Error("Ansteel supervisor lock ownership changed before release");
 	}
 	try {
 		unlinkSync(lockPath);
 	} catch (error) {
-		if (getErrorCode(error) !== "ENOENT") throw new Error(`Ansteel supervisor lock cannot be released: ${formatError(error)}`);
+		if (getErrorCode(error) !== "ENOENT")
+			throw new Error(`Ansteel supervisor lock cannot be released: ${formatError(error)}`);
 	}
 }
 
@@ -375,7 +380,11 @@ function updateSupervisorLock(
 	writeFileSync(temporaryPath, JSON.stringify(nextOwner), "utf8");
 	try {
 		const currentOwner = readSupervisorLock(lockPath);
-		if (currentOwner.version !== owner.version || currentOwner.pid !== owner.pid || currentOwner.startedAt !== owner.startedAt) {
+		if (
+			currentOwner.version !== owner.version ||
+			currentOwner.pid !== owner.pid ||
+			currentOwner.startedAt !== owner.startedAt
+		) {
 			throw new Error("Ansteel supervisor lock ownership changed before run ID update");
 		}
 		renameSync(temporaryPath, lockPath);
