@@ -156,6 +156,49 @@ export default function (pi) {
 }
 `;
 
+const ADAPTIVE_SIGN_OFF_PROVIDER_EXTENSION = `
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+
+const completeWorkCard = ${JSON.stringify(COMPLETE_WORK_CARD)};
+const completeRevisionWorkCard = ${JSON.stringify(COMPLETE_REVISION_WORK_CARD)};
+
+function register(pi, provider, model, responses) {
+	const faux = fauxProvider({ provider, models: [{ id: model }] });
+	faux.setResponses(responses.map((response) => fauxAssistantMessage(response)));
+	pi.registerProvider(faux.provider);
+}
+
+export default function (pi) {
+	register(pi, "adaptive-sign-off-tech", "tech", [
+		completeWorkCard,
+		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
+		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"[L1] Consensus\\nFinal answer: 100",
+		"RESOLUTION: STAFF-5 | RESOLVED\\n\\n[L1] Revised consensus\\nFinal answer: 100",
+		"RESOLUTION: STAFF-6 | RESOLVED\\n\\n[L1] Revised consensus 2\\nFinal answer: 100",
+	]);
+	register(pi, "adaptive-sign-off-staff", "staff", [
+		completeWorkCard,
+		"ISSUE: STAFF-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: qa-engineer",
+		"RESOLUTION: TL-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"VERDICT: REJECT\\nISSUE: STAFF-5 | TARGET: tech-lead\\n[L1] First objection.",
+		"VERDICT: REJECT\\nISSUE: STAFF-6 | TARGET: tech-lead\\n[L1] Second objection.",
+		"VERDICT: APPROVE",
+	]);
+	register(pi, "adaptive-sign-off-qa", "qa", [
+		completeWorkCard,
+		"ISSUE: QA-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: staff-engineer",
+		completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+	]);
+}
+`;
+
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
@@ -241,6 +284,33 @@ function createConvergingTemporaryProject(): { agentDir: string; projectDir: str
 					"tech-lead": { model: "converging-tech/tech", tools: [] },
 					"staff-engineer": { model: "converging-staff/staff", tools: [] },
 					"qa-engineer": { model: "converging-qa/qa", tools: [] },
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+	return { agentDir, projectDir };
+}
+
+
+function createAdaptiveConvergingTemporaryProject(): { agentDir: string; projectDir: string } {
+	const { agentDir, projectDir } = createTemporaryProject();
+	const extensionsDir = join(projectDir, ".pi", "extensions");
+	writeFileSync(join(extensionsDir, "adaptive-sign-off.ts"), ADAPTIVE_SIGN_OFF_PROVIDER_EXTENSION, "utf8");
+	writeFileSync(
+		join(projectDir, ".pi", "ansteel.json"),
+		JSON.stringify(
+			{
+				reportDirectory: ".pi/ansteel-reports",
+				stageTimeoutMs: 5_000,
+				maxToolCallsPerStage: 1,
+				adaptiveSignOffRevisions: true,
+				roles: {
+					"tech-lead": { model: "adaptive-sign-off-tech/tech", tools: [] },
+					"staff-engineer": { model: "adaptive-sign-off-staff/staff", tools: [] },
+					"qa-engineer": { model: "adaptive-sign-off-qa/qa", tools: [] },
 				},
 			},
 			null,
@@ -356,6 +426,25 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("tech-lead / consensus-revision");
 		expect(report).toContain("STAFF-5");
 		expect(report).toContain("Governance result: APPROVED");
+		}, 30_000);
+
+	it("extends sign-off adaptively beyond the baseline when each rejection resolves and narrows the ledger", async () => {
+		const { agentDir, projectDir } = createAdaptiveConvergingTemporaryProject();
+
+		const result = await runCli(projectDir, agentDir, ["--ansteel", "Review"], "adaptive-sign-off.ts");
+
+		expect(result.code).toBe(0);
+		expect(result.stderr).not.toContain("No more faux responses queued");
+		const reportMatch = /Ansteel review approved: (.+)\r?\n?$/.exec(result.stdout);
+		expect(reportMatch?.[1]).toBeDefined();
+		const reportPath = reportMatch?.[1];
+		if (!reportPath) throw new Error(`Could not find Ansteel report path in CLI output: ${result.stdout}`);
+		expect(existsSync(reportPath)).toBe(true);
+		const report = readFileSync(reportPath, "utf8");
+		expect(report).toContain("Governance result: APPROVED");
+		expect(report).toContain("STAFF-5");
+		expect(report).toContain("STAFF-6");
+		expect(report).toContain("tech-lead / consensus-revision");
 		}, 30_000);
 
 	it("runs from a child directory while retaining declared Git-root evidence in the archived CLI report", async () => {

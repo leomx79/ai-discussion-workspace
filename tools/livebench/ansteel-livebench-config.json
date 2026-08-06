@@ -54,6 +54,7 @@
   "adaptiveArchitectureRevisions": true,
   "adaptiveArchitectureRevisionCap": 4,
   "maxSignOffRounds": 3,
+  "adaptiveSignOffRevisions": true,
   "allowBashComputation": true,
   "maxStageResponseChars": 24000
 }

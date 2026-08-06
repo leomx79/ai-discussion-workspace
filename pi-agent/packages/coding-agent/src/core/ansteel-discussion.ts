@@ -281,8 +281,12 @@ export interface RunAnsteelDiscussionOptions {
 	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicyInput;
 	/** Baseline collaborative revision rounds; defaults to 2. */
 	maxArchitectureRevisionRounds?: number;
-	/** Final sign-off rounds after Tech Lead consensus; each rejected sign-off with new targeted issues triggers one Tech Lead consensus revision. Defaults to 2. */
+	/** Baseline final sign-off rounds after Tech Lead consensus; each rejected sign-off with new targeted issues triggers one Tech Lead consensus revision. Defaults to 2. */
 	maxSignOffRounds?: number;
+	/** When true, allow extra sign-off rounds while the issue ledger narrows. */
+	adaptiveSignOffRevisions?: boolean;
+	/** Hard ceiling on total sign-off rounds when adaptive extension is enabled. */
+	adaptiveSignOffRevisionCap?: number;
 	/** When true, allow extra revision rounds while the issue ledger narrows. */
 	adaptiveArchitectureRevisions?: boolean;
 	/** Hard ceiling on total revision rounds when adaptive extension is enabled. */
@@ -388,8 +392,12 @@ export interface AnsteelConfig {
 	maxToolCallsPerStage?: number;
 	/** Baseline collaborative revision rounds; defaults to 2. */
 	maxArchitectureRevisionRounds?: number;
-	/** Final sign-off rounds after Tech Lead consensus; each rejected sign-off with new targeted issues triggers one Tech Lead consensus revision. Defaults to 2. */
+	/** Baseline final sign-off rounds after Tech Lead consensus; each rejected sign-off with new targeted issues triggers one Tech Lead consensus revision. Defaults to 2. */
 	maxSignOffRounds?: number;
+	/** When true, allow extra sign-off rounds while the issue ledger narrows. */
+	adaptiveSignOffRevisions?: boolean;
+	/** Hard ceiling on total sign-off rounds when adaptive extension is enabled. */
+	adaptiveSignOffRevisionCap?: number;
 	/** When true, allow extra revision rounds while the issue ledger narrows. */
 	adaptiveArchitectureRevisions?: boolean;
 	/** Hard ceiling on total revision rounds when adaptive extension is enabled. */
@@ -1517,6 +1525,8 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 	let adaptiveArchitectureRevisionCap: number;
 	let adaptiveArchitectureRevisions: boolean;
 	let maxSignOffRounds: number;
+	let adaptiveSignOffRevisions: boolean;
+	let adaptiveSignOffRevisionCap: number;
 	let maxToolCallsPerStage: number;
 	let teamTaskMaxEpochs: number | undefined;
 	let teamTaskMaxNoProgressEpochs: number | undefined;
@@ -1535,6 +1545,14 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		}
 		adaptiveArchitectureRevisions = value.adaptiveArchitectureRevisions === true;
 		maxSignOffRounds = normalizeAnsteelRevisionRounds(value.maxSignOffRounds, ANSTEEL_MAX_SIGN_OFF_ROUNDS);
+		adaptiveSignOffRevisionCap = normalizeAnsteelRevisionRounds(
+			value.adaptiveSignOffRevisionCap,
+			Math.min(maxSignOffRounds + 2, 8),
+		);
+		if (adaptiveSignOffRevisionCap < maxSignOffRounds) {
+			throw new Error("adaptiveSignOffRevisionCap cannot be lower than maxSignOffRounds");
+		}
+		adaptiveSignOffRevisions = value.adaptiveSignOffRevisions === true;
 		teamTaskMaxEpochs = normalizeAnsteelTeamTaskMaxEpochs(value.teamTaskMaxEpochs);
 		teamTaskMaxNoProgressEpochs = normalizeAnsteelTeamTaskMaxNoProgressEpochs(value.teamTaskMaxNoProgressEpochs);
 		if (teamTaskMaxEpochs !== undefined && (teamTaskMaxNoProgressEpochs ?? 2) > teamTaskMaxEpochs) {
@@ -1578,6 +1596,8 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		stageTimeoutMs,
 		maxArchitectureRevisionRounds,
 		maxSignOffRounds,
+		adaptiveSignOffRevisions,
+		adaptiveSignOffRevisionCap,
 		adaptiveArchitectureRevisions,
 		adaptiveArchitectureRevisionCap,
 		maxToolCallsPerStage,
@@ -2060,6 +2080,8 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			adaptiveBudgetPolicy: config.adaptiveBudgetPolicy,
 			maxArchitectureRevisionRounds: config.maxArchitectureRevisionRounds,
 			maxSignOffRounds: config.maxSignOffRounds,
+			adaptiveSignOffRevisions: config.adaptiveSignOffRevisions,
+			adaptiveSignOffRevisionCap: config.adaptiveSignOffRevisionCap,
 			adaptiveArchitectureRevisions: config.adaptiveArchitectureRevisions,
 			adaptiveArchitectureRevisionCap: config.adaptiveArchitectureRevisionCap,
 			getRoleBashEnabled: (role) => config.roles[role].tools.includes("bash"),
@@ -4205,10 +4227,16 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	// answer instead of failing at the first objection. Bare rejections and
 	// rejections that exhaust the sign-off round cap fail closed.
 	const maxSignOffRounds = options.maxSignOffRounds ?? ANSTEEL_MAX_SIGN_OFF_ROUNDS;
+	const adaptiveSignOffRevisionCap =
+		options.adaptiveSignOffRevisionCap ?? Math.min(maxSignOffRounds + 2, 8);
+	const adaptiveSignOffRevisions = options.adaptiveSignOffRevisions === true;
 	let signOffRound = 0;
+	let signOffPreviousRoundNewIssues: number | undefined;
+	let signOffResolvedThisRound = 0;
 	for (;;) {
 		signOffRound += 1;
 		const signOffRejections: { role: AnsteelRole; reason: string }[] = [];
+		let signOffRoundNewIssues = 0;
 		const finalSignOffStop = await runParallelStageGroup(
 			[
 				{ role: "staff-engineer", stage: "staff-sign-off", options: { immutableLedgerSummary } },
@@ -4273,7 +4301,8 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 							"invalid-challenge-ledger",
 						);
 					}
-					signOffRejections.push({ role, reason: `${role} rejected the Tech Lead consensus during final sign-off` });
+					signOffRoundNewIssues += addedThisRound.length;
+				signOffRejections.push({ role, reason: `${role} rejected the Tech Lead consensus during final sign-off` });
 				}
 				return undefined;
 			},
@@ -4281,11 +4310,23 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		);
 		if (finalSignOffStop) return finalSignOffStop;
 		if (signOffRejections.length === 0) break;
-		if (signOffRound >= maxSignOffRounds) {
+		// Like architecture revisions, sign-off rounds extend adaptively while the
+		// issue ledger narrows, so the discussion keeps converging instead of
+		// stopping after one or two rejections.
+		const signOffExtension = shouldExtendRevisionRounds({
+			round: signOffRound,
+			baseline: maxSignOffRounds,
+			cap: adaptiveSignOffRevisionCap,
+			adaptive: adaptiveSignOffRevisions,
+			resolvedThisRound: signOffResolvedThisRound,
+			newIssuesThisRound: signOffRoundNewIssues,
+			newIssuesPreviousRound: signOffPreviousRoundNewIssues,
+		});
+		if (!signOffExtension.extend) {
 			return reject(
-				`Final sign-off did not approve within ${maxSignOffRounds} round(s): ${signOffRejections
+				`Final sign-off did not approve: ${signOffRejections
 					.map((item) => item.role)
-					.join(", ")} rejected the Tech Lead consensus`,
+					.join(", ")} rejected the Tech Lead consensus (${signOffExtension.reason})`,
 				undefined,
 				consensus,
 				"final-sign-off-rejected",
@@ -4317,6 +4358,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				"invalid-ledger-summary",
 			);
 		}
+		signOffResolvedThisRound = challengeLedger.filter(
+			(challenge) => challenge.round === signOffRound && challenge.status === "resolved",
+		).length;
+		signOffPreviousRoundNewIssues = signOffRoundNewIssues;
 		consensus = consensusRevision.response;
 	}
 
