@@ -2664,7 +2664,7 @@ describe("runAnsteelDiscussion", () => {
 					case "qa-verification":
 						return revisionCount === 1
 							? "VERDICT: REJECT\nISSUE: QA-VERIFY-1 | TARGET: staff-engineer\n[L1] issue one."
-							: "VERDICT: REJECT\nISSUE: QA-VERIFY-2 | TARGET: staff-engineer\n[L1] issue two.\nISSUE: QA-VERIFY-3 | TARGET: tech-lead\n[L1] issue three.";
+							: "VERDICT: REJECT\nISSUE: QA-VERIFY-2 | TARGET: staff-engineer\n[L1] issue two.\nISSUE: QA-VERIFY-3 | TARGET: tech-lead\n[L1] issue three.\nISSUE: QA-VERIFY-4 | TARGET: staff-engineer\n[L1] issue four.";
 					default:
 						return responseForMutualReviewStage(stage);
 				}
@@ -2672,7 +2672,7 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		expect(result.verdict).toBe("rejected");
-		expect(result.markdown).toContain("new issues grew from 1 to 2");
+		expect(result.markdown).toContain("new issues grew from 1 to 3 (more than 2x)");
 	});
 
 	it("rejects an architecture revision that does not answer every challenge ID", async () => {
@@ -4568,9 +4568,9 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		it("rejects when new issues grow", () => {
-			const decision = shouldExtendRevisionRounds({ ...base, round: 2, newIssuesThisRound: 2 });
+			const decision = shouldExtendRevisionRounds({ ...base, round: 2, newIssuesThisRound: 3 });
 			expect(decision.extend).toBe(false);
-			expect(decision.reason).toContain("grew from 1 to 2");
+			expect(decision.reason).toContain("grew from 1 to 3 (more than 2x)");
 		});
 
 		it("rejects at the configured cap", () => {

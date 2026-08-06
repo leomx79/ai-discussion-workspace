@@ -2435,15 +2435,18 @@ export function shouldExtendRevisionRounds(input: RevisionRoundExtensionInput): 
 	if (input.resolvedThisRound < 1) {
 		return { extend: false, reason: "no previously open issue was resolved this round" };
 	}
-	if (input.newIssuesPreviousRound !== undefined && input.newIssuesThisRound > input.newIssuesPreviousRound) {
+	if (
+		input.newIssuesPreviousRound !== undefined &&
+		input.newIssuesThisRound > input.newIssuesPreviousRound * 2
+	) {
 		return {
 			extend: false,
-			reason: `new issues grew from ${input.newIssuesPreviousRound} to ${input.newIssuesThisRound}`,
+			reason: `new issues grew from ${input.newIssuesPreviousRound} to ${input.newIssuesThisRound} (more than 2x)`,
 		};
 	}
 	return {
 		extend: true,
-		reason: `converging: ${input.resolvedThisRound} issue(s) resolved and new issues did not grow`,
+		reason: `converging: ${input.resolvedThisRound} issue(s) resolved and new issues within tolerance`,
 	};
 }
 
@@ -2814,6 +2817,39 @@ function formatRepairPreservesNonMarkerContent(previousResponse: string, repaire
 	return previous.length === repaired.length && previous.every((line, index) => line === repaired[index]);
 }
 
+function formatRepairPreservesMarkers(previousResponse: string, repairedResponse: string): boolean {
+	const collect = (response: string): { verdicts: string[]; issueTargets: string[]; noIssuesTargets: string[]; resolutions: string[] } => {
+		const verdicts: string[] = [];
+		const issueTargets: string[] = [];
+		const noIssuesTargets: string[] = [];
+		const resolutions: string[] = [];
+		for (const line of response.split(/\r?\n/)) {
+			const normalized = normalizeWholeLineMarker(line);
+			if (isVerdictCandidate(line)) {
+				verdicts.push(normalized);
+			} else if (normalized.startsWith("ISSUE:")) {
+				const target = /TARGET:\s*([A-Za-z0-9._-]+)/.exec(normalized)?.[1] ?? "";
+				issueTargets.push(target);
+			} else if (normalized.startsWith("NO ISSUES")) {
+				const target = /TARGET:\s*([A-Za-z0-9._-]+)/.exec(normalized)?.[1] ?? "";
+				noIssuesTargets.push(target);
+			} else if (normalized.startsWith("RESOLUTION:")) {
+				const id = /RESOLUTION:\s*([A-Za-z0-9._-]+)/.exec(normalized)?.[1] ?? "";
+				resolutions.push(id);
+			}
+		}
+		return { verdicts, issueTargets, noIssuesTargets, resolutions };
+	};
+	const previous = collect(previousResponse);
+	const repaired = collect(repairedResponse);
+	// A marker-only repair must keep every original verdict, every ISSUE/NO-ISSUES target coverage,
+	// and every RESOLUTION id; prose and issue-id namespaces may change.
+	const sameVerdicts = previous.verdicts.every((v) => repaired.verdicts.includes(v));
+	const sameIssueTargets = previous.issueTargets.every((t) => repaired.issueTargets.includes(t));
+	const sameNoIssuesTargets = previous.noIssuesTargets.every((t) => repaired.noIssuesTargets.includes(t));
+	const sameResolutions = previous.resolutions.every((r) => repaired.resolutions.includes(r));
+	return sameVerdicts && sameIssueTargets && sameNoIssuesTargets && sameResolutions;
+}
 function formatSectionRepairPreservesContent(previousResponse: string, repairedResponse: string): boolean {
 	const nonMarkerLines = (response: string): string[] =>
 		response.split(/\r?\n/).filter((line) => {
@@ -3737,7 +3773,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		const preserves =
 			kind === "sections"
 				? formatSectionRepairPreservesContent(previousEntry.response, repairedResult.response)
-				: formatRepairPreservesNonMarkerContent(previousEntry.response, repairedResult.response);
+			: formatRepairPreservesMarkers(previousEntry.response, repairedResult.response);
 		if (preserves) return repairedResult;
 		return {
 			rejection: reject(
