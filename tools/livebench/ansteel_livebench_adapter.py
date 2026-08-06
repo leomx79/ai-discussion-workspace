@@ -242,6 +242,7 @@ def load_livebench_questions(
     release: str,
     question_begin: int | None,
     question_end: int | None,
+    question_ids: set[str] | None = None,
 ) -> list[tuple[Path, str, dict[str, Any]]]:
     """Reuse LiveBench's release filtering so question selection matches its official generator."""
     sys.path.insert(0, str(livebench_root))
@@ -262,7 +263,13 @@ def load_livebench_questions(
             raise ProtocolResultError(f"No local question files found for {bench_name}")
         for question_file in question_files:
             questions = load_questions_jsonl(str(question_file), release_set, release)
-            question_slice = questions[slice(question_begin, question_end)]
+            if question_ids is not None:
+                # Explicit question-id selection takes precedence over the index
+                # range so arbitrary subsets (e.g. a curated IMO set) can be run
+                # without editing the dataset or choosing a contiguous slice.
+                question_slice = [q for q in questions if q["question_id"] in question_ids]
+            else:
+                question_slice = questions[slice(question_begin, question_end)]
             task_name = question_file.parent.relative_to(data_root).as_posix()
             selected.extend((question_file, task_name, question) for question in question_slice)
     return selected
@@ -617,6 +624,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release", default="2024-11-25")
     parser.add_argument("--question-begin", type=int, default=-1)
     parser.add_argument("--question-end", type=int, default=-1)
+    parser.add_argument(
+        "--question-ids",
+        default="",
+        help="Comma-separated question ids to run; mutually exclusive with --question-begin/--question-end",
+    )
     parser.add_argument("--max-epochs", type=int, default=64)
     parser.add_argument("--run-label", default="r1")
     parser.add_argument("--model-display-name", default=DEFAULT_MODEL_DISPLAY_NAME)
@@ -631,6 +643,13 @@ def main() -> int:
         raise ProtocolResultError("Question range values must be -1 or non-negative")
     if args.question_begin >= 0 and args.question_end >= 0 and args.question_end < args.question_begin:
         raise ProtocolResultError("question-end cannot be less than question-begin")
+    question_ids: set[str] | None = None
+    if args.question_ids.strip():
+        question_ids = {item.strip() for item in args.question_ids.split(",") if item.strip()}
+        if not question_ids:
+            raise ProtocolResultError("question-ids must contain at least one non-empty question id")
+        if args.question_begin >= 0 or args.question_end >= 0:
+            raise ProtocolResultError("question-ids cannot be combined with question-begin/question-end")
     if not 1 <= args.max_epochs <= 128:
         raise ProtocolResultError("max-epochs must be from 1 to 128")
     if not RUN_LABEL_PATTERN.fullmatch(args.run_label):
@@ -655,6 +674,7 @@ def main() -> int:
         args.release,
         args.question_begin,
         args.question_end,
+        question_ids,
     )
     if not selections:
         print("No LiveBench questions selected; no Ansteel process or provider request was started")

@@ -10,6 +10,7 @@ param(
 	[int]$QuestionBegin = -1,
 	[ValidateRange(-1, 1000000)]
 	[int]$QuestionEnd = -1,
+	[string]$QuestionIds = "",
 	[ValidateRange(1, 128)]
 	[int]$MaxEpochs = 64,
 	[ValidatePattern("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")]
@@ -41,6 +42,11 @@ foreach ($required in @($venvPython, $adapterPath, $protocolConfigPath, $piTestP
 if ($QuestionBegin -ge 0 -and $QuestionEnd -ge 0 -and $QuestionEnd -lt $QuestionBegin) {
 	throw "QuestionEnd ($QuestionEnd) cannot be less than QuestionBegin ($QuestionBegin)."
 }
+if (-not [string]::IsNullOrWhiteSpace($QuestionIds)) {
+	if ($QuestionBegin -ge 0 -or $QuestionEnd -ge 0) {
+		throw "QuestionIds cannot be combined with QuestionBegin/QuestionEnd."
+	}
+}
 
 $arguments = @(
 	$adapterPath,
@@ -54,6 +60,7 @@ $arguments = @(
 	"--release", $Release,
 	"--question-begin", "$QuestionBegin",
 	"--question-end", "$QuestionEnd",
+	"--question-ids", $QuestionIds,
 	"--max-epochs", "$MaxEpochs",
 	"--run-label", $RunLabel,
 	"--model-display-name", $ModelDisplayName
