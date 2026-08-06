@@ -2892,6 +2892,10 @@ function resolveOpenChallengesForRole(
 	return undefined;
 }
 
+function isOutputTruncatedFailure(failure: AnsteelDiscussionFailure): boolean {
+	return typeof failure.reason === "string" && failure.reason.includes("output-truncated");
+}
+
 function isBlankRoleResponse(response: string): boolean {
 	return response.replace(/\s|\u200B|\u200C|\u200D|\uFEFF/g, "").length === 0;
 }
@@ -3597,6 +3601,38 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		stageOptions: RunStageOptions = {},
 	): Promise<{ response: string; entry: AnsteelTranscriptEntry } | { rejection: AnsteelDiscussionResult }> => {
 		let stageResult = await runStage(role, stage, stageOptions);
+		// Provider-level truncation (stop=length) is an over-length case: give the
+		// role one concise rewrite before failing, mirroring the over-length path.
+		if (
+			"failure" in stageResult &&
+			stageOptions.formatRepair === undefined &&
+			isOutputTruncatedFailure(stageResult.failure)
+		) {
+			const repaired = await runStage(role, stage, {
+				...stageOptions,
+				formatRepair: {
+					reason: "response was truncated by the provider; rewrite the full response concisely",
+					previousResponse: "",
+					kind: "over-length" as const,
+				},
+			});
+			if ("failure" in repaired) {
+				return {
+					rejection: reject(
+						formatStageFailureStopReason(repaired.failure),
+						repaired.failure,
+						undefined,
+						getStageFailureTerminationReason(repaired.failure),
+					),
+				};
+			}
+			if (isBlankRoleResponse(repaired.response)) {
+				return {
+					rejection: reject(formatBlankResponseStopReason(role, stage), undefined, undefined, "blank-response"),
+				};
+			}
+			stageResult = repaired;
+		}
 		if ("failure" in stageResult) {
 			return {
 				rejection: reject(

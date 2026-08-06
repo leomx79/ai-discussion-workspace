@@ -4671,6 +4671,41 @@ describe("runAnsteelDiscussion", () => {
 		});
 	});
 
+	describe("provider-truncation repair", () => {
+		it("rewrites a provider-truncated response once and completes", async () => {
+			let repairCalls = 0;
+			const result = await runAnsteelDiscussion({
+				topic: "Review truncated response repair",
+				maxStageResponseChars: 1000,
+				runRole: async ({ role, stage, formatRepair }) => {
+					if (stage === "architecture") {
+						if (formatRepair) {
+							repairCalls++;
+							return COMPLETE_WORK_CARD;
+						}
+						throw new Error("Ansteel role stage failed: output-truncated");
+					}
+					return responseForMutualReviewStage(stage);
+				},
+			});
+			expect(result.verdict).toBe("approved");
+			expect(repairCalls).toBe(1);
+		});
+
+		it("rejects a response that stays truncated after the concise rewrite", async () => {
+			const result = await runAnsteelDiscussion({
+				topic: "Review persistent truncation",
+				maxStageResponseChars: 1000,
+				runRole: async ({ role, stage }) => {
+					if (stage === "architecture") throw new Error("Ansteel role stage failed: output-truncated");
+					return responseForMutualReviewStage(stage);
+				},
+			});
+			expect(result.verdict).toBe("rejected");
+			expect(result.markdown).toContain("output-truncated");
+		});
+	});
+
 	describe("over-length response enforcement", () => {
 		it("rewrites an over-length response once and completes", async () => {
 			let repairCalls = 0;
