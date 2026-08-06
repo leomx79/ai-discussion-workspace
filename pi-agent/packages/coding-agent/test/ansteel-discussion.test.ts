@@ -4726,6 +4726,26 @@ describe("runAnsteelDiscussion", () => {
 			expect(result.verdict).toBe("rejected");
 			expect(result.markdown).toContain("output-truncated");
 		});
+
+		it("repairs a provider-truncated parallel-group stage (cross-examination)", async () => {
+			let repairCalls = 0;
+			const result = await runAnsteelDiscussion({
+				topic: "Review truncated cross-examination repair",
+				maxStageResponseChars: 1000,
+				runRole: async ({ role, stage, formatRepair }) => {
+					if (role === "staff-engineer" && stage === "staff-cross-examination") {
+						if (formatRepair) {
+							repairCalls++;
+							return "ISSUE: STAFF-CROSS | TARGET: qa-engineer\nNO ISSUES | TARGET: tech-lead";
+						}
+						throw new Error("Ansteel role stage failed: output-truncated");
+					}
+					return responseForMutualReviewStage(stage);
+				},
+			});
+			expect(result.verdict).toBe("approved");
+			expect(repairCalls).toBe(1);
+		});
 	});
 
 	describe("over-length response enforcement", () => {
