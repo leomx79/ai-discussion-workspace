@@ -68,6 +68,7 @@ export const ANSTEEL_DISCUSSION_STAGES = [
 	"staff-verification",
 	"qa-verification",
 	"consensus",
+	"consensus-revision",
 	"staff-sign-off",
 	"qa-sign-off",
 ] as const;
@@ -198,6 +199,13 @@ export interface AnsteelStageAudit {
 }
 
 export const ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS = 2;
+
+/**
+ * Final sign-off rounds after the Tech Lead consensus. A sign-off rejection
+ * that adds new targeted ISSUE lines triggers one Tech Lead consensus
+ * revision per round instead of failing the discussion immediately.
+ */
+export const ANSTEEL_MAX_SIGN_OFF_ROUNDS = 2;
 export const ANSTEEL_DEFAULT_STAGE_TIMEOUT_MS = 120_000;
 export const ANSTEEL_DEFAULT_MAX_TOOL_CALLS_PER_STAGE = 4;
 export const ANSTEEL_DEFAULT_MAX_PROJECT_TOOL_CALLS = 96;
@@ -273,6 +281,8 @@ export interface RunAnsteelDiscussionOptions {
 	adaptiveBudgetPolicy?: AnsteelAdaptiveBudgetPolicyInput;
 	/** Baseline collaborative revision rounds; defaults to 2. */
 	maxArchitectureRevisionRounds?: number;
+	/** Final sign-off rounds after Tech Lead consensus; each rejected sign-off with new targeted issues triggers one Tech Lead consensus revision. Defaults to 2. */
+	maxSignOffRounds?: number;
 	/** When true, allow extra revision rounds while the issue ledger narrows. */
 	adaptiveArchitectureRevisions?: boolean;
 	/** Hard ceiling on total revision rounds when adaptive extension is enabled. */
@@ -378,6 +388,8 @@ export interface AnsteelConfig {
 	maxToolCallsPerStage?: number;
 	/** Baseline collaborative revision rounds; defaults to 2. */
 	maxArchitectureRevisionRounds?: number;
+	/** Final sign-off rounds after Tech Lead consensus; each rejected sign-off with new targeted issues triggers one Tech Lead consensus revision. Defaults to 2. */
+	maxSignOffRounds?: number;
 	/** When true, allow extra revision rounds while the issue ledger narrows. */
 	adaptiveArchitectureRevisions?: boolean;
 	/** Hard ceiling on total revision rounds when adaptive extension is enabled. */
@@ -1504,6 +1516,7 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 	let maxArchitectureRevisionRounds: number;
 	let adaptiveArchitectureRevisionCap: number;
 	let adaptiveArchitectureRevisions: boolean;
+	let maxSignOffRounds: number;
 	let maxToolCallsPerStage: number;
 	let teamTaskMaxEpochs: number | undefined;
 	let teamTaskMaxNoProgressEpochs: number | undefined;
@@ -1521,6 +1534,7 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 			throw new Error("adaptiveArchitectureRevisionCap cannot be lower than maxArchitectureRevisionRounds");
 		}
 		adaptiveArchitectureRevisions = value.adaptiveArchitectureRevisions === true;
+		maxSignOffRounds = normalizeAnsteelRevisionRounds(value.maxSignOffRounds, ANSTEEL_MAX_SIGN_OFF_ROUNDS);
 		teamTaskMaxEpochs = normalizeAnsteelTeamTaskMaxEpochs(value.teamTaskMaxEpochs);
 		teamTaskMaxNoProgressEpochs = normalizeAnsteelTeamTaskMaxNoProgressEpochs(value.teamTaskMaxNoProgressEpochs);
 		if (teamTaskMaxEpochs !== undefined && (teamTaskMaxNoProgressEpochs ?? 2) > teamTaskMaxEpochs) {
@@ -1563,6 +1577,7 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 				: options.resolveReportDirectory(value.reportDirectory),
 		stageTimeoutMs,
 		maxArchitectureRevisionRounds,
+		maxSignOffRounds,
 		adaptiveArchitectureRevisions,
 		adaptiveArchitectureRevisionCap,
 		maxToolCallsPerStage,
@@ -2044,6 +2059,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			stageBudgetPolicy,
 			adaptiveBudgetPolicy: config.adaptiveBudgetPolicy,
 			maxArchitectureRevisionRounds: config.maxArchitectureRevisionRounds,
+			maxSignOffRounds: config.maxSignOffRounds,
 			adaptiveArchitectureRevisions: config.adaptiveArchitectureRevisions,
 			adaptiveArchitectureRevisionCap: config.adaptiveArchitectureRevisionCap,
 			getRoleBashEnabled: (role) => config.roles[role].tools.includes("bash"),
@@ -2387,6 +2403,8 @@ const STAGE_INSTRUCTIONS: Record<AnsteelDiscussionStage, string> = {
 	"qa-verification": `Independently verify the three revised work cards against the ledger using project evidence and tools. ${VERIFICATION_VERDICT_INSTRUCTIONS}`,
 	consensus:
 		"Produce the final consensus. Resolve the competing recommendations into a decision, explain the selected trade-off, and carry forward the prioritized recommended actions with their owners, scope, and acceptance conditions. Separate verified conclusions, unresolved risks, and required follow-up work.",
+	"consensus-revision":
+		"Publish the revised Tech Lead consensus. Respond to every unresolved ISSUE raised during final sign-off (each must receive a `RESOLUTION: <ID> | RESOLVED` marker) and correct the errors the rejecting signatories identified. Keep the same standalone decision structure as the original consensus: a clear final answer, verified conclusions, unresolved risks, and carry-forward actions. Do not merely restate the previous consensus.",
 	"staff-sign-off":
 		"Review the Tech Lead consensus in the transcript. It is immutable: do not rewrite or replace it. End with the required explicit verdict marker.",
 	"qa-sign-off":
@@ -2587,6 +2605,7 @@ function buildRolePrompt(
 ): string {
 	const isWorkCardStage = stage === "architecture" || stage === "staff-critique" || stage === "qa-critique";
 	const isRevisionStage = stage === "architecture-revision" || stage === "staff-revision" || stage === "qa-revision";
+	const isConsensusRevisionStage = stage === "consensus-revision";
 	const isCrossExamination = isCrossExaminationStage(stage);
 	return [
 		ROLE_INSTRUCTIONS[role],
@@ -2607,7 +2626,7 @@ function buildRolePrompt(
 			? []
 			: [
 					`Challenge ledger:\n${formatChallengeLedger(options.challengeLedger)}`,
-					...(isRevisionStage
+					...(isRevisionStage || isConsensusRevisionStage
 						? [
 								`Open challenges assigned to ${role}:\n${formatAssignedOpenChallenges(options.challengeLedger, role)}`,
 							]
@@ -4178,63 +4197,128 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			"invalid-ledger-summary",
 		);
 	}
-	const consensus = consensusResult.response;
+	let consensus = consensusResult.response;
 
-	// Staff and QA final sign-off are independent and run in parallel.
-	const finalSignOffStop = await runParallelStageGroup(
-		[
-			{ role: "staff-engineer", stage: "staff-sign-off", options: { immutableLedgerSummary } },
-			{ role: "qa-engineer", stage: "qa-sign-off", options: { immutableLedgerSummary } },
-		],
-		async (member, { response, entry }) => {
-			const role = member.role;
-			const stage = member.stage;
-			const signOffLedgerCountClaim = getManualLedgerCountClaim(response);
-			if (signOffLedgerCountClaim) {
-				return reject(
-					`${role} / ${stage} manually stated a ledger count (${signOffLedgerCountClaim}) instead of citing the immutable coordinator summary`,
-					undefined,
-					consensus,
-					"final-sign-off-rejected",
-				);
-			}
-			let currentResponse = response;
-			let currentEntry = entry;
-			let verdict = getExplicitVerdict(currentResponse);
-			if (!verdict && isRepairableVerdictMarkerError(currentResponse)) {
-				const repaired = await runSingleFormatRepair(
-					role,
-					stage,
-					{ immutableLedgerSummary },
-					currentEntry,
-					`${role} / ${stage} did not provide the required exact verdict`,
-				);
-				if ("rejection" in repaired) return repaired.rejection;
-				if (!formatRepairPreservesNonMarkerContent(currentEntry.response, repaired.response)) {
+	// Staff and QA final sign-off are independent and run in parallel. A
+	// rejection that adds a new targeted ISSUE triggers one Tech Lead
+	// consensus-revision round, so the discussion keeps converging on an
+	// answer instead of failing at the first objection. Bare rejections and
+	// rejections that exhaust the sign-off round cap fail closed.
+	const maxSignOffRounds = options.maxSignOffRounds ?? ANSTEEL_MAX_SIGN_OFF_ROUNDS;
+	let signOffRound = 0;
+	for (;;) {
+		signOffRound += 1;
+		const signOffRejections: { role: AnsteelRole; reason: string }[] = [];
+		const finalSignOffStop = await runParallelStageGroup(
+			[
+				{ role: "staff-engineer", stage: "staff-sign-off", options: { immutableLedgerSummary } },
+				{ role: "qa-engineer", stage: "qa-sign-off", options: { immutableLedgerSummary } },
+			],
+			async (member, { response, entry }) => {
+				const role = member.role;
+				const stage = member.stage;
+				const signOffLedgerCountClaim = getManualLedgerCountClaim(response);
+				if (signOffLedgerCountClaim) {
 					return reject(
-						`${role} / ${stage} changed non-marker content during a format-only repair`,
+						`${role} / ${stage} manually stated a ledger count (${signOffLedgerCountClaim}) instead of citing the immutable coordinator summary`,
 						undefined,
 						consensus,
 						"final-sign-off-rejected",
 					);
 				}
-				currentResponse = repaired.response;
-				currentEntry = repaired.entry;
-				verdict = getExplicitVerdict(currentResponse);
-			}
-			if (verdict !== "approved") {
-				return reject(
-					`${role} / ${stage} did not provide the required explicit approval`,
-					undefined,
-					consensus,
-					"final-sign-off-rejected",
-				);
-			}
-			return undefined;
-		},
-		{ consensus },
-	);
-	if (finalSignOffStop) return finalSignOffStop;
+				let currentResponse = response;
+				let currentEntry = entry;
+				let verdict = getExplicitVerdict(currentResponse);
+				if (!verdict && isRepairableVerdictMarkerError(currentResponse)) {
+					const repaired = await runSingleFormatRepair(
+						role,
+						stage,
+						{ immutableLedgerSummary },
+						currentEntry,
+						`${role} / ${stage} did not provide the required exact verdict`,
+					);
+					if ("rejection" in repaired) return repaired.rejection;
+					if (!formatRepairPreservesNonMarkerContent(currentEntry.response, repaired.response)) {
+						return reject(
+							`${role} / ${stage} changed non-marker content during a format-only repair`,
+							undefined,
+							consensus,
+							"final-sign-off-rejected",
+						);
+					}
+					currentResponse = repaired.response;
+					currentEntry = repaired.entry;
+					verdict = getExplicitVerdict(currentResponse);
+				}
+				if (!verdict) {
+					return reject(
+						`${role} / ${stage} did not provide the required explicit approval`,
+						undefined,
+						consensus,
+						"final-sign-off-rejected",
+					);
+				}
+				if (verdict !== "approved") {
+					// A rejection must carry a new targeted ISSUE so the Tech Lead has a
+					// concrete revision contract; a bare objection cannot restart the discussion.
+					const ledgerLengthBefore = challengeLedger.length;
+					const challengeError = addChallengeIds(challengeLedger, role, signOffRound, currentResponse, true, true);
+					if (challengeError) return reject(challengeError, undefined, consensus, "invalid-challenge-ledger");
+					const addedThisRound = challengeLedger.slice(ledgerLengthBefore);
+					if (addedThisRound.some((challenge) => challenge.targetRole !== "tech-lead")) {
+						return reject(
+							`${role} / ${stage} rejection must target the Tech Lead consensus (ISSUE TARGET: tech-lead)`,
+							undefined,
+							consensus,
+							"invalid-challenge-ledger",
+						);
+					}
+					signOffRejections.push({ role, reason: `${role} rejected the Tech Lead consensus during final sign-off` });
+				}
+				return undefined;
+			},
+			{ consensus },
+		);
+		if (finalSignOffStop) return finalSignOffStop;
+		if (signOffRejections.length === 0) break;
+		if (signOffRound >= maxSignOffRounds) {
+			return reject(
+				`Final sign-off did not approve within ${maxSignOffRounds} round(s): ${signOffRejections
+					.map((item) => item.role)
+					.join(", ")} rejected the Tech Lead consensus`,
+				undefined,
+				consensus,
+				"final-sign-off-rejected",
+			);
+		}
+		// Tech Lead revises the consensus against the rejecting sign-off issues.
+		const consensusRevision = await runRequiredStage("tech-lead", "consensus-revision", {
+			round: signOffRound,
+			context: [...transcript],
+			challengeLedger,
+			immutableLedgerSummary,
+		});
+		if ("rejection" in consensusRevision) return consensusRevision.rejection;
+		const resolutionError = resolveOpenChallengesForRole(challengeLedger, consensusRevision.response, "tech-lead");
+		if (resolutionError) {
+			return reject(
+				`tech-lead / consensus-revision ${resolutionError}`,
+				undefined,
+				undefined,
+				"unanswered-challenge",
+			);
+		}
+		const revisedLedgerCountClaim = getManualLedgerCountClaim(consensusRevision.response);
+		if (revisedLedgerCountClaim) {
+			return reject(
+				`tech-lead / consensus-revision manually stated a ledger count (${revisedLedgerCountClaim}) instead of citing the immutable coordinator summary`,
+				undefined,
+				undefined,
+				"invalid-ledger-summary",
+			);
+		}
+		consensus = consensusRevision.response;
+	}
 
 	return {
 		topic,

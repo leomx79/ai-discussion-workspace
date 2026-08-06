@@ -220,6 +220,7 @@ function isNextAction(value: unknown): value is AnsteelNextAction {
 			action.stage === "staff-verification" ||
 			action.stage === "qa-verification" ||
 			action.stage === "consensus" ||
+			action.stage === "consensus-revision" ||
 			action.stage === "staff-sign-off" ||
 			action.stage === "qa-sign-off") &&
 		(action.round === undefined || (Number.isInteger(action.round) && action.round > 0)) &&
@@ -234,7 +235,8 @@ function isAnsteelRoleStagePair(role: unknown, stage: unknown): boolean {
 			stage === "tech-lead-cross-examination" ||
 			stage === "architecture-revision" ||
 			stage === "tech-lead-verification" ||
-			stage === "consensus"
+			stage === "consensus" ||
+			stage === "consensus-revision"
 		);
 	}
 	if (role === "staff-engineer") {

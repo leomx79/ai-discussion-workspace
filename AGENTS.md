@@ -63,7 +63,7 @@ Codex（OpenAI 模型）= 主平台与协调器
 - 每条质疑必须使用唯一 `ISSUE: <ID>`，无问题时使用 `NO ISSUES`；Tech Lead 的架构修订必须逐条使用 `RESOLUTION: <ID> | RESOLVED` 回应所有未关闭问题。
 - Staff Engineer 与 QA Engineer 必须各自独立验证同一架构修订和问题台账，不能看到对方当轮验证答复。只有两者都给出精确 `VERDICT: APPROVE`，Tech Lead 才能形成共识。
 - 验证中的精确 `VERDICT: REJECT` 必须附带新的 `ISSUE`，才可进入下一轮修订；格式错误、无问题编号的拒绝或遗漏问题均立即拒绝归档。最多两轮架构修订，达到上限仍未通过即拒绝。
-- Tech Lead 共识形成后，Staff Engineer 与 QA Engineer 必须分别对同一不可变文本给出精确的 `VERDICT: APPROVE`；任一拒绝、缺失或格式不合格即拒绝并归档。
+- Tech Lead 共识形成后，Staff Engineer 与 QA Engineer 必须分别对同一不可变文本给出精确的 `VERDICT: APPROVE`；会签 REJECT 必须附带新的 `ISSUE: <ID> | TARGET: tech-lead` 才能触发共识修订回合（Tech Lead 逐条以 `RESOLUTION: <ID> | RESOLVED` 回应后重新发布共识，再行会签；默认最多 2 轮，可在配置 `maxSignOffRounds` 调整）。无新 ISSUE 的拒绝、格式不合格、或达到轮次上限仍未通过即拒绝归档——讨论必须持续收敛出答案，而不是停在疑问上。
 - QA Engineer 拥有否决权；但否决必须可追溯到问题台账，不能跳过修订、验证或归档门禁。
 
 ### 废除的旧规

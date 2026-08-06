@@ -116,6 +116,46 @@ export default function (pi) {
 }
 `;
 
+const CONVERGING_SIGN_OFF_PROVIDER_EXTENSION = `
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+
+const completeWorkCard = ${JSON.stringify(COMPLETE_WORK_CARD)};
+const completeRevisionWorkCard = ${JSON.stringify(COMPLETE_REVISION_WORK_CARD)};
+
+function register(pi, provider, model, responses) {
+	const faux = fauxProvider({ provider, models: [{ id: model }] });
+	faux.setResponses(responses.map((response) => fauxAssistantMessage(response)));
+	pi.registerProvider(faux.provider);
+}
+
+export default function (pi) {
+	register(pi, "converging-tech", "tech", [
+		completeWorkCard,
+		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
+		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"[L1] Consensus\\nFinal answer: 100",
+		"RESOLUTION: STAFF-5 | RESOLVED\\n\\n[L1] Revised consensus\\nFinal answer: 100",
+	]);
+	register(pi, "converging-staff", "staff", [
+		completeWorkCard,
+		"ISSUE: STAFF-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: qa-engineer",
+		"RESOLUTION: TL-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"VERDICT: REJECT\\nISSUE: STAFF-5 | TARGET: tech-lead\\n[L1] The consensus answer 200 is contradicted by exhaustive computation.",
+		"VERDICT: APPROVE",
+	]);
+	register(pi, "converging-qa", "qa", [
+		completeWorkCard,
+		"ISSUE: QA-1 | TARGET: tech-lead\\nNO ISSUES | TARGET: staff-engineer",
+		completeRevisionWorkCard,
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+		"VERDICT: APPROVE",
+	]);
+}
+`;
+
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
@@ -175,6 +215,32 @@ function createSupervisedTemporaryProject(): { agentDir: string; projectDir: str
 					"tech-lead": { model: "supervised-tech/tech", tools: [] },
 					"staff-engineer": { model: "supervised-staff/staff", tools: [] },
 					"qa-engineer": { model: "supervised-qa/qa", tools: [] },
+				},
+			},
+			null,
+			2,
+		),
+		"utf8",
+	);
+	return { agentDir, projectDir };
+}
+
+
+function createConvergingTemporaryProject(): { agentDir: string; projectDir: string } {
+	const { agentDir, projectDir } = createTemporaryProject();
+	const extensionsDir = join(projectDir, ".pi", "extensions");
+	writeFileSync(join(extensionsDir, "converging-sign-off.ts"), CONVERGING_SIGN_OFF_PROVIDER_EXTENSION, "utf8");
+	writeFileSync(
+		join(projectDir, ".pi", "ansteel.json"),
+		JSON.stringify(
+			{
+				reportDirectory: ".pi/ansteel-reports",
+				stageTimeoutMs: 5_000,
+				maxToolCallsPerStage: 1,
+				roles: {
+					"tech-lead": { model: "converging-tech/tech", tools: [] },
+					"staff-engineer": { model: "converging-staff/staff", tools: [] },
+					"qa-engineer": { model: "converging-qa/qa", tools: [] },
 				},
 			},
 			null,
@@ -273,6 +339,24 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("Configured/resolved role identities:");
 		expect(report).toContain("Diversity status: UNVERIFIED.");
 	}, 20_000);
+
+	it("continues sign-off with a Tech Lead consensus revision when a signatory rejects with a new targeted issue", async () => {
+		const { agentDir, projectDir } = createConvergingTemporaryProject();
+
+		const result = await runCli(projectDir, agentDir, ["--ansteel", "Review"], "converging-sign-off.ts");
+
+		expect(result.code).toBe(0);
+		expect(result.stderr).not.toContain("No more faux responses queued");
+		const reportMatch = /Ansteel review approved: (.+)\r?\n?$/.exec(result.stdout);
+		expect(reportMatch?.[1]).toBeDefined();
+		const reportPath = reportMatch?.[1];
+		if (!reportPath) throw new Error(`Could not find Ansteel report path in CLI output: ${result.stdout}`);
+		expect(existsSync(reportPath)).toBe(true);
+		const report = readFileSync(reportPath, "utf8");
+		expect(report).toContain("tech-lead / consensus-revision");
+		expect(report).toContain("STAFF-5");
+		expect(report).toContain("Governance result: APPROVED");
+		}, 30_000);
 
 	it("runs from a child directory while retaining declared Git-root evidence in the archived CLI report", async () => {
 		const { agentDir, projectDir } = createTemporaryProject();
