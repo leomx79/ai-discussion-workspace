@@ -2875,6 +2875,13 @@ function isRepairableChallengeMarkerError(error: string): boolean {
 		"cannot combine NO ISSUES with ISSUE or targeted NO ISSUES markers",
 		"must use issue IDs beginning with",
 		"reused challenge ID",
+		// Structural omissions (no markers at all, or a peer left uncovered) are
+		// repairable once: the role gets one no-tool format pass to emit the
+		// required coverage, then the same gate revalidates the repaired text.
+		// This keeps the strict per-role coverage requirement while absorbing
+		// truncated provider responses that dropped the marker lines entirely.
+		"must provide ISSUE lines or exactly NO ISSUES",
+		"must cover every peer role with an ISSUE or targeted NO ISSUES marker",
 	].some((fragment) => error.includes(fragment));
 }
 

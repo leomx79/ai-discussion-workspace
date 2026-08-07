@@ -1918,6 +1918,39 @@ describe("runAnsteelDiscussion", () => {
 		]);
 	});
 
+	it("repairs a truncated cross-examination response that omitted all peer coverage markers", async () => {
+		const calls: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage; formatRepair?: true }> = [];
+
+		const result = await runAnsteelDiscussion({
+			topic: "Repair truncated cross-examination peer coverage",
+			runRole: async ({ role, stage, formatRepair }) => {
+				calls.push({ role, stage, formatRepair });
+				if (role === "staff-engineer" && stage === "staff-cross-examination") {
+					return formatRepair
+						? "NO ISSUES | TARGET: tech-lead\nNO ISSUES | TARGET: qa-engineer"
+						: "## Staff cross-examination\nProvider response was truncated mid-sentence without any ISSUE or NO ISSUES marker.";
+				}
+				if (stage === "qa-revision") {
+					// No challenge is targeted at QA in this scenario, so the
+					// default fixture's STAFF-CROSS resolution would be dangling.
+					return completeWorkCard("[L2] No challenge is assigned to QA.");
+				}
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(
+			calls.filter((call) => call.role === "staff-engineer" && call.stage === "staff-cross-examination"),
+		).toEqual([
+			{ role: "staff-engineer", stage: "staff-cross-examination" },
+			{ role: "staff-engineer", stage: "staff-cross-examination", formatRepair: true },
+		]);
+		expect(result.transcript.filter((entry) => entry.formatRepair)).toEqual([
+			expect.objectContaining({ role: "staff-engineer", stage: "staff-cross-examination", formatRepair: true }),
+		]);
+	});
+
 	it("reads only the raw assistant text created by the current prompt", async () => {
 		const messages: RawTurnMessage[] = [
 			{
