@@ -1286,6 +1286,8 @@ describe("runAnsteelDiscussion", () => {
 		expect(rebuild(cwd, [], frozenPaths, 25)).toBe(captured);
 	});
 
+	// This case must survive 3 same-model retries with 1s/2s/3s backoff (6s total)
+	// plus the fallback flow (~8s measured), so it needs an explicit timeout above the 5s default.
 	it("fails over only an explicitly configured role after a recoverable provider failure", async () => {
 		type TestModel = { provider: string; id: string };
 		const createdModels: string[] = [];
@@ -1339,7 +1341,7 @@ describe("runAnsteelDiscussion", () => {
 			}),
 		]);
 		expect(result.markdown).toContain("## Provider Recovery");
-	});
+	}, 30_000);
 
 	it("resumes a paused review with the provider fallback identity already in effect", async () => {
 		type TestModel = { provider: string; id: string };
