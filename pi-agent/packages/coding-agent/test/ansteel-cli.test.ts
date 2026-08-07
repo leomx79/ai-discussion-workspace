@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+﻿import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -97,7 +97,7 @@ export default function (pi) {
 		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
 		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
 		"VERDICT: APPROVE",
-		"[L1] Consensus\\nThe coordinator-derived immutable ledger summary is the authoritative resolution record.",
+		"[L1] Consensus\\nThe coordinator-derived immutable ledger summary is the authoritative resolution record.\\n<verification-method>\\nL1 confirmed by independent recomputation.\\n</verification-method>",
 	]);
 	register(pi, "supervised-staff", "staff", [
 		completeWorkCard,
@@ -134,7 +134,7 @@ export default function (pi) {
 		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
 		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
 		"VERDICT: APPROVE",
-		"[L1] Consensus\\nFinal answer: 100",
+		"[L1] Consensus\\nFinal answer: 100\\n<verification-method>\\nL1 confirmed by exhaustive computation.\\n</verification-method>",
 		"RESOLUTION: STAFF-5 | RESOLVED\\n\\n[L1] Revised consensus\\nFinal answer: 100",
 	]);
 	register(pi, "converging-staff", "staff", [
@@ -174,7 +174,7 @@ export default function (pi) {
 		"ISSUE: TL-1 | TARGET: staff-engineer\\nNO ISSUES | TARGET: qa-engineer",
 		"RESOLUTION: STAFF-1 | RESOLVED\\nRESOLUTION: QA-1 | RESOLVED\\n\\n" + completeRevisionWorkCard,
 		"VERDICT: APPROVE",
-		"[L1] Consensus\\nFinal answer: 100",
+		"[L1] Consensus\\nFinal answer: 100\\n<verification-method>\\nL1 confirmed by exhaustive computation.\\n</verification-method>",
 		"RESOLUTION: STAFF-5 | RESOLVED\\n\\n[L1] Revised consensus\\nFinal answer: 100",
 		"RESOLUTION: STAFF-6 | RESOLVED\\n\\n[L1] Revised consensus 2\\nFinal answer: 100",
 	]);
@@ -268,7 +268,6 @@ function createSupervisedTemporaryProject(): { agentDir: string; projectDir: str
 	return { agentDir, projectDir };
 }
 
-
 function createConvergingTemporaryProject(): { agentDir: string; projectDir: string } {
 	const { agentDir, projectDir } = createTemporaryProject();
 	const extensionsDir = join(projectDir, ".pi", "extensions");
@@ -293,7 +292,6 @@ function createConvergingTemporaryProject(): { agentDir: string; projectDir: str
 	);
 	return { agentDir, projectDir };
 }
-
 
 function createAdaptiveConvergingTemporaryProject(): { agentDir: string; projectDir: string } {
 	const { agentDir, projectDir } = createTemporaryProject();
@@ -426,7 +424,7 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("tech-lead / consensus-revision");
 		expect(report).toContain("STAFF-5");
 		expect(report).toContain("Governance result: APPROVED");
-		}, 30_000);
+	}, 30_000);
 
 	it("extends sign-off adaptively beyond the baseline when each rejection resolves and narrows the ledger", async () => {
 		const { agentDir, projectDir } = createAdaptiveConvergingTemporaryProject();
@@ -445,7 +443,7 @@ describe("Ansteel CLI", () => {
 		expect(report).toContain("STAFF-5");
 		expect(report).toContain("STAFF-6");
 		expect(report).toContain("tech-lead / consensus-revision");
-		}, 30_000);
+	}, 30_000);
 
 	it("runs from a child directory while retaining declared Git-root evidence in the archived CLI report", async () => {
 		const { agentDir, projectDir } = createTemporaryProject();

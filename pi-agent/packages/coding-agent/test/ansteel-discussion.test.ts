@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+﻿import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -17,8 +17,8 @@ import {
 	createAnsteelStageBudgetPolicy,
 	createAnsteelToolBudget,
 	getAnsteelReviewExitCode,
-	loadAnsteelConfig,
 	getAnsteelRunCheckpointPath,
+	loadAnsteelConfig,
 	loadAnsteelRunCheckpoint,
 	resolveAnsteelReviewRoot,
 	runAnsteelDiscussion,
@@ -129,8 +129,12 @@ const COMPLETE_REVISION_WORK_CARD = [
 	"## Recommended Actions\n[L2] Assign the next verification task with a scope and acceptance criterion.",
 ].join("\n\n");
 
-const INCOMPLETE_WORK_CARD = COMPLETE_WORK_CARD.split("\n\n").filter((section) => !section.startsWith("## Self-Refutation Conditions")).join("\n\n");
-const INCOMPLETE_REVISION_WORK_CARD = COMPLETE_REVISION_WORK_CARD.split("\n\n").filter((section) => !section.startsWith("## Recommended Actions")).join("\n\n");
+const INCOMPLETE_WORK_CARD = COMPLETE_WORK_CARD.split("\n\n")
+	.filter((section) => !section.startsWith("## Self-Refutation Conditions"))
+	.join("\n\n");
+const INCOMPLETE_REVISION_WORK_CARD = COMPLETE_REVISION_WORK_CARD.split("\n\n")
+	.filter((section) => !section.startsWith("## Recommended Actions"))
+	.join("\n\n");
 
 function completeWorkCard(response: string): string {
 	return `${response}\n\n${COMPLETE_REVISION_WORK_CARD}`;
@@ -152,7 +156,8 @@ const MUTUAL_REVIEW_RESPONSES: Record<AnsteelDiscussionStage, string> = {
 	"tech-lead-verification": "VERDICT: APPROVE",
 	"staff-verification": "VERDICT: APPROVE",
 	"qa-verification": "VERDICT: APPROVE",
-	consensus: "[L1] Immutable consensus",
+	consensus:
+		"[L1] Immutable consensus\n<verification-method>\nL1 confirmed by an independent numerical check.\n</verification-method>",
 	"staff-sign-off": "VERDICT: APPROVE",
 	"qa-sign-off": "VERDICT: APPROVE",
 };
@@ -1162,19 +1167,17 @@ describe("runAnsteelDiscussion", () => {
 	it("starts a resumed epoch from its epoch boundary instead of the original project start", async () => {
 		const calls: AnsteelDiscussionStage[] = [];
 		const resumedEpochStartedAt = Date.now();
-		const result = await runAnsteelDiscussion(
-			{
-				topic: "Resume with a fresh epoch clock",
-				projectStartedAt: resumedEpochStartedAt - 5_000,
-				hardProjectDeadline: resumedEpochStartedAt + 5_000,
-				adaptiveBudgetPolicy: { enabled: true, epochTimeoutMs: 1_000 },
-				runRole: async ({ stage }) => {
-					calls.push(stage);
-					return responseForMutualReviewStage(stage);
-				},
-				...({ epochStartedAt: resumedEpochStartedAt } as Record<string, unknown>),
-			} as Parameters<typeof runAnsteelDiscussion>[0],
-		);
+		const result = await runAnsteelDiscussion({
+			topic: "Resume with a fresh epoch clock",
+			projectStartedAt: resumedEpochStartedAt - 5_000,
+			hardProjectDeadline: resumedEpochStartedAt + 5_000,
+			adaptiveBudgetPolicy: { enabled: true, epochTimeoutMs: 1_000 },
+			runRole: async ({ stage }) => {
+				calls.push(stage);
+				return responseForMutualReviewStage(stage);
+			},
+			...({ epochStartedAt: resumedEpochStartedAt } as Record<string, unknown>),
+		} as Parameters<typeof runAnsteelDiscussion>[0]);
 
 		expect(result.verdict, result.markdown).toBe("approved");
 		expect(calls).toContain("staff-critique");
@@ -1245,7 +1248,11 @@ describe("runAnsteelDiscussion", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-frozen-evidence-"));
 		temporaryDirectories.push(cwd);
 		for (let index = 0; index < 24; index += 1) {
-			writeFileSync(join(cwd, `source-${String(index).padStart(2, "0")}.ts`), `export const value${index} = ${index};\n`, "utf8");
+			writeFileSync(
+				join(cwd, `source-${String(index).padStart(2, "0")}.ts`),
+				`export const value${index} = ${index};\n`,
+				"utf8",
+			);
 		}
 
 		const captured = createAnsteelEvidencePackage(cwd);
@@ -1259,7 +1266,11 @@ describe("runAnsteelDiscussion", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-ansteel-frozen-evidence-count-"));
 		temporaryDirectories.push(cwd);
 		for (let index = 0; index < 25; index += 1) {
-			writeFileSync(join(cwd, `source-${String(index).padStart(2, "0")}.ts`), `export const value${index} = ${index};\n`, "utf8");
+			writeFileSync(
+				join(cwd, `source-${String(index).padStart(2, "0")}.ts`),
+				`export const value${index} = ${index};\n`,
+				"utf8",
+			);
 		}
 
 		const captured = createAnsteelEvidencePackage(cwd);
@@ -1310,13 +1321,13 @@ describe("runAnsteelDiscussion", () => {
 
 		expect(result.verdict).toBe("approved");
 		expect(createdModels).toEqual([
-		"tech/primary",
-		"staff/primary",
-		"qa/primary",
-		"tech/primary",
-		"tech/primary",
-		"tech/primary",
-		"tech/fallback",
+			"tech/primary",
+			"staff/primary",
+			"qa/primary",
+			"tech/primary",
+			"tech/primary",
+			"tech/primary",
+			"tech/fallback",
 		]);
 		expect(disposedModels).toContain("tech/primary");
 		expect(result.providerFallbacks).toEqual([
@@ -1576,7 +1587,8 @@ describe("runAnsteelDiscussion", () => {
 			resolveModel: (provider, id) => ({ provider, id }),
 			createRoleSession: async () => ({
 				prompt: async (prompt) => {
-					if (getStageFromPrompt(prompt) === "architecture") await new Promise((resolve) => setTimeout(resolve, 550));
+					if (getStageFromPrompt(prompt) === "architecture")
+						await new Promise((resolve) => setTimeout(resolve, 550));
 					return responseForMutualReviewStage(getStageFromPrompt(prompt));
 				},
 				dispose: () => {},
@@ -1682,23 +1694,23 @@ describe("runAnsteelDiscussion", () => {
 		const progress: string[] = [];
 		const result = await runAnsteelDiscussion({
 			topic: "Review adaptive stage budget",
-		stageBudgetPolicy: {
+			stageBudgetPolicy: {
 				stageTimeoutMs: 10,
 				maxStageTimeoutMs: 30,
 				timeoutExtensionMs: 20,
 				maxStageExtensions: 1,
 				projectTimeoutMs: 500,
 				maxToolCallsPerStage: 4,
-			maxProjectToolCalls: 20,
-		},
-		adaptiveBudgetPolicy: {
-			enabled: true,
-			projectTimeoutMs: 500,
-			maxProjectToolCalls: 20,
-			timeExtensionMs: 20,
-			protectedVerificationTimeMs: 100,
-			protectedVerificationToolCalls: 10,
-		},
+				maxProjectToolCalls: 20,
+			},
+			adaptiveBudgetPolicy: {
+				enabled: true,
+				projectTimeoutMs: 500,
+				maxProjectToolCalls: 20,
+				timeExtensionMs: 20,
+				protectedVerificationTimeMs: 100,
+				protectedVerificationToolCalls: 10,
+			},
 			getStageAudit: () => ({
 				events: [
 					{ type: "tool-execution-end", elapsedMs: 1, toolName: "read", isError: false, evidenceProgress: true },
@@ -1801,7 +1813,12 @@ describe("runAnsteelDiscussion", () => {
 		expect(result.verdict, result.markdown).toBe("approved");
 		expect(requestedExtensions).toEqual([2]);
 		expect(result.adaptiveBudgetEvents).toEqual([
-			expect.objectContaining({ role: "tech-lead", stage: "architecture", action: "grant-tools", granted: { toolCalls: 2 } }),
+			expect.objectContaining({
+				role: "tech-lead",
+				stage: "architecture",
+				action: "grant-tools",
+				granted: { toolCalls: 2 },
+			}),
 		]);
 	});
 
@@ -2441,7 +2458,7 @@ describe("runAnsteelDiscussion", () => {
 					case "qa-sign-off":
 						return "VERDICT: APPROVE";
 					case "consensus":
-						return "[L1] Immutable architecture consensus";
+						return "[L1] Immutable architecture consensus\n<verification-method>\nL1 confirmed by exhaustive enumeration in an independent implementation.\n</verification-method>";
 					default:
 						return `[L2] ${role}/${stage}`;
 				}
@@ -2542,7 +2559,7 @@ describe("runAnsteelDiscussion", () => {
 					case "qa-sign-off":
 						return "VERDICT: APPROVE";
 					case "consensus":
-						return "[L1] Immutable consensus";
+						return "[L1] Immutable consensus\n<verification-method>\nL1 confirmed by an independent numerical check.\n</verification-method>";
 				}
 			},
 		});
@@ -3021,17 +3038,22 @@ describe("runAnsteelDiscussion", () => {
 					architecture: completeWorkCard("[L1] Tech Lead parser work card"),
 					"qa-verification":
 						"[L2] Conditions met before the decision\nVERDICT: APPROVE\n[L2] Follow-up remains after the decision",
-					consensus: "[L2] Consensus ",
+					consensus:
+						"[L2] Consensus \n<verification-method>\nL2 cross-checked with a second implementation.\n</verification-method>",
 				}),
 		});
 
 		expect(result.verdict).toBe("approved");
-		expect(result.consensus).toBe("[L2] Consensus ");
+		expect(result.consensus).toBe(
+			"[L2] Consensus \n<verification-method>\nL2 cross-checked with a second implementation.\n</verification-method>",
+		);
 		expect(result.markdown).toContain("[L1] Tech Lead parser work card");
 		expect(result.markdown).toContain("TL-CROSS");
 		expect(result.markdown).toContain("STAFF-CROSS");
 		expect(result.markdown).toContain("QA-CROSS");
-		expect(result.markdown).toContain("## Tech Lead Consensus\n\n[L2] Consensus \n");
+		expect(result.markdown).toContain(
+			"## Tech Lead Consensus\n\n[L2] Consensus \n<verification-method>\nL2 cross-checked with a second implementation.\n</verification-method>\n",
+		);
 	});
 
 	it("gives consensus and final sign-offs the same coordinator-generated ledger summary", async () => {
@@ -3093,7 +3115,7 @@ describe("runAnsteelDiscussion", () => {
 
 		expect(result.verdict).toBe("rejected");
 		expect(result.terminationReason).toBe("final-sign-off-rejected");
-		expect(result.consensus).toBe("[L1] Immutable consensus");
+		expect(result.consensus).toBe("[L1] Immutable consensus\n<verification-method>\nL1 confirmed by an independent numerical check.\n</verification-method>");
 		expect(result.markdown).toContain("- Total recorded challenges: 3");
 		expect(calls.map(({ role, stage }) => `${role}:${stage}`)).toContain("staff-engineer:staff-sign-off");
 		expect(result.transcript.some((entry) => entry.stage === "qa-sign-off")).toBe(false);
@@ -3111,7 +3133,7 @@ describe("runAnsteelDiscussion", () => {
 		});
 
 		expect(result.verdict).toBe("approved");
-		expect(result.consensus).toBe("[L1] Immutable consensus");
+		expect(result.consensus).toBe("[L1] Immutable consensus\n<verification-method>\nL1 confirmed by an independent numerical check.\n</verification-method>");
 		expect(calls.map(({ role, stage }) => `${role}:${stage}`)).toEqual(
 			MUTUAL_REVIEW_STAGE_ORDER.map(({ role, stage }) => `${role}:${stage}`),
 		);
@@ -3140,12 +3162,48 @@ describe("runAnsteelDiscussion", () => {
 			});
 
 			expect(result.verdict).toBe("rejected");
-			expect(result.consensus).toBe("[L1] Immutable consensus");
+			expect(result.consensus).toBe("[L1] Immutable consensus\n<verification-method>\nL1 confirmed by an independent numerical check.\n</verification-method>");
 			expect(result.markdown).not.toContain("## Tech Lead Consensus");
 			expect(result.markdown).toContain("- Governance result: REJECTED");
 			expect(result.transcript.at(-1)).toMatchObject({ role: rejectedRole, stage: rejectedStage });
 		},
 	);
+
+	it("repairs a consensus without an independent verification method once, then accepts it", async () => {
+		let consensusCalls = 0;
+		const result = await runAnsteelDiscussion({
+			topic: "Review the independent verification method gate",
+			runRole: async ({ stage }) => {
+				if (stage === "consensus") {
+					consensusCalls += 1;
+					return consensusCalls === 1
+						? "[L1] Consensus without an independent method"
+						: "[L1] Consensus without an independent method\n<verification-method>\nL1 confirmed by exhaustive enumeration in a second implementation.\n</verification-method>";
+				}
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(consensusCalls).toBe(2);
+		expect(result.consensus).toBe(
+			"[L1] Consensus without an independent method\n<verification-method>\nL1 confirmed by exhaustive enumeration in a second implementation.\n</verification-method>",
+		);
+	});
+
+	it("rejects a consensus that still lacks an independent verification method after the format repair", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Reject consensus without an independent verification method",
+			runRole: async ({ stage }) =>
+				stage === "consensus" ? "[L1] Consensus still without any verification method" : responseForMutualReviewStage(stage),
+		});
+
+		expect(result.verdict).toBe("rejected");
+		expect(result.terminationReason).toBe("consensus-verification-method-missing");
+		expect(result.consensus).toBeUndefined();
+		expect(result.markdown).toContain("- Governance result: REJECTED");
+		expect(result.markdown).toContain("<verification-method>");
+	});
 
 	it("sends every role explicit L2-L4 confidence discipline", async () => {
 		const prompts = new Map<AnsteelRole, string[]>();
@@ -3293,7 +3351,7 @@ describe("runAnsteelDiscussion", () => {
 			expect(result.verdict).toBe("rejected");
 			expect(result.consensus).toBe(
 				blankIndex > stageOrder.findIndex(({ stage }) => stage === "consensus")
-					? "[L1] Immutable consensus"
+					? "[L1] Immutable consensus\n<verification-method>\nL1 confirmed by an independent numerical check.\n</verification-method>"
 					: undefined,
 			);
 			// Parallel groups invoke every independent member; archiving keeps protocol order.
@@ -4484,12 +4542,15 @@ describe("runAnsteelDiscussion", () => {
 				responseForMutualReviewStage(stage, {
 					"qa-verification":
 						"VERDICT: APPROVE\nVerdict rationale: [L1] The required test passed\n[L2] Monitor the follow-up",
-					consensus: "[L2] Consensus",
+					consensus:
+						"[L2] Consensus\n<verification-method>\nL2 cross-checked with a second implementation.\n</verification-method>",
 				}),
 		});
 
 		expect(result.verdict).toBe("approved");
-		expect(result.consensus).toBe("[L2] Consensus");
+		expect(result.consensus).toBe(
+			"[L2] Consensus\n<verification-method>\nL2 cross-checked with a second implementation.\n</verification-method>",
+		);
 	});
 
 	it("uses a nonzero CLI outcome for a rejected review", () => {
@@ -4545,7 +4606,14 @@ describe("runAnsteelDiscussion", () => {
 	});
 
 	describe("shouldExtendRevisionRounds", () => {
-		const base = { baseline: 2, cap: 4, adaptive: true, resolvedThisRound: 1, newIssuesThisRound: 1, newIssuesPreviousRound: 1 };
+		const base = {
+			baseline: 2,
+			cap: 4,
+			adaptive: true,
+			resolvedThisRound: 1,
+			newIssuesThisRound: 1,
+			newIssuesPreviousRound: 1,
+		};
 
 		it("extends within the baseline", () => {
 			expect(shouldExtendRevisionRounds({ ...base, round: 1 }).extend).toBe(true);
@@ -4588,7 +4656,11 @@ describe("runAnsteelDiscussion", () => {
 			writeFileSync(
 				join(cwd, ".pi", "ansteel.json"),
 				JSON.stringify({
-					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					roles: {
+						"tech-lead": { model: "a/b" },
+						"staff-engineer": { model: "c/d" },
+						"qa-engineer": { model: "e/f" },
+					},
 					maxArchitectureRevisionRounds: 3,
 					adaptiveArchitectureRevisions: true,
 					adaptiveArchitectureRevisionCap: 5,
@@ -4608,7 +4680,11 @@ describe("runAnsteelDiscussion", () => {
 			writeFileSync(
 				join(cwd, ".pi", "ansteel.json"),
 				JSON.stringify({
-					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					roles: {
+						"tech-lead": { model: "a/b" },
+						"staff-engineer": { model: "c/d" },
+						"qa-engineer": { model: "e/f" },
+					},
 					maxArchitectureRevisionRounds: 4,
 					adaptiveArchitectureRevisionCap: 2,
 				}),
@@ -4620,13 +4696,13 @@ describe("runAnsteelDiscussion", () => {
 	describe("review bash computation policy", () => {
 		it("allows bounded bash computation when enabled", () => {
 			const policy = createAnsteelReviewToolPolicy(process.cwd(), { allowBashComputation: true });
-			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"", timeout: 10 })).toBeUndefined();
-			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"", timeout: 20 })).toBeUndefined();
-			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"", timeout: 21 })).toEqual({
+			expect(policy.beforeToolCall("bash", { command: 'python -c "print(1)"', timeout: 10 })).toBeUndefined();
+			expect(policy.beforeToolCall("bash", { command: 'python -c "print(1)"', timeout: 20 })).toBeUndefined();
+			expect(policy.beforeToolCall("bash", { command: 'python -c "print(1)"', timeout: 21 })).toEqual({
 				block: true,
 				reason: "Ansteel bash requires an explicit timeout of at most 20 seconds.",
 			});
-			expect(policy.beforeToolCall("bash", { command: "python -c \"print(1)\"" })).toEqual({
+			expect(policy.beforeToolCall("bash", { command: 'python -c "print(1)"' })).toEqual({
 				block: true,
 				reason: "Ansteel bash requires an explicit timeout of at most 20 seconds.",
 			});
@@ -4647,7 +4723,11 @@ describe("runAnsteelDiscussion", () => {
 			writeFileSync(
 				join(cwd, ".pi", "ansteel.json"),
 				JSON.stringify({
-					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					roles: {
+						"tech-lead": { model: "a/b" },
+						"staff-engineer": { model: "c/d" },
+						"qa-engineer": { model: "e/f" },
+					},
 					allowBashComputation: true,
 				}),
 			);
@@ -4663,7 +4743,11 @@ describe("runAnsteelDiscussion", () => {
 			writeFileSync(
 				join(cwd, ".pi", "ansteel.json"),
 				JSON.stringify({
-					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					roles: {
+						"tech-lead": { model: "a/b" },
+						"staff-engineer": { model: "c/d" },
+						"qa-engineer": { model: "e/f" },
+					},
 					allowBashComputation: "yes",
 				}),
 			);
@@ -4671,28 +4755,27 @@ describe("runAnsteelDiscussion", () => {
 		});
 	});
 
-
-		describe("provider-truncation repair (parallel group)", () => {
-			it("rewrites a provider-truncated cross-examination once and completes", async () => {
-				let repairCalls = 0;
-				const result = await runAnsteelDiscussion({
-					topic: "Review truncated cross-examination repair",
-					maxStageResponseChars: 1000,
-					runRole: async ({ role, stage, formatRepair }) => {
-						if (role === "staff-engineer" && stage === "staff-cross-examination") {
-							if (formatRepair) {
-								repairCalls++;
-								return "ISSUE: STAFF-CROSS | TARGET: qa-engineer\nNO ISSUES | TARGET: tech-lead\n[L2] Check the test strategy.";
-							}
-							throw new Error("Ansteel role stage failed: output-truncated");
+	describe("provider-truncation repair (parallel group)", () => {
+		it("rewrites a provider-truncated cross-examination once and completes", async () => {
+			let repairCalls = 0;
+			const result = await runAnsteelDiscussion({
+				topic: "Review truncated cross-examination repair",
+				maxStageResponseChars: 1000,
+				runRole: async ({ role, stage, formatRepair }) => {
+					if (role === "staff-engineer" && stage === "staff-cross-examination") {
+						if (formatRepair) {
+							repairCalls++;
+							return "ISSUE: STAFF-CROSS | TARGET: qa-engineer\nNO ISSUES | TARGET: tech-lead\n[L2] Check the test strategy.";
 						}
-						return responseForMutualReviewStage(stage);
-					},
-				});
-				expect(result.verdict).toBe("approved");
-				expect(repairCalls).toBe(1);
+						throw new Error("Ansteel role stage failed: output-truncated");
+					}
+					return responseForMutualReviewStage(stage);
+				},
 			});
+			expect(result.verdict).toBe("approved");
+			expect(repairCalls).toBe(1);
 		});
+	});
 	describe("provider-truncation repair", () => {
 		it("rewrites a provider-truncated response once and completes", async () => {
 			let repairCalls = 0;
@@ -4792,7 +4875,11 @@ describe("runAnsteelDiscussion", () => {
 			writeFileSync(
 				join(cwd, ".pi", "ansteel.json"),
 				JSON.stringify({
-					roles: { "tech-lead": { model: "a/b" }, "staff-engineer": { model: "c/d" }, "qa-engineer": { model: "e/f" } },
+					roles: {
+						"tech-lead": { model: "a/b" },
+						"staff-engineer": { model: "c/d" },
+						"qa-engineer": { model: "e/f" },
+					},
 					maxStageResponseChars: 24000,
 				}),
 			);

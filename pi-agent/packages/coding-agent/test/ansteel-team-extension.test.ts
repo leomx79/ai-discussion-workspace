@@ -40,8 +40,8 @@ import type {
 	ToolCallEventResult,
 } from "../src/core/extensions/index.ts";
 import {
-	type AnsteelTeamTaskOperations,
 	type AnsteelTeamRoleSession,
+	type AnsteelTeamTaskOperations,
 	type CreateAnsteelTeamRoleSessionOptions,
 	createAnsteelTeamExtension,
 	createAnsteelTeamMutationToolController,

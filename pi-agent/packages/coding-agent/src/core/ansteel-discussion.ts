@@ -249,7 +249,8 @@ export type AnsteelTerminationReason =
 	| "incomplete-work-card"
 	| "unanswered-challenge"
 	| "max-revision-rounds-exhausted"
-	| "final-sign-off-rejected";
+	| "final-sign-off-rejected"
+	| "consensus-verification-method-missing";
 
 export type AnsteelSetupFailurePhase = "configuration" | "model-resolution" | "session-construction";
 
@@ -303,6 +304,8 @@ export interface RunAnsteelDiscussionOptions {
 	abortRole?: (call: AnsteelRoleCall) => void | Promise<void>;
 	getStageAudit?: (call: AnsteelRoleCall) => { events: AnsteelStageAuditEvent[] } | undefined;
 	getRoleBashEnabled?: (role: AnsteelRole) => boolean;
+	/** Optional interpreter hint injected into role prompts for reliable bash computation on this host. */
+	bashInterpreter?: string;
 	maxStageResponseChars?: number;
 	onStageEvent?: (event: AnsteelStageProgressEvent) => void;
 	/** Persists the next uncommitted coordinator action before it can be started or paused. */
@@ -410,6 +413,8 @@ export interface AnsteelConfig {
 	/** Explicitly permits one model across all roles; this is not cross-model verification. */
 	/** When true, review roles may run bounded single-command bash computation (timeout <= 20s). */
 	allowBashComputation?: boolean;
+	/** Optional interpreter hint (for example the resolved python executable path) injected into role prompts for reliable bash computation on this host. */
+	bashInterpreter?: string;
 	/** Hard ceiling on a single stage response length in characters; longer responses get one concise rewrite. */
 	maxStageResponseChars?: number;
 	allowSingleModel?: boolean;
@@ -1309,7 +1314,6 @@ function normalizeAnsteelMaxToolCallsPerStage(value: unknown): number {
 		);
 	}
 	return maxToolCalls;
-
 }
 
 function normalizeAnsteelRevisionRounds(value: unknown, defaultValue: number): number {
@@ -1499,13 +1503,22 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		);
 	}
 	if (value.allowBashComputation !== undefined && typeof value.allowBashComputation !== "boolean") {
+		throw new Error("Ansteel config allowBashComputation must be a boolean");
+	}
+	if (
+		value.bashInterpreter !== undefined &&
+		(typeof value.bashInterpreter !== "string" || value.bashInterpreter.trim().length === 0)
+	) {
+		throw new AnsteelGovernanceSetupError(
+			"Ansteel config bashInterpreter must be a non-empty string",
+			"configuration",
+		);
+	}
 	if (
 		value.maxStageResponseChars !== undefined &&
 		(!Number.isInteger(value.maxStageResponseChars) || (value.maxStageResponseChars as number) < 1)
 	) {
 		throw new Error("Ansteel config maxStageResponseChars must be a positive integer");
-	}
-		throw new Error("Ansteel config allowBashComputation must be a boolean");
 	}
 	if (value.allowSingleModel !== undefined && typeof value.allowSingleModel !== "boolean") {
 		throw new AnsteelGovernanceSetupError("Ansteel config allowSingleModel must be a boolean", "configuration");
@@ -1611,6 +1624,7 @@ function parseAnsteelConfig(value: unknown, options: ParseAnsteelConfigOptions):
 		...(teamTaskMaxNoProgressEpochs === undefined ? {} : { teamTaskMaxNoProgressEpochs }),
 		allowSingleModel: value.allowSingleModel ?? false,
 		allowBashComputation: value.allowBashComputation === true,
+		...(value.bashInterpreter === undefined ? {} : { bashInterpreter: value.bashInterpreter.trim() }),
 		maxStageResponseChars: value.maxStageResponseChars as number | undefined,
 	};
 }
@@ -2085,6 +2099,7 @@ export async function runAnsteelProjectReview<TModel extends AnsteelModelReferen
 			adaptiveArchitectureRevisions: config.adaptiveArchitectureRevisions,
 			adaptiveArchitectureRevisionCap: config.adaptiveArchitectureRevisionCap,
 			getRoleBashEnabled: (role) => config.roles[role].tools.includes("bash"),
+			bashInterpreter: config.bashInterpreter,
 			maxStageResponseChars: config.maxStageResponseChars,
 			projectStartedAt,
 			hardProjectDeadline,
@@ -2424,7 +2439,7 @@ const STAGE_INSTRUCTIONS: Record<AnsteelDiscussionStage, string> = {
 	"staff-verification": `Independently verify the three revised work cards against the ledger using project evidence and tools. ${VERIFICATION_VERDICT_INSTRUCTIONS}`,
 	"qa-verification": `Independently verify the three revised work cards against the ledger using project evidence and tools. ${VERIFICATION_VERDICT_INSTRUCTIONS}`,
 	consensus:
-		"Produce the final consensus. Resolve the competing recommendations into a decision, explain the selected trade-off, and carry forward the prioritized recommended actions with their owners, scope, and acceptance conditions. Separate verified conclusions, unresolved risks, and required follow-up work.",
+		"Produce the final consensus. Resolve the competing recommendations into a decision, explain the selected trade-off, and carry forward the prioritized recommended actions with their owners, scope, and acceptance conditions. Separate verified conclusions, unresolved risks, and required follow-up work. The consensus must contain exactly one visible `<verification-method>` block describing an independent verification of the final answer that differs from the primary approach (a different algorithm, tool, or numerical path, ideally with the concrete command or reasoning used). If an independent verification is impossible with the available evidence and tools, write exactly `L4 not independently verified` inside the block and do not assert an exact final value as verified fact.",
 	"consensus-revision":
 		"Publish the revised Tech Lead consensus. Respond to every unresolved ISSUE raised during final sign-off (each must receive a `RESOLUTION: <ID> | RESOLVED` marker) and correct the errors the rejecting signatories identified. Keep the same standalone decision structure as the original consensus: a clear final answer, verified conclusions, unresolved risks, and carry-forward actions. Do not merely restate the previous consensus.",
 	"staff-sign-off":
@@ -2464,13 +2479,16 @@ function formatResolutionsBrief(entries: readonly AnsteelTranscriptEntry[]): str
 	for (const entry of entries) {
 		const hits: string[] = [];
 		const pattern = new RegExp(RESOLUTION_MARKER_PATTERN.source, "g");
-		let match: RegExpExecArray | null;
-		while ((match = pattern.exec(entry.response)) !== null) {
+		let match: RegExpExecArray | null = pattern.exec(entry.response);
+		while (match !== null) {
 			const after = entry.response
 				.slice(match.index + match[0].length, match.index + match[0].length + 260)
 				.split(/\r?\n/, 1)[0]
 				.trim();
-			hits.push(`- ${match[1]} | ${entry.role} / ${entry.stage}: ${after || "[resolution stated without inline evidence]"}`);
+			hits.push(
+				`- ${match[1]} | ${entry.role} / ${entry.stage}: ${after || "[resolution stated without inline evidence]"}`,
+			);
+			match = pattern.exec(entry.response);
 		}
 		if (hits.length > 0) {
 			blocks.push(`### ${entry.role} / ${entry.stage}\n${hits.join("\n")}`);
@@ -2501,10 +2519,7 @@ export function shouldExtendRevisionRounds(input: RevisionRoundExtensionInput): 
 	if (input.resolvedThisRound < 1) {
 		return { extend: false, reason: "no previously open issue was resolved this round" };
 	}
-	if (
-		input.newIssuesPreviousRound !== undefined &&
-		input.newIssuesThisRound > input.newIssuesPreviousRound * 2
-	) {
+	if (input.newIssuesPreviousRound !== undefined && input.newIssuesThisRound > input.newIssuesPreviousRound * 2) {
 		return {
 			extend: false,
 			reason: `new issues grew from ${input.newIssuesPreviousRound} to ${input.newIssuesThisRound} (more than 2x)`,
@@ -2615,6 +2630,7 @@ interface BuildRolePromptOptions {
 	revisionRoundBaseline?: number;
 	resolutionsBrief?: string;
 	bashEnabled?: boolean;
+	bashInterpreterHint?: string;
 	immutableLedgerSummary?: string;
 }
 
@@ -2641,7 +2657,9 @@ function buildRolePrompt(
 						options.revisionRoundMax ?? ANSTEEL_MAX_ARCHITECTURE_REVISION_ROUNDS
 					}.`,
 					...(options.revisionRoundBaseline !== undefined && options.round > options.revisionRoundBaseline
-						? ["Adaptive extension round: the issue ledger is narrowing, so the coordinator permits one more revision round."]
+						? [
+								"Adaptive extension round: the issue ledger is narrowing, so the coordinator permits one more revision round.",
+							]
 						: []),
 				]),
 		...(options.challengeLedger === undefined
@@ -2667,17 +2685,17 @@ function buildRolePrompt(
 		...(options.formatRepair
 			? [
 					options.formatRepair.kind === "sections"
-					? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that adds every missing required visible section while keeping all existing content unchanged."
-					: options.formatRepair.kind === "over-length"
-						? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Rewrite the response concisely within the stated character limit. Preserve every conclusion, evidence label, issue, resolution, verdict, and marker; remove rambling, restatements, redundant prose, and repeated content."
-						: "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that corrects only marker syntax, the role-specific namespace, or duplicate markers.",
+						? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that adds every missing required visible section while keeping all existing content unchanged."
+						: options.formatRepair.kind === "over-length"
+							? "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Rewrite the response concisely within the stated character limit. Preserve every conclusion, evidence label, issue, resolution, verdict, and marker; remove rambling, restatements, redundant prose, and repeated content."
+							: "Format repair constraint: this is the one allowed retry for this response. Do not use any tools. Preserve the prior claims, evidence, targets, coverage, verdict, and reasoning; output a complete replacement response that corrects only marker syntax, the role-specific namespace, or duplicate markers.",
 					`The prior response had this repairable ${options.formatRepair.kind === "sections" ? "section-completeness" : options.formatRepair.kind === "over-length" ? "over-length" : "marker"} error: ${options.formatRepair.reason}`,
 					`Prior response to replace:\n${options.formatRepair.previousResponse}`,
 				]
 			: [
 					isCrossExamination
 						? "Tool governance: no tools are available during cross-examination. Use the immutable project evidence package and coordinator-generated peer briefs; provide the evidence-labelled conclusion directly."
-						: `Tool governance: execute at most ${options.maxToolCallsPerStage ?? ANSTEEL_DEFAULT_MAX_TOOL_CALLS_PER_STAGE} bounded review tools during this stage. ${options.bashEnabled ? "Bounded bash computation is available for calculations and verification (each call needs an explicit timeout of at most 20 seconds)." : "Shell execution is not available."} If a tool request is blocked or the budget is exhausted, stop requesting tools and provide the evidence-labelled conclusion.`,
+						: `Tool governance: execute at most ${options.maxToolCallsPerStage ?? ANSTEEL_DEFAULT_MAX_TOOL_CALLS_PER_STAGE} bounded review tools during this stage. ${options.bashEnabled ? `Bounded bash computation is available for calculations and verification (each call needs an explicit timeout of at most 20 seconds).${options.bashInterpreterHint ? ` Use this exact interpreter for Python computation: ${options.bashInterpreterHint}.` : ""}` : "Shell execution is not available."} If a tool request is blocked or the budget is exhausted, stop requesting tools and provide the evidence-labelled conclusion.`,
 				]),
 		"Evidence boundary: use project source, documentation, and current command output. Do not read or cite prior Ansteel reports from .pi/ansteel-reports; they are historical model output, not current evidence.",
 		options.evidencePackage ?? NO_PROJECT_EVIDENCE_PACKAGE,
@@ -2885,7 +2903,9 @@ function formatRepairPreservesNonMarkerContent(previousResponse: string, repaire
 }
 
 function formatRepairPreservesMarkers(previousResponse: string, repairedResponse: string): boolean {
-	const collect = (response: string): { verdicts: string[]; issueTargets: string[]; noIssuesTargets: string[]; resolutions: string[] } => {
+	const collect = (
+		response: string,
+	): { verdicts: string[]; issueTargets: string[]; noIssuesTargets: string[]; resolutions: string[] } => {
 		const verdicts: string[] = [];
 		const issueTargets: string[] = [];
 		const noIssuesTargets: string[] = [];
@@ -2965,6 +2985,22 @@ function isOutputTruncatedFailure(failure: AnsteelDiscussionFailure): boolean {
 
 function isBlankRoleResponse(response: string): boolean {
 	return response.replace(/\s|\u200B|\u200C|\u200D|\uFEFF/g, "").length === 0;
+}
+
+/**
+ * Extracts the required independent-verification block from the Tech Lead consensus.
+ * The block must be non-empty and must not contain only its own markers.
+ */
+export function extractVerificationMethod(consensus: string): string | undefined {
+	const match = /<verification-method>([\s\S]*?)<\/verification-method>/.exec(consensus);
+	if (!match) return undefined;
+	const body = match[1]
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && line !== "<verification-method>" && line !== "</verification-method>")
+		.join("\n");
+	if (body.length === 0) return undefined;
+	return body;
 }
 
 function getRequiredWorkCardSection(
@@ -3337,7 +3373,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			options.onCommittedState?.({
 				projectToolCallsUsed: projectToolBudget.getUsedToolCalls(),
 				transcript: transcript.map((item) => ({ ...item })),
-				stageAudits: stageAudits.map((audit) => ({ ...audit, events: audit.events.map((event) => ({ ...event })) })),
+				stageAudits: stageAudits.map((audit) => ({
+					...audit,
+					events: audit.events.map((event) => ({ ...event })),
+				})),
 				budgetLedger: budgetLedger.map((item) => ({ ...item })),
 				adaptiveBudgetEvents: adaptiveBudgetEvents.map((event) => ({ ...event })),
 			});
@@ -3403,6 +3442,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			revisionRoundBaseline: stageOptions.revisionRoundBaseline,
 			resolutionsBrief: stageOptions.resolutionsBrief,
 			bashEnabled: options.getRoleBashEnabled?.(role) ?? false,
+			bashInterpreterHint: options.bashInterpreter,
 		});
 		const call: AnsteelRoleCall = {
 			role,
@@ -3775,13 +3815,14 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			group.length === 0
 				? undefined
 				: Math.max(
-						...group.map(({ stage, options }) =>
-							options.reserveOverride ??
-							getRequiredProtectedVerificationReserve(
-								stage,
-								adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0,
-								options.round,
-							),
+						...group.map(
+							({ stage, options }) =>
+								options.reserveOverride ??
+								getRequiredProtectedVerificationReserve(
+									stage,
+									adaptiveBudgetPolicy?.protectedVerificationToolCalls ?? 0,
+									options.round,
+								),
 						),
 					);
 		const emitGroupCompleted = (member: T): void => {
@@ -3804,7 +3845,11 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				// Progress reporting must not affect discussion governance.
 			}
 		};
-		if (adaptiveBudgetPolicy && epochCommittedStages > 0 && elapsedSince(epochStartedAt) >= adaptiveBudgetPolicy.epochTimeoutMs) {
+		if (
+			adaptiveBudgetPolicy &&
+			epochCommittedStages > 0 &&
+			elapsedSince(epochStartedAt) >= adaptiveBudgetPolicy.epochTimeoutMs
+		) {
 			// Epoch boundary pause: register only the first member as nextAction.
 			const first = group[0];
 			if (first !== undefined) {
@@ -3832,12 +3877,18 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				// Parallel stages share the same over-length / truncation concise rewrite as sequential stages.
 				const maxCharsForGroup = options.maxStageResponseChars;
 				const needsGroupRepair =
-					(("failure" in result) && isOutputTruncatedFailure(result.failure) && member.options.formatRepair === undefined) ||
-					((!("failure" in result)) && maxCharsForGroup !== undefined && result.response.length > maxCharsForGroup && member.options.formatRepair === undefined);
+					("failure" in result &&
+						isOutputTruncatedFailure(result.failure) &&
+						member.options.formatRepair === undefined) ||
+					(!("failure" in result) &&
+						maxCharsForGroup !== undefined &&
+						result.response.length > maxCharsForGroup &&
+						member.options.formatRepair === undefined);
 				if (needsGroupRepair) {
-					const repairReason = "failure" in result
-						? "response was truncated by the provider; rewrite the full response concisely"
-						: `response exceeds ${maxCharsForGroup} characters; rewrite it within that limit`;
+					const repairReason =
+						"failure" in result
+							? "response was truncated by the provider; rewrite the full response concisely"
+							: `response exceeds ${maxCharsForGroup} characters; rewrite it within that limit`;
 					const priorResponse = "failure" in result ? "" : result.response;
 					const repaired = await runStage(member.role, member.stage, {
 						...member.options,
@@ -3847,7 +3898,6 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 					});
 					result = repaired;
 				}
-				return { member, result };
 				return { member, result };
 			}),
 		);
@@ -3896,7 +3946,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		const preserves =
 			kind === "sections"
 				? formatSectionRepairPreservesContent(previousEntry.response, repairedResult.response)
-			: formatRepairPreservesMarkers(previousEntry.response, repairedResult.response);
+				: formatRepairPreservesMarkers(previousEntry.response, repairedResult.response);
 		if (preserves) return repairedResult;
 		return {
 			rejection: reject(
@@ -3915,7 +3965,9 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		entry: AnsteelTranscriptEntry,
 		requiredSections: readonly string[],
 		allowParenthesizedQualifier: boolean,
-	): Promise<{ response: string; entry: AnsteelTranscriptEntry; repaired: boolean } | { rejection: AnsteelDiscussionResult }> => {
+	): Promise<
+		{ response: string; entry: AnsteelTranscriptEntry; repaired: boolean } | { rejection: AnsteelDiscussionResult }
+	> => {
 		const missingSections = getMissingWorkCardSections(entry.response, requiredSections, allowParenthesizedQualifier);
 		if (missingSections.length === 0) {
 			return { response: entry.response, entry, repaired: false };
@@ -4026,7 +4078,13 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			challengeLedger.filter((challenge) => challenge.status === "open").map((challenge) => challenge.id),
 		);
 		for (const { role, stage } of revisionStages) {
-			const stageOptions = { round, context: revisionContext, challengeLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline };
+			const stageOptions = {
+				round,
+				context: revisionContext,
+				challengeLedger,
+				revisionRoundMax: revisionRoundCap,
+				revisionRoundBaseline,
+			};
 			let result = await runRequiredStage(role, stage, stageOptions);
 			if ("rejection" in result) return result.rejection;
 			const sectionRepair = await repairMissingWorkCardSections(
@@ -4078,17 +4136,38 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				{
 					role: "tech-lead",
 					stage: "tech-lead-verification",
-					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline, resolutionsBrief },
+					options: {
+						round,
+						context: revisedWorkCards,
+						challengeLedger: verificationLedger,
+						revisionRoundMax: revisionRoundCap,
+						revisionRoundBaseline,
+						resolutionsBrief,
+					},
 				},
 				{
 					role: "staff-engineer",
 					stage: "staff-verification",
-					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline, resolutionsBrief },
+					options: {
+						round,
+						context: revisedWorkCards,
+						challengeLedger: verificationLedger,
+						revisionRoundMax: revisionRoundCap,
+						revisionRoundBaseline,
+						resolutionsBrief,
+					},
 				},
 				{
 					role: "qa-engineer",
 					stage: "qa-verification",
-					options: { round, context: revisedWorkCards, challengeLedger: verificationLedger, revisionRoundMax: revisionRoundCap, revisionRoundBaseline, resolutionsBrief },
+					options: {
+						round,
+						context: revisedWorkCards,
+						challengeLedger: verificationLedger,
+						revisionRoundMax: revisionRoundCap,
+						revisionRoundBaseline,
+						resolutionsBrief,
+					},
 				},
 			],
 			async (member, { response, entry }) => {
@@ -4125,7 +4204,13 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				if (verdict === "rejected") {
 					let verificationError = addChallengeIds(challengeLedger, role, round, currentResponse, true, true);
 					if (verificationError && !usedFormatRepair && isRepairableChallengeMarkerError(verificationError)) {
-						const repaired = await runSingleFormatRepair(role, stage, stageOptions, currentEntry, verificationError);
+						const repaired = await runSingleFormatRepair(
+							role,
+							stage,
+							stageOptions,
+							currentEntry,
+							verificationError,
+						);
 						if ("rejection" in repaired) return repaired.rejection;
 						currentResponse = repaired.response;
 						verdict = getExplicitVerdict(currentResponse);
@@ -4147,7 +4232,8 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 						}
 						verificationError = addChallengeIds(challengeLedger, role, round, currentResponse, true, true);
 					}
-					if (verificationError) return reject(verificationError, undefined, undefined, "invalid-challenge-ledger");
+					if (verificationError)
+						return reject(verificationError, undefined, undefined, "invalid-challenge-ledger");
 				}
 				return undefined;
 			},
@@ -4168,8 +4254,8 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			staffVerdict: verificationVerdicts["staff-engineer"],
 			qaVerdict: verificationVerdicts["qa-engineer"],
 			outcome,
-				newIssues: newIssuesThisRound,
-				resolvedIssues: resolvedIssuesThisRound,
+			newIssues: newIssuesThisRound,
+			resolvedIssues: resolvedIssuesThisRound,
 		});
 		if (outcome === "approved") {
 			collaborationAccepted = true;
@@ -4220,6 +4306,26 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 		);
 	}
 	let consensus = consensusResult.response;
+	if (extractVerificationMethod(consensus) === undefined) {
+		const verificationMethodRepair = await runSingleFormatRepair(
+			"tech-lead",
+			"consensus",
+			{ immutableLedgerSummary },
+			consensusResult.entry,
+			"tech-lead / consensus did not provide the required visible <verification-method> block",
+			"sections",
+		);
+		if ("rejection" in verificationMethodRepair) return verificationMethodRepair.rejection;
+		if (extractVerificationMethod(verificationMethodRepair.response) === undefined) {
+			return reject(
+				"tech-lead / consensus did not provide the required visible <verification-method> block after the format repair",
+				undefined,
+				undefined,
+				"consensus-verification-method-missing",
+			);
+		}
+		consensus = verificationMethodRepair.response;
+	}
 
 	// Staff and QA final sign-off are independent and run in parallel. A
 	// rejection that adds a new targeted ISSUE triggers one Tech Lead
@@ -4227,8 +4333,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	// answer instead of failing at the first objection. Bare rejections and
 	// rejections that exhaust the sign-off round cap fail closed.
 	const maxSignOffRounds = options.maxSignOffRounds ?? ANSTEEL_MAX_SIGN_OFF_ROUNDS;
-	const adaptiveSignOffRevisionCap =
-		options.adaptiveSignOffRevisionCap ?? Math.min(maxSignOffRounds + 2, 8);
+	const adaptiveSignOffRevisionCap = options.adaptiveSignOffRevisionCap ?? Math.min(maxSignOffRounds + 2, 8);
 	const adaptiveSignOffRevisions = options.adaptiveSignOffRevisions === true;
 	let signOffRound = 0;
 	let signOffPreviousRoundNewIssues: number | undefined;
@@ -4302,7 +4407,10 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 						);
 					}
 					signOffRoundNewIssues += addedThisRound.length;
-				signOffRejections.push({ role, reason: `${role} rejected the Tech Lead consensus during final sign-off` });
+					signOffRejections.push({
+						role,
+						reason: `${role} rejected the Tech Lead consensus during final sign-off`,
+					});
 				}
 				return undefined;
 			},

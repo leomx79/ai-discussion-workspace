@@ -1269,14 +1269,14 @@ function buildTaskReviewPrompt(
 		return receipt === undefined
 			? { taskId: dependencyId, status: "missing" }
 			: {
-				id: receipt.id,
-				taskId: receipt.taskId,
-				revision: receipt.revision,
-				status: receipt.status,
-				sourceCommit: receipt.sourceCommit,
-				diffHash: receipt.diffHash,
-				checks: receipt.checks.map((check) => ({ id: check.id, exitCode: check.exitCode })),
-			};
+					id: receipt.id,
+					taskId: receipt.taskId,
+					revision: receipt.revision,
+					status: receipt.status,
+					sourceCommit: receipt.sourceCommit,
+					diffHash: receipt.diffHash,
+					checks: receipt.checks.map((check) => ({ id: check.id, exitCode: check.exitCode })),
+				};
 	});
 	return [
 		`You are the independent ${role} final-verification reviewer for ${task.id} revision ${submission.revision}.`,
