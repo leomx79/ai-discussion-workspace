@@ -15,6 +15,7 @@ param(
 	[int]$QuestionBegin = -1,
 	[ValidateRange(-1, 1000000)]
 	[int]$QuestionEnd = -1,
+	[string]$QuestionIds = "",
 	[switch]$Resume,
 	[switch]$RetryFailures,
 	[switch]$DryRun
@@ -100,6 +101,11 @@ if ($questionFiles.Count -eq 0) {
 if ($QuestionBegin -ge 0 -and $QuestionEnd -ge 0 -and $QuestionEnd -lt $QuestionBegin) {
 	throw "QuestionEnd ($QuestionEnd) cannot be less than QuestionBegin ($QuestionBegin)."
 }
+if (-not [string]::IsNullOrWhiteSpace($QuestionIds)) {
+	if ($QuestionBegin -ge 0 -or $QuestionEnd -ge 0) {
+		throw "QuestionIds cannot be combined with QuestionBegin/QuestionEnd."
+	}
+}
 $transportConfigPath = Join-Path $LiveBenchRoot "livebench\model\model_configs\ansteel-livebench.yml"
 if (-not (Test-Path -LiteralPath $transportConfigPath)) {
 	throw "Local transport model aliases are missing at $transportConfigPath. Re-run Setup-LiveBench.ps1 before launching."
@@ -164,6 +170,14 @@ try {
 		if ($QuestionEnd -ge 0) {
 			$inferenceArguments += @("--question-end", "$QuestionEnd")
 			$judgmentArguments += @("--question-end", "$QuestionEnd")
+		}
+		if (-not [string]::IsNullOrWhiteSpace($QuestionIds)) {
+			$questionIdList = @($QuestionIds -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+			if ($questionIdList.Count -eq 0) {
+				throw "QuestionIds is non-empty but contained no usable ids."
+			}
+			$inferenceArguments += @("--question-id") + $questionIdList
+			$judgmentArguments += @("--question-id") + $questionIdList
 		}
 		if ($Resume) {
 			$inferenceArguments += "--resume"
