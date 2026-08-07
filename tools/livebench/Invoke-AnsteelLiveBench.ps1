@@ -18,7 +18,11 @@ param(
 	[ValidatePattern("^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")]
 	[string]$ModelDisplayName = "ansteel-three-role-consensus-v1",
 	[switch]$Resume,
-	[switch]$DryRun
+	[switch]$DryRun,
+	# Optional protocol config override for ablation runs (e.g. disable bash,
+	# disable adaptive rounds, or force a single model). Defaults to the
+	# canonical ansteel-livebench-config.json when omitted.
+	[string]$ProtocolConfig = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,7 +36,12 @@ if ([string]::IsNullOrWhiteSpace($PiAgentRoot)) {
 }
 $venvPython = Join-Path $LiveBenchRoot ".venv\Scripts\python.exe"
 $adapterPath = Join-Path $PSScriptRoot "ansteel_livebench_adapter.py"
-$protocolConfigPath = Join-Path $PSScriptRoot "ansteel-livebench-config.json"
+$protocolConfigPath = if ([string]::IsNullOrWhiteSpace($ProtocolConfig)) {
+	Join-Path $PSScriptRoot "ansteel-livebench-config.json"
+}
+else {
+	$ProtocolConfig
+}
 $piTestPath = Join-Path $PiAgentRoot "pi-test.ps1"
 foreach ($required in @($venvPython, $adapterPath, $protocolConfigPath, $piTestPath)) {
 	if (-not (Test-Path -LiteralPath $required)) {
