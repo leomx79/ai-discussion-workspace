@@ -56,5 +56,6 @@
   "maxSignOffRounds": 3,
   "adaptiveSignOffRevisions": true,
   "allowBashComputation": true,
+  "bashInterpreter": "C:\\Users\\leomx\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
   "maxStageResponseChars": 24000
 }

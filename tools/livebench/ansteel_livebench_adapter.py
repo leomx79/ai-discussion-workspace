@@ -495,6 +495,26 @@ def retry_approved_scoring(
     return "approved"
 
 
+def failure_details(workspace: Path) -> dict[str, str]:
+    """Extract the report termination reason and failing stage without user inspection."""
+    reports = sorted((workspace / ".pi" / "ansteel-reports").glob("*.md"))
+    if reports:
+        text = reports[-1].read_text(encoding="utf-8", errors="replace")
+        reason_match = re.search(r"^-\s*Termination reason:\s*(.+)$", text, re.M)
+        stage_match = re.search(r"^-\s*Failed stage:\s*(.+)$", text, re.M)
+        role_match = re.search(r"^-\s*Failed role:\s*(.+)$", text, re.M)
+        return {
+            "failure_reason": reason_match.group(1).strip() if reason_match else "",
+            "failure_stage": stage_match.group(1).strip() if stage_match else "",
+            "failure_role": role_match.group(1).strip() if role_match else "",
+        }
+    log_path = workspace / "ansteel-console.log"
+    if log_path.is_file():
+        tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-6:]
+        return {"failure_reason": " | ".join(line.strip() for line in tail if line.strip())[:400]}
+    return {"failure_reason": "no report and no console log"}
+
+
 def process_question(
     question_file: Path,
     task_name: str,
@@ -554,6 +574,7 @@ def process_question(
         return "paused"
     if return_code != 0:
         manifest["protocol_status"] = "failed"
+        manifest.update(failure_details(workspace))
         write_json(workspace / "protocol-result.json", manifest)
         print(f"FAILED {question['question_id']} {task_name}: Ansteel exited {return_code}; no LiveBench answer was written")
         return "failed"
@@ -634,7 +655,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-display-name", default=DEFAULT_MODEL_DISPLAY_NAME)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--skip-stubborn",
+        type=int,
+        default=0,
+        help="Skip questions already failed N or more times across previous runs under this release",
+    )
     return parser.parse_args()
+
+
+def historical_failures(evaluation_root: Path, release: str) -> dict[str, int]:
+    """Count failed protocol-result records per question across all runs under one release."""
+    counts: dict[str, int] = {}
+    release_root = evaluation_root / "ansteel-livebench" / release
+    if not release_root.is_dir():
+        return counts
+    for record_path in release_root.rglob("protocol-result.json"):
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        question_id = record.get("question_id")
+        if isinstance(question_id, str) and record.get("protocol_status") == "failed":
+            counts[question_id] = counts.get(question_id, 0) + 1
+    return counts
 
 
 def main() -> int:
@@ -679,6 +723,23 @@ def main() -> int:
     if not selections:
         print("No LiveBench questions selected; no Ansteel process or provider request was started")
         return 0
+
+    if args.skip_stubborn > 0:
+        failures = historical_failures(args.evaluation_root, args.release)
+        kept: list[tuple[Path, str, dict[str, Any]]] = []
+        for question_file, task_name, question in selections:
+            failed_count = failures.get(question["question_id"], 0)
+            if failed_count >= args.skip_stubborn:
+                print(
+                    f"SKIP-STUBBORN {question['question_id']} {task_name}: "
+                    f"already failed {failed_count} times (>= {args.skip_stubborn})"
+                )
+                continue
+            kept.append((question_file, task_name, question))
+        selections = kept
+        if not selections:
+            print("All selected questions were skipped as stubborn; no Ansteel process or provider request was started")
+            return 0
 
     outcomes: dict[str, int] = {}
     for question_file, task_name, question in selections:
