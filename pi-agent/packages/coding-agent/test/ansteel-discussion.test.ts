@@ -3135,6 +3135,21 @@ describe("runAnsteelDiscussion", () => {
 		expect(calls.map(({ role, stage }) => `${role}:${stage}`)).not.toContain("staff-engineer:staff-sign-off");
 	});
 
+	it("accepts a sign-off that restates the authoritative ledger count from the coordinator summary", async () => {
+		const result = await runAnsteelDiscussion({
+			topic: "Accept a sign-off restating the immutable ledger count",
+			runRole: async ({ role, stage }) => {
+				if (role === "qa-engineer" && stage === "qa-sign-off") {
+					return "All 3 ledger challenges are resolved per the immutable coordinator summary.\nVERDICT: APPROVE";
+				}
+				return responseForMutualReviewStage(stage);
+			},
+		});
+
+		expect(result.verdict).toBe("approved");
+		expect(result.terminationReason).toBeUndefined();
+	});
+
 	it("rejects a final sign-off that writes a ledger count instead of citing the immutable summary", async () => {
 		const calls: Array<{ role: AnsteelRole; stage: AnsteelDiscussionStage }> = [];
 

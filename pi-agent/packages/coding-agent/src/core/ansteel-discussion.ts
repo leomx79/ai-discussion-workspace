@@ -2597,15 +2597,36 @@ function formatImmutableLedgerSummary(challengeLedger: readonly AnsteelChallenge
 	].join("\n");
 }
 
-function getManualLedgerCountClaim(response: string): string | undefined {
+function getManualLedgerCountClaim(response: string, immutableLedgerSummary?: string): string | undefined {
 	const patterns = [
 		/\b\d+\s+ledger\s+(?:entries|challenges)\b/i,
 		/\bledger\s+(?:entries|challenges)\s*[:=]?\s*\d+\b/i,
 		/\b(?:ledger|challenge)\s+(?:total|count)\s*[:=]?\s*\d+\b/i,
 	];
+	// The coordinator's immutable summary is the only authoritative source of
+	// ledger counts. A role that restates one of those exact numbers is citing
+	// the summary; a number outside that set is a fabricated count and must
+	// fail closed. Without a summary (defensive fallback), keep the old strict
+	// behaviour so a bare numeric claim is never silently accepted.
+	const authoritativeCounts = new Set<number>();
+	if (immutableLedgerSummary !== undefined) {
+		for (const match of immutableLedgerSummary.matchAll(
+			/^-\s*(?:Total recorded|Resolved|Open) challenges:\s*(\d+)\s*$/gm,
+		)) {
+			authoritativeCounts.add(Number(match[1]));
+		}
+	}
 	for (const line of response.split(/\r?\n/)) {
-		const claim = patterns.map((pattern) => pattern.exec(line)?.[0]).find((value) => value !== undefined);
-		if (claim) return claim;
+		for (const pattern of patterns) {
+			const match = pattern.exec(line);
+			if (!match) continue;
+			const claim = match[0];
+			if (authoritativeCounts.size > 0) {
+				const claimedNumber = Number(claim.match(/\d+/)?.[0]);
+				if (authoritativeCounts.has(claimedNumber)) continue;
+			}
+			return claim;
+		}
 	}
 	return undefined;
 }
@@ -4303,7 +4324,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 	immutableLedgerSummary = formatImmutableLedgerSummary(challengeLedger);
 	const consensusResult = await runRequiredStage("tech-lead", "consensus", { immutableLedgerSummary });
 	if ("rejection" in consensusResult) return consensusResult.rejection;
-	const consensusLedgerCountClaim = getManualLedgerCountClaim(consensusResult.response);
+	const consensusLedgerCountClaim = getManualLedgerCountClaim(consensusResult.response, immutableLedgerSummary);
 	if (consensusLedgerCountClaim) {
 		return reject(
 			`tech-lead / consensus manually stated a ledger count (${consensusLedgerCountClaim}) instead of citing the immutable coordinator summary`,
@@ -4357,7 +4378,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 			async (member, { response, entry }) => {
 				const role = member.role;
 				const stage = member.stage;
-				const signOffLedgerCountClaim = getManualLedgerCountClaim(response);
+				const signOffLedgerCountClaim = getManualLedgerCountClaim(response, immutableLedgerSummary);
 				if (signOffLedgerCountClaim) {
 					return reject(
 						`${role} / ${stage} manually stated a ledger count (${signOffLedgerCountClaim}) instead of citing the immutable coordinator summary`,
@@ -4464,7 +4485,7 @@ export async function runAnsteelDiscussion(options: RunAnsteelDiscussionOptions)
 				"unanswered-challenge",
 			);
 		}
-		const revisedLedgerCountClaim = getManualLedgerCountClaim(consensusRevision.response);
+		const revisedLedgerCountClaim = getManualLedgerCountClaim(consensusRevision.response, immutableLedgerSummary);
 		if (revisedLedgerCountClaim) {
 			return reject(
 				`tech-lead / consensus-revision manually stated a ledger count (${revisedLedgerCountClaim}) instead of citing the immutable coordinator summary`,
