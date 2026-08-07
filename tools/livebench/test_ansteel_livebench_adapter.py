@@ -92,6 +92,37 @@ class AnsteelLiveBenchAdapterTests(unittest.TestCase):
         with self.assertRaises(ADAPTER.ProtocolResultError):
             ADAPTER.extract_final_answer(ambiguous)
 
+    def test_answer_block_with_confidence_qualifier_is_rejected(self) -> None:
+        approved = (
+            "## Status\n- Governance result: APPROVED\n\n"
+            "## Tech Lead Consensus\n"
+            "<livebench-final-answer>\n"
+            "3822  (verified achievable value; exact maximality for n=100 unproven - L4)\n"
+            "</livebench-final-answer>"
+        )
+        with self.assertRaises(ADAPTER.ProtocolResultError):
+            ADAPTER.extract_final_answer(approved)
+
+    def test_answer_block_without_qualifier_is_extracted(self) -> None:
+        approved = (
+            "## Status\n- Governance result: APPROVED\n\n"
+            "## Tech Lead Consensus\n"
+            "<livebench-final-answer>\n"
+            "3822\n"
+            "</livebench-final-answer>"
+        )
+        self.assertEqual(ADAPTER.extract_final_answer(approved), "3822")
+
+    def test_answer_block_with_code_or_expression_is_extracted(self) -> None:
+        approved = (
+            "## Status\n- Governance result: APPROVED\n\n"
+            "## Tech Lead Consensus\n"
+            "<livebench-final-answer>\n"
+            "\\boxed{42}\n"
+            "</livebench-final-answer>"
+        )
+        self.assertEqual(ADAPTER.extract_final_answer(approved), "\\boxed{42}")
+
     def test_protocol_config_requires_distinct_read_only_roles(self) -> None:
         config = {
             "roles": {

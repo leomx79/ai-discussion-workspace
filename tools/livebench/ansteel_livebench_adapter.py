@@ -122,9 +122,10 @@ def render_benchmark_contract(question_id: str) -> str:
             "- In every verification or final sign-off response, emit exactly one `VERDICT: APPROVE` or `VERDICT: REJECT` marker as the final standalone line. Do not quote, restate, embed, or otherwise reproduce either `VERDICT:` marker in headings, prose, evidence, code, or references to another role's sign-off.",
 "- Keep every stage response concise: each architecture, work card, critique, revision, verification, and sign-off should fit within roughly 600-1000 words. Long prose is not evidence and risks output truncation; state the answer, the supporting evidence, and the verdict directly without restating the question or repeating peers.",
             "- In the immutable Tech Lead consensus only, emit exactly one answer block using the following tags. The content must be the direct final answer to the benchmark question and may be multiline when the task requires code or structured output.",
+            "- The answer block must contain ONLY the answer itself: the final numeric value, expression, or structured output that the official scorer will grade. Put every confidence label ([L1]-[L4]), caveat, qualifier, explanation, proof sketch, and reasoning OUTSIDE the block in the consensus body. A graded answer that carries 'verified', 'unproven', 'L4', or a parenthetical note inside the block fails the official scorer and is a protocol failure, not an answer.",
             "",
             FINAL_ANSWER_OPEN,
-            "answer text only",
+            "answer text only (no confidence labels, caveats, or parenthetical notes)",
             FINAL_ANSWER_CLOSE,
             "",
             "- Do not emit those tags in work cards, critiques, revisions, verification, or sign-off. Staff Engineer and QA Engineer must sign off on the same immutable consensus containing this block.",
@@ -171,7 +172,34 @@ def extract_final_answer(report: str) -> str:
         raise ProtocolResultError("Approved consensus final-answer block is empty")
     if FINAL_ANSWER_OPEN in answer or FINAL_ANSWER_CLOSE in answer:
         raise ProtocolResultError("Approved consensus final-answer block is malformed")
+    reject_qualifier(answer)
     return answer
+
+
+# Protocol meta-language that must never appear inside a graded answer block:
+# confidence labels, uncertainty qualifiers, and parenthetical explanations
+# belong in the consensus body, where the official scorer never looks. The
+# scorer for numeric tasks matches against the answer tail, so a caveat that
+# trails the value silently converts a correct answer into a 0 score. Failing
+# closed here keeps such cases visible as answer-format failures instead of
+# writing a guaranteed-wrong answer file.
+_ANSWER_QUALIFIER_PATTERNS = (
+    re.compile(r"\[L[1-4]\]"),
+    re.compile(r"\bL[1-4]\b"),
+    re.compile(r"\b(?:unproven|not proven|verified achievable|exact maximality)\b", re.IGNORECASE),
+    re.compile(r"\([^)]*(?:verified|unproven|confidence|L[1-4])[^)]*\)", re.IGNORECASE),
+)
+
+
+def reject_qualifier(answer: str) -> None:
+    """Reject a graded answer block that carries protocol meta-language."""
+    for pattern in _ANSWER_QUALIFIER_PATTERNS:
+        match = pattern.search(answer)
+        if match:
+            raise ProtocolResultError(
+                f"Approved consensus final-answer block contains protocol qualifier "
+                f"{match.group(0)!r}; put confidence labels and caveats in the consensus body"
+            )
 
 
 def read_ground_truth_score(
