@@ -7,7 +7,7 @@ param(
 	[string[]]$Role = @("tech-lead", "staff-engineer", "qa-engineer"),
 	[ValidatePattern("^\d{4}-\d{2}-\d{2}$")]
 	[string]$Release = "2024-11-25",
-	[ValidateRange(1, 16384)]
+	[ValidateRange(1, 65536)]
 	[int]$MaxTokens = 4096,
 	[ValidateRange(1, 16)]
 	[int]$ParallelRequests = 1,
